@@ -7,6 +7,15 @@ Veja (e, se quiser, use) a tela de um computador em outro, ligados por cabo — 
 
 Funciona nos dois sentidos: notebook → PC ou PC → notebook.
 
+## ⬇ Download
+
+**[Baixar a versão mais recente](https://github.com/jefzinw/TransLocal/releases/latest)** — na página que abrir, em *Assets*:
+
+- **`TransLocal-Setup-x.y.z.exe`** — instalador (recomendado)
+- **`TransLocal.exe`** — executável único, roda sem instalar
+
+Instale nos dois computadores. Não é preciso ter o .NET instalado.
+
 ## Que cabo usar
 
 | Ligação | Funciona? |
@@ -20,8 +29,6 @@ Funciona nos dois sentidos: notebook → PC ou PC → notebook.
 | HDMI ↔ HDMI direto entre notebook e PC | ✘ As duas portas HDMI são de saída. |
 
 ## Instalação
-
-Baixe o instalador (`TransLocal-Setup-x.y.z.exe`) ou o executável único (`TransLocal.exe`) na página **Releases** deste repositório.
 
 **Instalador (recomendado):** execute `TransLocal-Setup-1.0.0.exe` nos dois computadores. Ele:
 - instala em *Arquivos de Programas* e cria o atalho no Menu Iniciar;
