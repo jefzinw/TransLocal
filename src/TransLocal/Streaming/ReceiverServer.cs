@@ -1,0 +1,263 @@
+using System.Buffers.Binary;
+using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
+using NAudio.Wave;
+using TransLocal.Audio;
+using TransLocal.Video;
+
+namespace TransLocal.Streaming;
+
+/// <summary>
+/// Fica aguardando transmissões (TCP 52020) e responde às procuras (UDP 52021).
+/// Exibe uma transmissão por vez.
+/// </summary>
+internal sealed class ReceiverServer : IDisposable
+{
+    private readonly int _port;
+    private readonly int _discoveryPort;
+    private readonly Func<string> _name;
+    private readonly Func<bool> _playAudio;
+    private TcpListener? _listener;
+    private DiscoveryResponder? _discovery;
+    private CancellationTokenSource? _cts;
+    private ReceiverSession? _active;
+
+    public event Action<ReceiverSession>? SessionStarted;
+    public event Action<ReceiverSession, string?>? SessionEnded;
+
+    public ReceiverServer(Func<string> name, Func<bool> playAudio, int port = Proto.VideoPort, int discoveryPort = Proto.DiscoveryPort)
+    {
+        _name = name;
+        _playAudio = playAudio;
+        _port = port;
+        _discoveryPort = discoveryPort;
+    }
+
+    public bool IsRunning => _listener is not null;
+    public ReceiverSession? Active => Volatile.Read(ref _active);
+    public int Port => _port;
+
+    public void Start()
+    {
+        if (_listener is not null) return;
+        var listener = new TcpListener(IPAddress.Any, _port);
+        listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ExclusiveAddressUse, true);
+        listener.Start();
+        _listener = listener;
+        _cts = new CancellationTokenSource();
+        try
+        {
+            _discovery = new DiscoveryResponder(_discoveryPort, _port, _name, () => Active is not null);
+            _discovery.Start();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Descoberta automática indisponível (porta UDP {_discoveryPort})", ex);
+        }
+        _ = AcceptLoopAsync(listener, _cts.Token);
+        Log.Info($"Receptor aguardando na porta TCP {_port} (descoberta UDP {_discoveryPort})");
+    }
+
+    public void Stop()
+    {
+        _cts?.Cancel();
+        try { _listener?.Stop(); } catch { }
+        _listener = null;
+        _discovery?.Dispose();
+        _discovery = null;
+        Active?.Close();
+        Log.Info("Receptor desligado");
+    }
+
+    private async Task AcceptLoopAsync(TcpListener listener, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            TcpClient client;
+            try
+            {
+                client = await listener.AcceptTcpClientAsync(ct);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (ObjectDisposedException) { break; }
+            catch (SocketException ex)
+            {
+                if (ct.IsCancellationRequested) break;
+                Log.Warn("Falha ao aceitar conexão", ex);
+                continue;
+            }
+            var t = new Thread(() => HandleClient(client)) { IsBackground = true, Name = "TransLocal receptor" };
+            t.Start();
+        }
+    }
+
+    private void HandleClient(TcpClient client)
+    {
+        Connection conn;
+        try { conn = new Connection(client); }
+        catch { client.Dispose(); return; }
+
+        ReceiverSession? session = null;
+        try
+        {
+            conn.ReceiveTimeoutMs = 10_000;
+            HelloMessage hello;
+            using (var m = conn.Receive())
+            {
+                if (m.Type != MsgType.Hello) return;
+                hello = m.ReadJson<HelloMessage>();
+            }
+            if (hello.App != Proto.AppId || hello.ProtocolVersion != Proto.Version)
+            {
+                conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = false, Name = _name(), Reason = "Versão do TransLocal incompatível. Atualize os dois computadores." });
+                return;
+            }
+
+            session = new ReceiverSession(conn, hello, _playAudio());
+            if (Interlocked.CompareExchange(ref _active, session, null) is not null)
+            {
+                conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = false, Name = _name(), Reason = "Este computador já está exibindo outra transmissão." });
+                session.Surface.Dispose();
+                session = null;
+                return;
+            }
+
+            conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = true, Name = _name() });
+            Log.Info($"Recebendo de {hello.Name} ({conn.RemoteEndPoint}) {hello.Width}×{hello.Height}, áudio={hello.Audio}, controle={hello.Control}");
+            try { SessionStarted?.Invoke(session); } catch (Exception ex) { Log.Error("Erro ao abrir exibição", ex); }
+
+            string? reason = session.Run();
+            Log.Info($"Exibição de {hello.Name} terminou: {reason ?? "fechada neste computador"}");
+            Interlocked.CompareExchange(ref _active, null, session);
+            try { SessionEnded?.Invoke(session, reason); } catch (Exception ex) { Log.Error("Erro ao fechar exibição", ex); }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Conexão de {conn.RemoteEndPoint} encerrada", ex);
+            if (session is not null && Interlocked.CompareExchange(ref _active, null, session) == session)
+            {
+                try { SessionEnded?.Invoke(session, "A ligação foi perdida."); } catch { }
+            }
+        }
+        finally
+        {
+            conn.Dispose();
+        }
+    }
+
+    public void Dispose() => Stop();
+}
+
+/// <summary>Uma transmissão sendo exibida neste computador.</summary>
+internal sealed class ReceiverSession
+{
+    private readonly Connection _conn;
+    private readonly HelloMessage _hello;
+    private readonly bool _playAudio;
+    private volatile bool _closing;
+
+    private int _statFrames;
+    private long _statDecodeTicks;
+    private long _statBytesAtLast;
+    private long _statLastTs = Stopwatch.GetTimestamp();
+
+    public FrameSurface Surface { get; } = new();
+    public string SenderName => _hello.Name;
+    public string RemoteEndPoint => _conn.RemoteEndPoint;
+    public bool ControlAllowed => _hello.Control;
+    public int InitialWidth => _hello.Width;
+    public int InitialHeight => _hello.Height;
+    public long FramesReceived;
+
+    public event Action? FrameReady;
+    public event Action<string>? StatsUpdated;
+
+    public ReceiverSession(Connection conn, HelloMessage hello, bool playAudio)
+    {
+        _conn = conn;
+        _hello = hello;
+        _playAudio = playAudio;
+    }
+
+    /// <summary>Executa até a transmissão terminar. Retorna o motivo (null se fechada aqui).</summary>
+    public string? Run()
+    {
+        AudioPlayer? audio = null;
+        if (_hello.Audio && _playAudio && _hello.AudioRate > 0 && _hello.AudioChannels is 1 or 2)
+        {
+            try { audio = new AudioPlayer(new WaveFormat(_hello.AudioRate, 16, _hello.AudioChannels)); }
+            catch (Exception ex) { Log.Warn("Não foi possível tocar o áudio recebido", ex); }
+        }
+        using var statsTimer = new System.Threading.Timer(_ => ReportStats(), null, 1000, 1000);
+        Span<byte> ack = stackalloc byte[4];
+        try
+        {
+            _conn.ReceiveTimeoutMs = 15_000;
+            while (true)
+            {
+                using var m = _conn.Receive();
+                switch (m.Type)
+                {
+                    case MsgType.Frame:
+                        long t0 = Stopwatch.GetTimestamp();
+                        int id = TileDecoder.Decode(m.Buffer, m.Length, Surface);
+                        Interlocked.Add(ref _statDecodeTicks, Stopwatch.GetTimestamp() - t0);
+                        Interlocked.Increment(ref _statFrames);
+                        Interlocked.Increment(ref FramesReceived);
+                        BinaryPrimitives.WriteInt32LittleEndian(ack, id);
+                        _conn.Send(MsgType.FrameAck, ack);
+                        FrameReady?.Invoke();
+                        break;
+                    case MsgType.Audio:
+                        audio?.Add(m.Span);
+                        break;
+                    case MsgType.Ping:
+                        _conn.Send(MsgType.Pong, m.Span);
+                        break;
+                    case MsgType.Bye:
+                        return "O outro computador parou de transmitir.";
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            if (_closing) return null;
+            Log.Warn("Recepção interrompida", ex);
+            return ex is IOException or ObjectDisposedException
+                ? "A ligação com o outro computador foi perdida."
+                : "Falha na exibição: " + ex.Message;
+        }
+        finally
+        {
+            audio?.Dispose();
+        }
+    }
+
+    public void SendInput(byte[] payload)
+    {
+        if (!ControlAllowed || _closing) return;
+        try { _conn.Send(MsgType.Input, payload); } catch { }
+    }
+
+    /// <summary>Encerra a exibição a partir deste computador.</summary>
+    public void Close()
+    {
+        if (_closing) return;
+        _closing = true;
+        _conn.TrySendBye();
+        _conn.Dispose();
+    }
+
+    private void ReportStats()
+    {
+        long now = Stopwatch.GetTimestamp();
+        double secs = Math.Max(0.001, (now - Interlocked.Exchange(ref _statLastTs, now)) / (double)Stopwatch.Frequency);
+        int frames = Interlocked.Exchange(ref _statFrames, 0);
+        long dec = Interlocked.Exchange(ref _statDecodeTicks, 0);
+        long bytes = Interlocked.Read(ref _conn.BytesReceived);
+        long delta = bytes - Interlocked.Exchange(ref _statBytesAtLast, bytes);
+        double decMs = frames > 0 ? dec * 1000.0 / Stopwatch.Frequency / frames : 0;
+        StatsUpdated?.Invoke($"{SenderName} • {Surface.Width}×{Surface.Height} • {frames / secs:0} quadros/s • {delta * 8 / secs / 1_000_000:0.0} Mbit/s • decodificação {decMs:0} ms");
+    }
+}
