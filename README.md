@@ -38,6 +38,8 @@ Instale nos dois computadores. Não é preciso ter o .NET instalado.
 
 **Executável único (sem instalar):** copie `TransLocal.exe` e execute. Não precisa do .NET instalado. Na aba *Configurações e ajuda*, clique em **Liberar no Firewall do Windows** no computador que vai receber.
 
+**Atualização automática:** ao abrir (e a cada 12 h, se ficar aberto na bandeja), o TransLocal procura uma versão nova nas Releases deste repositório, baixa em segundo plano, confere o SHA-256 publicado pelo GitHub e instala — esperando terminar qualquer transmissão. Na cópia instalada, o Windows pede permissão de administrador uma vez e o app reabre sozinho; no executável único, o arquivo é trocado e reaberto. Pode ser desligada em *Configurações e ajuda › Atualizações*, onde também há “Procurar atualizações agora”. *(Quem está na 1.1.0 ou anterior precisa instalar a 1.2.0 manualmente uma vez.)*
+
 > O executável não tem assinatura digital. Na primeira execução o Windows pode mostrar “O Windows protegeu o computador”: clique em **Mais informações › Executar assim mesmo**.
 
 ## Como usar
@@ -122,6 +124,7 @@ Diagnóstico (resultados em `%LOCALAPPDATA%\TransLocal\TransLocal.log`):
 TransLocal.exe --selftest <pasta>   # transmissão completa pela interface local; salva a imagem recebida
 TransLocal.exe --bench              # mede captura, codificação e decodificação
 TransLocal.exe --gamepad-test       # cria um controle virtual e confere pelo XInput (requer ViGEmBus)
+TransLocal.exe --update-test <pasta> # consulta o GitHub, baixa e confere a versão nova, troca o exe numa pasta de teste
 ```
 
 Estrutura:
@@ -129,6 +132,7 @@ Estrutura:
 ```
 src/TransLocal/
   Program.cs              entrada, instância única, modos de linha de comando
+  Updater.cs              atualização automática pelas Releases do GitHub
   Protocol.cs             mensagens TCP e handshake
   Discovery.cs            descoberta UDP e classificação das ligações (cabo/Wi-Fi)
   Streaming/              SenderSession (transmissor) e ReceiverServer (receptor)

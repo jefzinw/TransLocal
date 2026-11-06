@@ -7,6 +7,13 @@ internal sealed class AppSettings
     // Geral
     public string DeviceName { get; set; } = Environment.MachineName;
 
+    /// <summary>Procura e instala atualizações do GitHub ao abrir (e a cada 12 h).</summary>
+    public bool AutoUpdate { get; set; } = true;
+
+    /// <summary>Última versão cuja instalação automática foi tentada e quando (evita repetir em ciclo).</summary>
+    public string? LastUpdateAttempt { get; set; }
+    public DateTime LastUpdateAttemptUtc { get; set; }
+
     // Receptor (este PC mostra a tela de outro)
     public bool ReceiverEnabled { get; set; } = true;
     public bool ViewerFullscreen { get; set; } = true;

@@ -58,6 +58,21 @@ internal static class SystemIntegration
         }
     }
 
+    /// <summary>Remove o início automático só se ele aponta para este executável (outra cópia pode estar instalada).</summary>
+    public static void RemoveAutoStartIfOurs()
+    {
+        try
+        {
+            using var k = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
+            if (k?.GetValue(RunValue) is string cmd && cmd.Contains(ExePath, StringComparison.OrdinalIgnoreCase))
+                k.DeleteValue(RunValue, false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("Falha ao remover início automático", ex);
+        }
+    }
+
     /// <summary>Atualiza o caminho do início automático se o programa foi movido.</summary>
     public static void RefreshAutoStartPath()
     {

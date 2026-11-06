@@ -75,6 +75,9 @@ internal sealed class MainForm : Form
 
     // Configurações
     private readonly TextBox _txtName = new();
+    private readonly CheckBox _chkAutoUpdate = new();
+    private readonly Button _btnCheckUpdate = new();
+    private readonly Label _updateStatus = new();
     private readonly CheckBox _chkAutostart = new();
     private readonly Label _fwStatus = new();
     private readonly Button _btnFirewall = new();
@@ -597,6 +600,27 @@ internal sealed class MainForm : Form
         Add(t, Note("Ligações diretas por cabo aparecem no Windows como “rede não identificada” (pública), onde conexões de entrada são bloqueadas. " +
                     "A regra libera o TransLocal em todos os tipos de rede. O instalador já cria essa regra."));
 
+        Add(t, Heading("Atualizações"));
+        SetupCheck(_chkAutoUpdate, "Atualizar automaticamente ao abrir (baixa a versão nova do GitHub e instala)");
+        _chkAutoUpdate.CheckedChanged += (_, _) => SaveSetting(s => s.AutoUpdate = _chkAutoUpdate.Checked);
+        Add(t, _chkAutoUpdate);
+        SetupButton(_btnCheckUpdate, "Procurar atualizações agora");
+        _btnCheckUpdate.Click += async (_, _) =>
+        {
+            _btnCheckUpdate.Enabled = false;
+            try { await _app.CheckForUpdatesAsync(manual: true); }
+            finally { _btnCheckUpdate.Enabled = true; }
+        };
+        var btnReleases = new Button();
+        SetupButton(btnReleases, "Abrir página de versões");
+        btnReleases.Click += (_, _) => SystemIntegration.OpenUrl(Updater.ReleasesPage);
+        Add(t, Row(_btnCheckUpdate, btnReleases));
+        SetupStatus(_updateStatus);
+        _updateStatus.ForeColor = Muted;
+        Add(t, _updateStatus);
+        Add(t, Note("A atualização espera terminar qualquer transmissão. Na cópia instalada, o Windows pede permissão de administrador " +
+                    "uma vez; o TransLocal fecha e reabre sozinho, mantendo as configurações."));
+
         Add(t, Heading("Quais ligações funcionam"));
         Add(t, Note(
             "✔ Cabo de rede (RJ45) direto entre os dois computadores — funciona sem configurar nada (o Windows usa endereços 169.254.x.x). " +
@@ -644,6 +668,7 @@ internal sealed class MainForm : Form
             _chkAllowControl.Checked = s.SenderAllowControl;
             _chkHdmiFullscreen.Checked = s.HdmiFullscreen;
             _txtName.Text = s.DeviceName;
+            _chkAutoUpdate.Checked = s.AutoUpdate;
             _txtAddress.Text = s.LastReceiverAddress ?? "";
             _chkAutostart.Checked = SystemIntegration.IsAutoStartEnabled();
 
@@ -927,6 +952,7 @@ internal sealed class MainForm : Form
     private void RefreshState()
     {
         if (IsDisposed) return;
+        _updateStatus.Text = _app.UpdateStatus;
 
         // Receber
         if (_app.ReceiverError is { } err)

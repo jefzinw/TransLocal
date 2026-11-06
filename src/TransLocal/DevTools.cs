@@ -285,11 +285,66 @@ internal static class DevTools
         return failures == 0 ? 0 : 1;
     }
 
+    /// <summary>
+    /// Testa a atualização sem aplicá-la de verdade: consulta o GitHub, baixa e confere o arquivo e troca o
+    /// executável de uma cópia numa pasta de teste (não reabre nada nem mexe na cópia instalada).
+    /// </summary>
+    public static int UpdateTest(string dir)
+    {
+        int failures = 0;
+        void Check(bool ok, string what)
+        {
+            Log.Info($"UPDTEST {(ok ? "OK  " : "FALHOU")} {what}");
+            if (!ok) failures++;
+        }
+
+        Log.Info($"UPDTEST versão atual {Updater.Current} • cópia instalada: {Updater.IsInstalled}");
+        var portable = Updater.CheckAsync(CancellationToken.None, installed: false).GetAwaiter().GetResult();
+        var setup = Updater.CheckAsync(CancellationToken.None, installed: true).GetAwaiter().GetResult();
+        if (portable is null || setup is null)
+        {
+            Log.Info("UPDTEST nenhuma versão mais nova no GitHub (esta já é a mais recente).");
+            return portable is null && setup is null ? 0 : 1;
+        }
+        Check(true, $"GitHub: versão {portable.Version} ({portable.Tag})");
+        Log.Info($"UPDTEST portátil: {portable.AssetName} {portable.Size} bytes, SHA-256 do GitHub: {portable.Sha256 ?? "(não informado)"}");
+        Log.Info($"UPDTEST instalador: {setup.AssetName} {setup.Size} bytes, SHA-256 do GitHub: {setup.Sha256 ?? "(não informado)"}");
+
+        int lastLogged = -25;
+        var progress = new Progress<int>(p =>
+        {
+            if (p - lastLogged < 25) return;
+            lastLogged = p;
+            Log.Info($"UPDTEST baixando… {p}%");
+        });
+        string file = Updater.DownloadAsync(portable, progress, CancellationToken.None).GetAwaiter().GetResult();
+        Check(new FileInfo(file).Length == portable.Size, $"download completo e conferido ({file})");
+
+        Directory.CreateDirectory(dir);
+        string target = Path.Combine(dir, "TransLocal.exe");
+        File.Copy(SystemIntegration.ExePath, target, overwrite: true);
+        bool replaced = Updater.ReplaceExecutable(target, file);
+        string Hash(string p)
+        {
+            using var fs = File.OpenRead(p);
+            return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fs));
+        }
+        Check(replaced && Hash(target) == Hash(file) && File.Exists(Path.Combine(dir, "TransLocal.old.exe")),
+            "troca do executável na pasta de teste (antigo renomeado, novo no lugar)");
+        string? newVersion = FileVersionInfo.GetVersionInfo(target).ProductVersion;
+        Check(Updater.ParseVersion(newVersion) == portable.Version, $"versão do executável novo: {newVersion}");
+
+        try { Directory.Delete(dir, recursive: true); } catch { }
+        try { Directory.Delete(Updater.DownloadDirectory, recursive: true); } catch { }
+        Log.Info(failures == 0 ? "UPDTEST concluído: tudo certo" : $"UPDTEST concluído com {failures} falha(s)");
+        return failures == 0 ? 0 : 1;
+    }
+
     /// <summary>Salva imagens de cada aba da janela principal (para revisão visual).</summary>
     public static int UiScreenshots(string outDir)
     {
         Directory.CreateDirectory(outDir);
-        using var app = new TrayApp(startMinimized: true);
+        using var app = new TrayApp(startMinimized: true, autoUpdate: false);
         // Fora da área visível e sem ativar: não atrapalha quem estiver usando o computador.
         var form = new MainForm(app)
         {

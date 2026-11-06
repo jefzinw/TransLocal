@@ -12,12 +12,17 @@ namespace TransLocal.UI;
 internal sealed class TrayApp : ApplicationContext
 {
     public const string ShowEventName = @"Local\TransLocal.Show";
+    public const string QuitEventName = @"Local\TransLocal.Quit";
 
     private readonly NotifyIcon _tray;
     private readonly Control _ui;
     private readonly HotkeyWindow _hotkeys;
     private readonly EventWaitHandle _showEvent;
     private readonly RegisteredWaitHandle _showWait;
+    private readonly EventWaitHandle _quitEvent;
+    private readonly RegisteredWaitHandle _quitWait;
+    private System.Threading.Timer? _updateTimer;
+    private bool _updating;
     private readonly ToolStripMenuItem _miSend;
     private readonly ToolStripMenuItem _miHdmi;
     private readonly ToolStripMenuItem _miReceive;
@@ -46,10 +51,15 @@ internal sealed class TrayApp : ApplicationContext
     public string? LastSendEnd { get; private set; }
     public bool IsHdmiOpen => _hdmi is not null;
 
+    /// <summary>Texto sobre atualizações (para a aba Configurações).</summary>
+    public string UpdateStatus { get; private set; } = $"Versão {Updater.Current}.";
+
+    private bool IsBusy => IsSending || IsConnecting || _viewSession is not null || IsHdmiOpen;
+
     /// <summary>Disparado na thread da interface quando algo muda.</summary>
     public event Action? StateChanged;
 
-    public TrayApp(bool startMinimized)
+    public TrayApp(bool startMinimized, bool justUpdated = false, bool autoUpdate = true)
     {
         Settings = AppSettings.Load();
         bool firstRun = !File.Exists(AppSettings.FilePath);
@@ -90,6 +100,9 @@ internal sealed class TrayApp : ApplicationContext
 
         _showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEventName);
         _showWait = ThreadPool.RegisterWaitForSingleObject(_showEvent, (_, _) => Ui(() => ShowMain()), null, -1, false);
+        // O instalador (atualização/desinstalação) pede para fechar com “TransLocal.exe --quit”.
+        _quitEvent = new EventWaitHandle(false, EventResetMode.AutoReset, QuitEventName);
+        _quitWait = ThreadPool.RegisterWaitForSingleObject(_quitEvent, (_, _) => Ui(Exit), null, -1, true);
 
         SystemIntegration.RefreshAutoStartPath();
         SystemIntegration.RestoreGameBarPromptIfGameBarInstalled();
@@ -102,6 +115,114 @@ internal sealed class TrayApp : ApplicationContext
 
         if (!startMinimized) ShowMain();
         Log.Info($"TransLocal {SystemIntegration.Version} iniciado ({SystemIntegration.ExePath})");
+
+        Updater.Cleanup();
+        if (justUpdated)
+        {
+            Balloon("TransLocal atualizado", $"Agora na versão {Updater.Current}.");
+            UpdateStatus = $"Atualizado para a versão {Updater.Current}.";
+        }
+        // Atualização automática: pouco depois de abrir e, depois, a cada 12 horas.
+        if (autoUpdate)
+        {
+            _updateTimer = new System.Threading.Timer(_ => Ui(() =>
+            {
+                if (Settings.AutoUpdate) _ = CheckForUpdatesAsync(manual: false);
+            }), null, TimeSpan.FromSeconds(8), TimeSpan.FromHours(12));
+        }
+    }
+
+    // ================= Atualização automática =================
+
+    private void SetUpdateStatus(string text)
+    {
+        UpdateStatus = text;
+        Changed();
+    }
+
+    /// <summary>Procura, baixa e aplica uma atualização. <paramref name="manual"/> = pedido pelo botão.</summary>
+    public async Task CheckForUpdatesAsync(bool manual)
+    {
+        if (_updating || IsExiting) return;
+        _updating = true;
+        try
+        {
+            bool installed = Updater.IsInstalled;
+            SetUpdateStatus("Procurando atualizações…");
+            var info = await Updater.CheckAsync(CancellationToken.None, installed);
+            if (info is null)
+            {
+                SetUpdateStatus($"Você está na versão mais recente ({Updater.Current}).");
+                return;
+            }
+            Log.Info($"Atualização disponível: {info.Version} ({info.AssetName})");
+
+            // Evita ciclo: se a mesma versão já foi tentada há pouco e não “pegou”, só tenta de novo pelo botão.
+            if (!manual && Settings.LastUpdateAttempt == info.Version.ToString() &&
+                DateTime.UtcNow - Settings.LastUpdateAttemptUtc < TimeSpan.FromHours(24))
+            {
+                SetUpdateStatus($"Versão {info.Version} disponível. Use “Procurar atualizações agora” para instalar.");
+                return;
+            }
+
+            await WaitUntilIdleAsync(info);
+            SetUpdateStatus($"Baixando a versão {info.Version}…");
+            if (!manual) Balloon("Atualização do TransLocal", $"Baixando a versão {info.Version} em segundo plano…");
+            var progress = new Progress<int>(p => SetUpdateStatus($"Baixando a versão {info.Version}… {p}%"));
+            string file = await Updater.DownloadAsync(info, progress, CancellationToken.None);
+            await WaitUntilIdleAsync(info);
+
+            Settings.LastUpdateAttempt = info.Version.ToString();
+            Settings.LastUpdateAttemptUtc = DateTime.UtcNow;
+            Settings.Save();
+
+            if (installed)
+            {
+                SetUpdateStatus($"Instalando a versão {info.Version}… confirme a permissão do Windows.");
+                Balloon("Instalando atualização", $"Versão {info.Version}: confirme a permissão do Windows. O TransLocal fecha e reabre sozinho.");
+                var setup = Updater.StartInstaller(file);
+                if (setup is not null)
+                {
+                    // Se o instalador terminar e este processo ainda estiver aberto, a instalação não aconteceu
+                    // (permissão negada, por exemplo). Com sucesso, o instalador fecha este processo antes.
+                    await setup.WaitForExitAsync();
+                    SetUpdateStatus($"A instalação da versão {info.Version} não foi concluída (a permissão do Windows foi negada?). Tente pelo botão.");
+                }
+            }
+            else
+            {
+                if (Updater.ReplaceExecutable(SystemIntegration.ExePath, file))
+                {
+                    Log.Info($"Executável atualizado para {info.Version}; reabrindo");
+                    Updater.RelaunchUpdated();
+                    Exit();
+                }
+                else
+                {
+                    SetUpdateStatus($"Versão {info.Version} baixada, mas sem permissão para trocar o arquivo nesta pasta. Baixe pelo GitHub.");
+                    if (manual) SystemIntegration.OpenUrl(info.PageUrl);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("Atualização automática falhou", ex);
+            SetUpdateStatus("Não foi possível atualizar agora: " + ex.Message);
+        }
+        finally
+        {
+            _updating = false;
+        }
+    }
+
+    /// <summary>Não atualiza no meio de uma transmissão ou exibição.</summary>
+    private async Task WaitUntilIdleAsync(UpdateInfo info)
+    {
+        while (IsBusy && !IsExiting)
+        {
+            SetUpdateStatus($"Versão {info.Version} disponível — será instalada quando a transmissão terminar.");
+            await Task.Delay(TimeSpan.FromSeconds(20));
+        }
     }
 
     // ================= Utilidades =================
@@ -474,8 +595,11 @@ internal sealed class TrayApp : ApplicationContext
         StopReceiver();
         try { ControllerService.Shutdown(); } catch { }
         _hotkeys.Dispose();
+        _updateTimer?.Dispose();
         _showWait.Unregister(null);
         _showEvent.Dispose();
+        _quitWait.Unregister(null);
+        _quitEvent.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         if (_main is not null && !_main.IsDisposed) _main.Close();

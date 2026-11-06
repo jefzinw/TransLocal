@@ -22,12 +22,19 @@ function Find-First([string[]]$candidates) {
     return $null
 }
 
+# Usa o primeiro dotnet que tenha um SDK instalado (só o runtime não compila).
 $cmd = Get-Command dotnet -ErrorAction SilentlyContinue
-$dotnet = Find-First @(
-    $(if ($cmd) { $cmd.Source } else { $null }),
-    "$env:LOCALAPPDATA\Microsoft\dotnet\dotnet.exe",
-    "$env:ProgramFiles\dotnet\dotnet.exe")
+$dotnet = $null
+foreach ($candidate in @(
+        $(if ($cmd) { $cmd.Source } else { $null }),
+        "$env:LOCALAPPDATA\Microsoft\dotnet\dotnet.exe",
+        "$env:ProgramFiles\dotnet\dotnet.exe")) {
+    if (-not $candidate -or -not (Test-Path $candidate)) { continue }
+    $sdks = & $candidate --list-sdks 2>$null
+    if ($LASTEXITCODE -eq 0 -and $sdks) { $dotnet = $candidate; break }
+}
 if (-not $dotnet) { throw "SDK do .NET 10 não encontrado. Instale em https://dot.net" }
+Write-Host "Usando $dotnet"
 
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 $env:DOTNET_NOLOGO = '1'

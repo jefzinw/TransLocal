@@ -30,8 +30,19 @@ internal static class Program
         }
         if (Has("--cleanup"))
         {
-            SystemIntegration.SetAutoStart(false);
+            SystemIntegration.RemoveAutoStartIfOurs();
             SystemIntegration.RestoreGameBarPrompt();
+            return 0;
+        }
+        if (Has("--quit"))
+        {
+            // Usado pelo instalador: pede para a instância em execução fechar normalmente.
+            try
+            {
+                using var ev = EventWaitHandle.OpenExisting(TrayApp.QuitEventName);
+                ev.Set();
+            }
+            catch (WaitHandleCannotBeOpenedException) { }
             return 0;
         }
         if (Has("--fix-gamebar-prompt"))
@@ -46,12 +57,13 @@ internal static class Program
         }
 
         // ---- Diagnóstico ----
-        if (Has("--bench") || Has("--selftest") || Has("--ui-screenshot") || Has("--gamepad-test"))
+        if (Has("--bench") || Has("--selftest") || Has("--ui-screenshot") || Has("--gamepad-test") || Has("--update-test"))
         {
             Log.Echo = Native.AttachConsole(Native.ATTACH_PARENT_PROCESS);
             try
             {
                 if (Has("--bench")) return DevTools.Bench();
+                if (Has("--update-test")) return DevTools.UpdateTest(Arg("--update-test") ?? Path.Combine(Path.GetTempPath(), "TransLocal-UpdateTest"));
                 if (Has("--gamepad-test")) return DevTools.GamepadTest();
                 if (Has("--selftest")) return DevTools.SelfTest(Arg("--selftest") ?? Log.DataDirectory);
                 return DevTools.UiScreenshots(Arg("--ui-screenshot") ?? Log.DataDirectory);
@@ -90,7 +102,7 @@ internal static class Program
             e.SetObserved();
         };
 
-        using var app = new TrayApp(startMinimized: Has("--minimized"));
+        using var app = new TrayApp(startMinimized: Has("--minimized"), justUpdated: Has("--updated"));
         Application.Run(app);
         return 0;
     }
