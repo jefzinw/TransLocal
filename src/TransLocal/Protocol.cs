@@ -54,6 +54,25 @@ internal sealed class WelcomeMessage
     public bool Accepted { get; set; }
     public string Name { get; set; } = "";
     public string? Reason { get; set; }
+
+    /// <summary>Tamanho da tela onde a transmissão será exibida (0 em versões antigas).</summary>
+    public int ScreenWidth { get; set; }
+    public int ScreenHeight { get; set; }
+
+    /// <summary>O receptor pede uma transmissão leve (computador mais simples).</summary>
+    public bool Light { get; set; }
+}
+
+/// <summary>Preferências do receptor enviadas no handshake.</summary>
+internal readonly record struct ReceiverPrefs(int ScreenWidth, int ScreenHeight, bool Light);
+
+/// <summary>Limites da transmissão leve.</summary>
+internal static class LightMode
+{
+    public const int MaxWidth = 1366;
+    public const int MaxHeight = 768;
+    public const int MaxFps = 30;
+    public const int MaxQuality = 55;
 }
 
 internal sealed class DiscoveryReply

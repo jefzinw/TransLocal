@@ -93,6 +93,10 @@ internal sealed class TrayApp : ApplicationContext
 
         SystemIntegration.RefreshAutoStartPath();
         SystemIntegration.RestoreGameBarPromptIfGameBarInstalled();
+
+        // Controles de jogo (SDL): mapeamentos salvos e inicialização em segundo plano.
+        ControllerService.InitialMappings = () => Settings.ControllerMappings.ToArray();
+        _ = Task.Run(() => _ = ControllerService.Instance);
         if (Settings.ReceiverEnabled) StartReceiver();
         if (firstRun) Settings.Save();
 
@@ -170,7 +174,12 @@ internal sealed class TrayApp : ApplicationContext
     private void StartReceiver()
     {
         if (_receiver is not null) return;
-        var server = new ReceiverServer(() => Settings.DeviceName, () => Settings.ReceiverPlayAudio);
+        var server = new ReceiverServer(() => Settings.DeviceName, () => Settings.ReceiverPlayAudio, () =>
+        {
+            // A imagem chega no tamanho da tela onde será exibida (o transmissor reduz se for maior).
+            var screen = Monitors.Resolve(Settings.ViewerMonitor).Bounds;
+            return new ReceiverPrefs(screen.Width, screen.Height, Settings.ReceiverLight);
+        });
         server.SessionStarted += s => Ui(() => OnViewStarted(s));
         server.SessionEnded += (s, reason) => Ui(() => OnViewEnded(s, reason));
         try
@@ -216,6 +225,7 @@ internal sealed class TrayApp : ApplicationContext
         s.FrameReady += viewer.NotifyFrame;
         s.StatsUpdated += viewer.SetStats;
         _viewViewer = viewer;
+        s.Surface.FastScaling = s.Light;
         if (s.ControlAllowed) StartGamepads(s, viewer);
         viewer.Show();
         viewer.Activate();
@@ -312,6 +322,7 @@ internal sealed class TrayApp : ApplicationContext
                 Quality = Settings.SenderQuality,
                 Audio = Settings.SenderAudio,
                 AllowControl = Settings.SenderAllowControl,
+                Resolution = Settings.SenderResolution,
             };
             var session = await SenderSession.ConnectAsync(host, port, opt, CancellationToken.None);
             session.StatsUpdated += text => Ui(() =>
@@ -461,6 +472,7 @@ internal sealed class TrayApp : ApplicationContext
             try { Task.Run(async () => await hdmi.DisposeAsync()).Wait(3000); } catch { }
         }
         StopReceiver();
+        try { ControllerService.Shutdown(); } catch { }
         _hotkeys.Dispose();
         _showWait.Unregister(null);
         _showEvent.Dispose();

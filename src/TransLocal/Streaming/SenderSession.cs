@@ -16,6 +16,44 @@ internal sealed class SenderOptions
     public int Quality { get; init; } = 75;
     public bool Audio { get; init; } = true;
     public bool AllowControl { get; init; }
+
+    /// <summary>"auto" (tela do receptor), "original" ou um limite como "1280x720".</summary>
+    public string Resolution { get; init; } = "auto";
+}
+
+/// <summary>Limites efetivos da transmissão, combinando a configuração local e o pedido do receptor.</summary>
+internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fps, int Quality, bool Light)
+{
+    public static StreamLimits Compute(SenderOptions opt, WelcomeMessage welcome)
+    {
+        int mw = 0, mh = 0;
+        switch (opt.Resolution?.Trim().ToLowerInvariant())
+        {
+            case "original":
+                break;
+            case null or "" or "auto":
+                mw = welcome.ScreenWidth;
+                mh = welcome.ScreenHeight;
+                break;
+            default:
+                var parts = opt.Resolution.ToLowerInvariant().Split('x', '×');
+                if (parts.Length == 2 && int.TryParse(parts[0], out var w) && int.TryParse(parts[1], out var h) && w > 0 && h > 0)
+                {
+                    mw = w;
+                    mh = h;
+                }
+                break;
+        }
+        int fps = opt.Fps, quality = opt.Quality;
+        if (welcome.Light)
+        {
+            mw = mw <= 0 ? LightMode.MaxWidth : Math.Min(mw, LightMode.MaxWidth);
+            mh = mh <= 0 ? LightMode.MaxHeight : Math.Min(mh, LightMode.MaxHeight);
+            fps = Math.Min(fps, LightMode.MaxFps);
+            quality = Math.Min(quality, LightMode.MaxQuality);
+        }
+        return new StreamLimits(mw, mh, fps, quality, welcome.Light);
+    }
 }
 
 /// <summary>Transmite a tela (e o som) deste computador para um receptor.</summary>
@@ -27,6 +65,8 @@ internal sealed class SenderSession : IDisposable
     private readonly LoopbackAudioSource? _audio;
     private readonly InputInjector? _injector;
     private readonly VirtualGamepads? _gamepads;
+    private readonly StreamLimits _limits;
+    private Size _sendSize;
     private readonly SemaphoreSlim _inflight = new(Proto.MaxFramesInFlight, Proto.MaxFramesInFlight);
     private readonly CancellationTokenSource _cts = new();
     private System.Threading.Timer? _pingTimer;
@@ -53,12 +93,17 @@ internal sealed class SenderSession : IDisposable
     /// <summary>Fim da sessão; o texto é o motivo (null quando parada localmente).</summary>
     public event Action<SenderSession, string?>? Ended;
 
-    private SenderSession(Connection conn, SenderOptions opt, string receiverName, Screen screen, LoopbackAudioSource? audio, string gamepadStatus)
+    /// <summary>Limites efetivos (resolução máxima, quadros/s, qualidade, modo leve).</summary>
+    public StreamLimits Limits => _limits;
+
+    private SenderSession(Connection conn, SenderOptions opt, string receiverName, Screen screen, LoopbackAudioSource? audio,
+        string gamepadStatus, StreamLimits limits)
     {
         _conn = conn;
         _opt = opt;
         _screen = screen;
         _audio = audio;
+        _limits = limits;
         ReceiverName = receiverName;
         GamepadStatus = gamepadStatus;
         if (opt.AllowControl) _injector = new InputInjector(screen.Bounds);
@@ -147,7 +192,7 @@ internal sealed class SenderSession : IDisposable
             if (!welcome.Accepted)
                 throw new InvalidOperationException(welcome.Reason ?? "O receptor recusou a transmissão.");
 
-            var session = new SenderSession(conn, opt, welcome.Name, screen, audio, gamepadStatus);
+            var session = new SenderSession(conn, opt, welcome.Name, screen, audio, gamepadStatus, StreamLimits.Compute(opt, welcome));
             session.Start();
             return session;
         }
@@ -169,7 +214,10 @@ internal sealed class SenderSession : IDisposable
 
     private void Start()
     {
-        Log.Info($"Transmitindo {_screen.DeviceName} {_screen.Bounds} para {ReceiverName} ({RemoteEndPoint}), {_opt.Fps} fps, qualidade {_opt.Quality}, áudio={_audio is not null}, controle={_opt.AllowControl}, controles de jogo={GamepadStatus}");
+        string maxRes = _limits.MaxWidth > 0 ? $"até {_limits.MaxWidth}×{_limits.MaxHeight}" : "original";
+        Log.Info($"Transmitindo {_screen.DeviceName} {_screen.Bounds} para {ReceiverName} ({RemoteEndPoint}), resolução {maxRes}, " +
+                 $"{_limits.Fps} fps, qualidade {_limits.Quality}{(_limits.Light ? " (modo leve pedido pelo receptor)" : "")}, " +
+                 $"áudio={_audio is not null}, controle={_opt.AllowControl}, controles de jogo={GamepadStatus}");
 
         new Thread(VideoLoop) { IsBackground = true, Name = "TransLocal vídeo", Priority = ThreadPriority.AboveNormal }.Start();
         new Thread(ReadLoop) { IsBackground = true, Name = "TransLocal leitura" }.Start();
@@ -194,10 +242,12 @@ internal sealed class SenderSession : IDisposable
         Native.SetThreadExecutionState(Native.ES_CONTINUOUS | Native.ES_SYSTEM_REQUIRED | Native.ES_DISPLAY_REQUIRED);
         ScreenCapturer? capturer = null;
         TileEncoder? encoder = null;
+        FrameScaler? scaler = null;
+        bool needFrame = true;
         var ct = _cts.Token;
         try
         {
-            long interval = Stopwatch.Frequency / Math.Clamp(_opt.Fps, 1, 120);
+            long interval = Stopwatch.Frequency / Math.Clamp(_limits.Fps, 1, 120);
             long next = Stopwatch.GetTimestamp();
             long lastBoundsCheck = Stopwatch.GetTimestamp();
             var screen = _screen;
@@ -220,9 +270,16 @@ internal sealed class SenderSession : IDisposable
                 if (capturer is null)
                 {
                     capturer = ScreenCapturer.Create(screen);
-                    encoder = new TileEncoder(capturer.Width, capturer.Height);
+                    var size = FrameScaler.Fit(new Size(capturer.Width, capturer.Height), _limits.MaxWidth, _limits.MaxHeight);
+                    scaler = size == new Size(capturer.Width, capturer.Height)
+                        ? null
+                        : new FrameScaler(capturer.Width, capturer.Height, size.Width, size.Height);
+                    encoder = new TileEncoder(size.Width, size.Height);
+                    _sendSize = size;
+                    needFrame = true;
                     _injector?.SetMonitor(capturer.Bounds);
-                    Log.Info($"Captura {capturer.Method} de {screen.DeviceName} {capturer.Width}×{capturer.Height}");
+                    Log.Info($"Captura {capturer.Method} de {screen.DeviceName} {capturer.Width}×{capturer.Height}" +
+                             (scaler is null ? "" : $", enviada em {size.Width}×{size.Height}"));
                 }
 
                 if (!_inflight.Wait(500, ct)) continue;
@@ -230,10 +287,18 @@ internal sealed class SenderSession : IDisposable
                 bool sent = false;
                 try
                 {
-                    if (capturer.Capture(drawCursor: true))
+                    // Sem mudança na tela (nem no cursor): não precisa reduzir nem comparar a imagem.
+                    if (capturer.Capture(drawCursor: true) && (capturer.LastCaptureChanged || needFrame))
                     {
+                        needFrame = false;
                         long t0 = Stopwatch.GetTimestamp();
-                        using var frame = encoder!.Encode(capturer.Bits, _opt.Quality, Interlocked.Increment(ref _frameId));
+                        IntPtr bits = capturer.Bits;
+                        if (scaler is not null)
+                        {
+                            scaler.Scale(capturer);
+                            bits = scaler.Bits;
+                        }
+                        using var frame = encoder!.Encode(bits, _limits.Quality, Interlocked.Increment(ref _frameId));
                         Interlocked.Add(ref _statEncodeTicks, Stopwatch.GetTimestamp() - t0);
                         if (frame.TileCount > 0)
                         {
@@ -340,7 +405,8 @@ internal sealed class SenderSession : IDisposable
         double mbps = deltaBytes * 8 / secs / 1_000_000;
         double encMs = frames > 0 ? encTicks * 1000.0 / Stopwatch.Frequency / frames : 0;
         string rtt = double.IsNaN(_rttMs) ? "–" : $"{_rttMs:0.#} ms";
-        StatsUpdated?.Invoke($"{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s • codificação {encMs:0} ms • ida e volta {rtt}");
+        string size = _sendSize.IsEmpty ? "" : $"{_sendSize.Width}×{_sendSize.Height}{(_limits.Light ? " (leve)" : "")} • ";
+        StatsUpdated?.Invoke($"{size}{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s • codificação {encMs:0} ms • ida e volta {rtt}");
     }
 
     private void End(string? reason)

@@ -136,22 +136,29 @@ internal static class XInput
 }
 
 /// <summary>
-/// No computador que exibe: lê os controles USB a cada 4 ms e envia as mudanças ao transmissor
-/// enquanto <paramref name="isActive"/> for verdadeiro (janela de exibição em primeiro plano, controle ligado).
+/// No computador que exibe: lê os controles (USB ou Bluetooth) a cada 4 ms e envia as mudanças ao transmissor
+/// enquanto <c>isActive</c> for verdadeiro (janela de exibição em primeiro plano, controle ligado).
 /// Quando deixa de estar ativo, envia o controle em repouso para nada ficar “preso”.
+/// Usa a SDL (Xbox, PlayStation, Switch, genéricos); sem ela, só XInput.
 /// </summary>
 internal sealed class GamepadForwarder : IDisposable
 {
     private readonly Action<byte[]> _send;
     private readonly Func<bool> _isActive;
     private readonly bool _canSend;
+    private readonly ControllerService? _sdl;
     private readonly GamepadState?[] _lastSent = new GamepadState?[XInput.MaxControllers];
+    private readonly uint?[] _slotOwner = new uint?[XInput.MaxControllers];
     private readonly bool[] _rumbling = new bool[XInput.MaxControllers];
+    private readonly bool[] _xinputPresent = new bool[XInput.MaxControllers];
     private volatile bool _running = true;
     private readonly Thread _thread;
 
     /// <summary>Quantos controles estão conectados neste computador agora.</summary>
     public int ConnectedCount { get; private set; }
+
+    /// <summary>Nomes dos controles conectados (para a interface).</summary>
+    public IReadOnlyList<string> Names { get; private set; } = Array.Empty<string>();
 
     /// <param name="canSend">false quando o outro computador não aceita controles (só conta os conectados).</param>
     public GamepadForwarder(Action<byte[]> send, Func<bool> isActive, bool canSend)
@@ -159,6 +166,15 @@ internal sealed class GamepadForwarder : IDisposable
         _send = send;
         _isActive = isActive;
         _canSend = canSend;
+        try
+        {
+            var sdl = ControllerService.Instance;
+            if (sdl.Available) _sdl = sdl;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("SDL indisponível; controles só via XInput", ex);
+        }
         _thread = new Thread(Loop) { IsBackground = true, Name = "TransLocal controles", Priority = ThreadPriority.AboveNormal };
         _thread.Start();
     }
@@ -166,45 +182,44 @@ internal sealed class GamepadForwarder : IDisposable
     private void Loop()
     {
         Native.timeBeginPeriod(1);
-        var present = new bool[XInput.MaxControllers];
+        using var active = _sdl?.BeginActive();
         try
         {
             long tick = 0;
             while (_running)
             {
-                bool active = _canSend && _isActive();
-                for (int i = 0; i < XInput.MaxControllers; i++)
+                var current = _sdl is not null ? ReadSdl() : ReadXInput(tick);
+                AssignSlots(current);
+                bool isActive = _canSend && _isActive();
+
+                for (int slot = 0; slot < XInput.MaxControllers; slot++)
                 {
-                    // Consultar um slot vazio é lento no XInput: slots vazios só a cada ~0,5 s.
-                    if (!present[i] && tick % 125 != 0) continue;
-
-                    present[i] = XInput.TryGetState(i, out var state, out _);
-                    if (!_canSend) continue;
-
-                    var last = _lastSent[i];
-                    if (!present[i])
+                    if (!_canSend) break;
+                    var last = _lastSent[slot];
+                    if (_slotOwner[slot] is not { } owner || !current.TryGetValue(owner, out var state))
                     {
                         // Controle desconectado aqui: desconecta o controle virtual lá.
                         if (last is { } l) Send(l.Neutral() with { Connected = false });
-                        _lastSent[i] = null;
+                        _lastSent[slot] = null;
                         continue;
                     }
 
+                    state = state with { Slot = (byte)slot, Connected = true };
                     // Fora de foco (ou controle desligado): mantém o controle virtual, mas em repouso.
-                    var desired = active ? state : state.Neutral();
+                    var desired = isActive ? state : state.Neutral();
                     if (last is null)
                     {
                         // O controle virtual só é criado quando o controle é usado com a exibição em foco.
-                        if (!active) continue;
+                        if (!isActive) continue;
                     }
                     else if (last.Value == desired)
                     {
                         continue;
                     }
                     Send(desired);
-                    _lastSent[i] = desired;
+                    _lastSent[slot] = desired;
                 }
-                ConnectedCount = present.Count(p => p);
+                ConnectedCount = current.Count;
                 tick++;
                 Thread.Sleep(4);
             }
@@ -219,6 +234,43 @@ internal sealed class GamepadForwarder : IDisposable
         }
     }
 
+    private Dictionary<uint, GamepadState> ReadSdl()
+    {
+        var snap = _sdl!.Snapshot;
+        Names = snap.Controllers.Select(c => c.Describe()).ToList();
+        return new Dictionary<uint, GamepadState>(snap.States);
+    }
+
+    private Dictionary<uint, GamepadState> ReadXInput(long tick)
+    {
+        var result = new Dictionary<uint, GamepadState>();
+        for (int i = 0; i < XInput.MaxControllers; i++)
+        {
+            // Consultar um slot vazio é lento no XInput: slots vazios só a cada ~0,5 s.
+            if (!_xinputPresent[i] && tick % 125 != 0) continue;
+            _xinputPresent[i] = XInput.TryGetState(i, out var s, out _);
+            if (_xinputPresent[i]) result[(uint)i] = s;
+        }
+        Names = result.Keys.Select(k => $"Controle XInput {k + 1}").ToList();
+        return result;
+    }
+
+    /// <summary>Cada controle local ocupa um dos 4 controles virtuais enquanto estiver conectado.</summary>
+    private void AssignSlots(Dictionary<uint, GamepadState> current)
+    {
+        for (int s = 0; s < _slotOwner.Length; s++)
+        {
+            if (_slotOwner[s] is { } owner && !current.ContainsKey(owner)) _slotOwner[s] = null;
+        }
+        foreach (var id in current.Keys.OrderBy(k => k))
+        {
+            if (Array.IndexOf(_slotOwner, id) >= 0) continue;
+            int free = Array.FindIndex(_slotOwner, o => o is null);
+            if (free < 0) break;
+            _slotOwner[free] = id;
+        }
+    }
+
     private void Send(GamepadState s)
     {
         try { _send(GamepadCodec.Encode(s)); } catch { }
@@ -227,9 +279,10 @@ internal sealed class GamepadForwarder : IDisposable
     /// <summary>Vibração pedida pelo jogo no outro computador.</summary>
     public void Rumble(int slot, byte large, byte small)
     {
-        if (slot is < 0 or >= XInput.MaxControllers) return;
+        if (slot is < 0 or >= XInput.MaxControllers || _slotOwner[slot] is not { } owner) return;
         _rumbling[slot] = large != 0 || small != 0;
-        XInput.SetVibration(slot, large, small);
+        if (_sdl is not null) _sdl.Rumble(owner, large, small);
+        else XInput.SetVibration((int)owner, large, small);
     }
 
     public void Dispose()
@@ -238,7 +291,7 @@ internal sealed class GamepadForwarder : IDisposable
         _thread.Join(500);
         for (int i = 0; i < XInput.MaxControllers; i++)
         {
-            if (_rumbling[i]) XInput.SetVibration(i, 0, 0);
+            if (_rumbling[i]) Rumble(i, 0, 0);
         }
     }
 }

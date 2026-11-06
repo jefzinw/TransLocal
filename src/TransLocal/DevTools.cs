@@ -40,6 +40,25 @@ internal static class DevTools
         }
         var enc = new TileEncoder(cap.Width, cap.Height);
 
+        // Redução de resolução (transmissão leve) + codificação do quadro reduzido.
+        foreach (var (mw, mh) in new[] { (1600, 900), (1366, 768), (1280, 720), (854, 480) })
+        {
+            var size = FrameScaler.Fit(new Size(cap.Width, cap.Height), mw, mh);
+            var scaler = new FrameScaler(cap.Width, cap.Height, size.Width, size.Height);
+            var scaleMs = new List<double>();
+            for (int i = 0; i < 15; i++)
+            {
+                long t = Stopwatch.GetTimestamp();
+                scaler.Scale(cap);
+                scaleMs.Add(Ms(t));
+            }
+            var senc = new TileEncoder(size.Width, size.Height);
+            long te = Stopwatch.GetTimestamp();
+            using var sf = senc.Encode(scaler.Bits, 55, 1);
+            double encMs = Ms(te);
+            Log.Info($"BENCH redução para {size.Width}×{size.Height}: {scaleMs.Skip(3).Average():0.0} ms • quadro inteiro q55 {sf.Length / 1024} KiB em {encMs:0.0} ms");
+        }
+
         // Detecção de mudanças com imagem controlada: mesma imagem => 0 faixas; um bloco alterado => 1 faixa.
         unsafe
         {
@@ -119,7 +138,8 @@ internal static class DevTools
             if (!ok) failures++;
         }
 
-        using var server = new ReceiverServer(() => "Receptor-Teste", () => false, port, discoveryPort);
+        var prefs = new ReceiverPrefs(0, 0, false);
+        using var server = new ReceiverServer(() => "Receptor-Teste", () => false, () => prefs, port, discoveryPort);
         var started = new TaskCompletionSource<ReceiverSession>(TaskCreationOptions.RunContinuationsAsynchronously);
         var ended = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         server.SessionStarted += s => started.TrySetResult(s);
@@ -171,8 +191,14 @@ internal static class DevTools
         Log.Info($"SELFTEST controles XInput conectados neste computador: {Input.XInput.CountConnected()}");
         bool driver = Input.VirtualGamepads.IsDriverInstalled(out var driverError);
         Log.Info($"SELFTEST driver ViGEmBus neste computador: {(driver ? "instalado" : "ausente (" + driverError + ")")}");
+        var sdl = Input.ControllerService.Instance;
+        Check(sdl.Available, $"SDL3 carregada para controles USB/Bluetooth{(sdl.Available ? "" : " — " + sdl.Error)}");
+        await Task.Delay(400);
+        foreach (var c in sdl.Snapshot.Controllers) Log.Info($"SELFTEST controle neste computador: {c.Describe()} [{c.Kind}]");
+        Log.Info($"SELFTEST controles via SDL neste computador: {sdl.Snapshot.Controllers.Count}");
 
-        // Nova sessão com controle permitido, encerrada pelo transmissor.
+        // Nova sessão: receptor pede modo leve numa tela 1366×768; controle permitido; encerrada pelo transmissor.
+        prefs = new ReceiverPrefs(1366, 768, true);
         var started2 = new TaskCompletionSource<ReceiverSession>(TaskCreationOptions.RunContinuationsAsynchronously);
         var ended2 = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         server.SessionStarted += s => started2.TrySetResult(s);
@@ -186,14 +212,20 @@ internal static class DevTools
         Check(session2.FromThisComputer && !session2.ControlAllowed && session2.GamepadStatus == Input.VirtualGamepads.StatusDisabled,
             "controle bloqueado quando a transmissão vem do próprio computador");
         session2.SendGamepad(Input.GamepadCodec.Encode(padIn with { Slot = 0 })); // deve ser ignorado
-        await Task.Delay(800);
+        await Task.Delay(1500);
         Check(sender2.IsRunning && Input.XInput.CountConnected() == 0, "nenhum controle virtual criado; transmissão segue ativa");
+        Check(sender2.Limits == new StreamLimits(1366, 768, 30, 55, true),
+            $"modo leve aplicado pelo transmissor ({sender2.Limits})");
+        Check(Interlocked.Read(ref session2.FramesReceived) >= 1 && session2.Surface.Width == 1366 && session2.Surface.Height == 768,
+            $"imagem reduzida recebida em {session2.Surface.Width}×{session2.Surface.Height} (pedido: 1366×768)");
+        session2.Surface.SavePng(Path.Combine(outDir, "selftest-leve-1366x768.png"));
         sender2.Stop();
         var reasonAtReceiver = await ended2.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Check(reasonAtReceiver is not null, $"receptor avisado do fim (“{reasonAtReceiver}”)");
         session2.Surface.Dispose();
 
         server.Stop();
+        Input.ControllerService.Shutdown();
         Log.Info(failures == 0 ? "SELFTEST concluído: tudo certo" : $"SELFTEST concluído com {failures} falha(s)");
         return failures == 0 ? 0 : 1;
     }

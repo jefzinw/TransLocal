@@ -43,6 +43,10 @@ internal sealed class MainForm : Form
     private readonly CheckBox _chkStats = new();
     private readonly CheckBox _chkAutoControl = new();
     private readonly Label _padsHere = new();
+    private readonly ListBox _lstPads = new();
+    private readonly Button _btnPadSetup = new();
+    private readonly CheckBox _chkLight = new();
+    private readonly ComboBox _cmbResolution = new();
     private readonly System.Windows.Forms.Timer _padsTimer = new() { Interval = 1500 };
 
     // Transmitir
@@ -330,18 +334,34 @@ internal sealed class MainForm : Form
         _chkStats.CheckedChanged += (_, _) => SaveSetting(s => s.ShowStats = _chkStats.Checked);
         Add(t, _chkStats);
 
+        SetupCheck(_chkLight, $"Pedir transmissão leve — para computadores mais simples (até {LightMode.MaxWidth}×{LightMode.MaxHeight}, {LightMode.MaxFps} quadros/s, mais compressão)");
+        _chkLight.CheckedChanged += (_, _) => SaveSetting(s => s.ReceiverLight = _chkLight.Checked);
+        Add(t, _chkLight);
+        Add(t, Note("A imagem já chega na resolução desta tela quando o outro computador usa “Resolução enviada: Automática” (padrão), " +
+                    "o que deixa a exibição mais leve. O modo leve reduz também os quadros por segundo e a banda."));
+
         Add(t, Heading("Controlar o outro computador daqui"));
-        SetupCheck(_chkAutoControl, "Começar já controlando quando o outro computador permitir (mouse, teclado e controles de jogo USB)");
+        SetupCheck(_chkAutoControl, "Começar já controlando quando o outro computador permitir (mouse, teclado e controles de jogo)");
         _chkAutoControl.CheckedChanged += (_, _) => SaveSetting(s => s.ViewerAutoControl = _chkAutoControl.Checked);
         Add(t, _chkAutoControl);
         SetupStatus(_padsHere);
         Add(t, _padsHere);
+        _lstPads.Height = 64;
+        _lstPads.IntegralHeight = false;
+        _lstPads.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+        _lstPads.Margin = new Padding(0, 0, 0, 4);
+        _lstPads.SelectedIndexChanged += (_, _) => _btnPadSetup.Enabled = _lstPads.SelectedItem is ComboItem<Input.ControllerInfo>;
+        Add(t, _lstPads);
+        SetupButton(_btnPadSetup, "Configurar botões do controle selecionado…");
+        _btnPadSetup.Enabled = false;
+        _btnPadSetup.Click += (_, _) => OpenControllerSetup();
+        Add(t, Row(_btnPadSetup));
         _padsTimer.Tick += (_, _) => RefreshPadsHere();
-        Add(t, Note("O outro computador precisa marcar “Permitir que o outro computador use o mouse, o teclado e os controles” na aba Transmitir " +
-                    "e, para controles de jogo, instalar o suporte a controles (botão na mesma aba).\n" +
-                    "Controles reconhecidos: Xbox 360/One/Series e compatíveis (XInput). Controles de PS4/PS5 ou genéricos: ligue o modo “X-input” do controle " +
-                    "(muitos têm uma chave ou combinação de botões) ou use o Steam/DS4Windows neste computador.\n" +
-                    "Os controles só são enviados enquanto a janela de exibição estiver em primeiro plano."));
+        Add(t, Note("Funcionam controles USB e Bluetooth: Xbox, PlayStation 4/5, Switch Pro e centenas de modelos genéricos, todos vistos no outro " +
+                    "computador como controle de Xbox (com vibração). Se um controle aparecer como “não reconhecido” ou com botões trocados, " +
+                    "selecione-o e clique em “Configurar botões”.\n" +
+                    "O outro computador precisa marcar “Permitir que o outro computador use o mouse, o teclado e os controles” na aba Transmitir " +
+                    "e instalar o suporte a controles (botão na mesma aba). Os controles só são enviados com a janela de exibição em primeiro plano."));
 
         Add(t, Note("Na janela de exibição: F11 alterna tela cheia • Esc sai da tela cheia • leve o mouse ao topo da tela para ver a barra de botões.\n" +
                     "Ctrl+Alt+Shift+Q fecha • Ctrl+Alt+Shift+C liga/desliga o controle do outro computador • Ctrl+Alt+Shift+F tela cheia."));
@@ -350,14 +370,52 @@ internal sealed class MainForm : Form
 
     private void RefreshPadsHere()
     {
-        int n = Input.XInput.CountConnected();
-        _padsHere.Text = n switch
+        var svc = Input.ControllerService.Instance;
+        if (!svc.Available)
         {
-            0 => "Controles de jogo conectados aqui: nenhum (XInput)",
-            1 => "Controles de jogo conectados aqui: 1 ✔",
-            _ => $"Controles de jogo conectados aqui: {n} ✔",
-        };
-        _padsHere.ForeColor = n > 0 ? Good : Muted;
+            int n = Input.XInput.CountConnected();
+            _padsHere.Text = $"Controles de jogo conectados aqui: {(n == 0 ? "nenhum" : n.ToString())} (somente XInput — {svc.Error})";
+            _padsHere.ForeColor = n > 0 ? Good : Muted;
+            _lstPads.Visible = _btnPadSetup.Visible = false;
+            return;
+        }
+
+        var list = svc.Snapshot.Controllers;
+        _padsHere.Text = list.Count == 0
+            ? "Controles de jogo conectados aqui: nenhum — conecte por USB ou pareie por Bluetooth"
+            : $"Controles de jogo conectados aqui: {list.Count}";
+        _padsHere.ForeColor = list.Count > 0 ? Good : Muted;
+
+        var items = list.Select(c => new ComboItem<Input.ControllerInfo>(c.Describe(), c)).ToList();
+        bool same = items.Count == _lstPads.Items.Count &&
+                    items.Select(i => i.Text).SequenceEqual(_lstPads.Items.Cast<ComboItem<Input.ControllerInfo>>().Select(i => i.Text));
+        if (!same)
+        {
+            var selectedGuid = (_lstPads.SelectedItem as ComboItem<Input.ControllerInfo>)?.Value.Id;
+            _lstPads.BeginUpdate();
+            _lstPads.Items.Clear();
+            foreach (var it in items) _lstPads.Items.Add(it);
+            int idx = items.FindIndex(i => i.Value.Id == selectedGuid);
+            if (idx < 0) idx = items.FindIndex(i => !i.Value.Mapped);
+            if (idx >= 0) _lstPads.SelectedIndex = idx;
+            _lstPads.EndUpdate();
+        }
+        _btnPadSetup.Enabled = _lstPads.SelectedItem is ComboItem<Input.ControllerInfo>;
+    }
+
+    private void OpenControllerSetup()
+    {
+        if (_lstPads.SelectedItem is not ComboItem<Input.ControllerInfo> item) return;
+        var svc = Input.ControllerService.Instance;
+        using var form = new ControllerSetupForm(svc, item.Value, mapping =>
+        {
+            var guid = item.Value.Guid;
+            _app.Settings.ControllerMappings.RemoveAll(m => m.StartsWith(guid + ",", StringComparison.OrdinalIgnoreCase));
+            _app.Settings.ControllerMappings.Add(mapping);
+            _app.Settings.Save();
+        });
+        form.ShowDialog(this);
+        RefreshPadsHere();
     }
 
     private void BuildSendTab()
@@ -417,7 +475,17 @@ internal sealed class MainForm : Form
         {
             if (_cmbQuality.SelectedItem is ComboItem<int> it) SaveSetting(s => s.SenderQuality = it.Value);
         };
+        SetupCombo(_cmbResolution, 290);
+        _cmbResolution.Items.Add(new ComboItem<string>("Automática (tela do outro computador)", "auto"));
+        _cmbResolution.Items.Add(new ComboItem<string>("Original (sem reduzir)", "original"));
+        foreach (var r in new[] { "1600x900", "1366x768", "1280x720", "1024x576", "854x480" })
+            _cmbResolution.Items.Add(new ComboItem<string>("Até " + r.Replace('x', '×'), r));
+        _cmbResolution.SelectedIndexChanged += (_, _) =>
+        {
+            if (_cmbResolution.SelectedItem is ComboItem<string> it) SaveSetting(s => s.SenderResolution = it.Value);
+        };
         Add(t, Row(Caption("Monitor:"), _cmbSendMonitor));
+        Add(t, Row(Caption("Resolução enviada:"), _cmbResolution));
         Add(t, Row(Caption("Quadros por segundo:"), _cmbFps, Caption("Qualidade:"), _cmbQuality));
 
         SetupCheck(_chkSendAudio, "Transmitir também o som deste computador");
@@ -583,13 +651,17 @@ internal sealed class MainForm : Form
             FillMonitors(_cmbSendMonitor, s.SenderMonitor);
             SelectByValue(_cmbFps, s.SenderFps, 30);
             SelectByValue(_cmbQuality, s.SenderQuality, 75);
+            int resIdx = _cmbResolution.Items.Cast<ComboItem<string>>().ToList()
+                .FindIndex(i => string.Equals(i.Value, s.SenderResolution, StringComparison.OrdinalIgnoreCase));
+            _cmbResolution.SelectedIndex = Math.Max(0, resIdx);
+            _chkLight.Checked = s.ReceiverLight;
+            _chkAutoControl.Checked = s.ViewerAutoControl;
             RefreshAddresses();
         }
         finally
         {
             _loading = false;
         }
-        _chkAutoControl.Checked = _app.Settings.ViewerAutoControl;
         _ = Task.Run(() =>
         {
             bool fw = SystemIntegration.HasFirewallRule();
@@ -901,7 +973,8 @@ internal sealed class MainForm : Form
         }
         _btnSend.Enabled = !_app.IsConnecting;
         bool idle = !_app.IsSending && !_app.IsConnecting;
-        _cmbSendMonitor.Enabled = _cmbFps.Enabled = _cmbQuality.Enabled = _chkSendAudio.Enabled = _chkAllowControl.Enabled = idle;
+        _cmbSendMonitor.Enabled = _cmbFps.Enabled = _cmbQuality.Enabled = _cmbResolution.Enabled =
+            _chkSendAudio.Enabled = _chkAllowControl.Enabled = idle;
 
         // HDMI
         _btnHdmiOpen.Text = _app.IsHdmiOpen ? "Fechar visualização" : "Abrir visualização";

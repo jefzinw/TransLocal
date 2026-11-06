@@ -19,6 +19,7 @@ internal sealed class ReceiverServer : IDisposable
     private readonly int _discoveryPort;
     private readonly Func<string> _name;
     private readonly Func<bool> _playAudio;
+    private readonly Func<ReceiverPrefs> _prefs;
     private TcpListener? _listener;
     private DiscoveryResponder? _discovery;
     private CancellationTokenSource? _cts;
@@ -27,8 +28,10 @@ internal sealed class ReceiverServer : IDisposable
     public event Action<ReceiverSession>? SessionStarted;
     public event Action<ReceiverSession, string?>? SessionEnded;
 
-    public ReceiverServer(Func<string> name, Func<bool> playAudio, int port = Proto.VideoPort, int discoveryPort = Proto.DiscoveryPort)
+    public ReceiverServer(Func<string> name, Func<bool> playAudio, Func<ReceiverPrefs>? prefs = null,
+        int port = Proto.VideoPort, int discoveryPort = Proto.DiscoveryPort)
     {
+        _prefs = prefs ?? (() => default);
         _name = name;
         _playAudio = playAudio;
         _port = port;
@@ -115,7 +118,8 @@ internal sealed class ReceiverServer : IDisposable
                 return;
             }
 
-            session = new ReceiverSession(conn, hello, _playAudio());
+            var prefs = _prefs();
+            session = new ReceiverSession(conn, hello, _playAudio(), prefs.Light);
             if (Interlocked.CompareExchange(ref _active, session, null) is not null)
             {
                 conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = false, Name = _name(), Reason = "Este computador já está exibindo outra transmissão." });
@@ -124,7 +128,14 @@ internal sealed class ReceiverServer : IDisposable
                 return;
             }
 
-            conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = true, Name = _name() });
+            conn.SendJson(MsgType.Welcome, new WelcomeMessage
+            {
+                Accepted = true,
+                Name = _name(),
+                ScreenWidth = prefs.ScreenWidth,
+                ScreenHeight = prefs.ScreenHeight,
+                Light = prefs.Light,
+            });
             Log.Info($"Recebendo de {hello.Name} ({conn.RemoteEndPoint}) {hello.Width}×{hello.Height}, áudio={hello.Audio}, controle={hello.Control}, controles de jogo={hello.Gamepads ?? "?"}");
             try { SessionStarted?.Invoke(session); } catch (Exception ex) { Log.Error("Erro ao abrir exibição", ex); }
 
@@ -186,8 +197,12 @@ internal sealed class ReceiverSession
     /// <summary>Vibração pedida pelo jogo no outro computador: (slot, motor grande, motor pequeno).</summary>
     public event Action<int, byte, byte>? GamepadFeedback;
 
-    public ReceiverSession(Connection conn, HelloMessage hello, bool playAudio)
+    /// <summary>Este receptor pediu transmissão leve (desenho mais rápido também).</summary>
+    public bool Light { get; }
+
+    public ReceiverSession(Connection conn, HelloMessage hello, bool playAudio, bool light = false)
     {
+        Light = light;
         _conn = conn;
         _hello = hello;
         _playAudio = playAudio;

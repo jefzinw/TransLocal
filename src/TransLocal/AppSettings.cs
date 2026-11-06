@@ -17,12 +17,21 @@ internal sealed class AppSettings
     /// <summary>Ao exibir, já começa controlando (mouse, teclado e controles) quando o outro computador permite.</summary>
     public bool ViewerAutoControl { get; set; } = true;
 
+    /// <summary>Pede ao transmissor uma transmissão leve (até 1366×768, 30 quadros/s, mais compressão).</summary>
+    public bool ReceiverLight { get; set; }
+
+    /// <summary>Mapeamentos de controles configurados no assistente (formato SDL), um por controle.</summary>
+    public List<string> ControllerMappings { get; set; } = new();
+
     // Transmissor (este PC envia a sua tela)
     public string? SenderMonitor { get; set; }
     public int SenderFps { get; set; } = 30;
     public int SenderQuality { get; set; } = 75;
     public bool SenderAudio { get; set; } = true;
     public bool SenderAllowControl { get; set; }
+
+    /// <summary>"auto" (tela do receptor), "original" ou limite como "1280x720".</summary>
+    public string SenderResolution { get; set; } = "auto";
     public string? LastReceiverAddress { get; set; }
     public string? LastReceiverName { get; set; }
 

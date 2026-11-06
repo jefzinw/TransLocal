@@ -20,6 +20,9 @@ internal abstract class ScreenCapturer : IDisposable
     protected readonly IntPtr MemDc;
     protected IntPtr ScreenDc => _screenDc;
 
+    /// <summary>DC de memória com a imagem capturada (para redimensionar com StretchBlt).</summary>
+    public IntPtr DeviceContext => MemDc;
+
     public Rectangle Bounds { get; }
     public int Width => Bounds.Width;
     public int Height => Bounds.Height;
@@ -59,37 +62,64 @@ internal abstract class ScreenCapturer : IDisposable
     /// imagem disponível agora (ex.: tela de bloqueio ou UAC na área de trabalho segura).</summary>
     public bool Capture(bool drawCursor)
     {
-        if (!CaptureDesktop()) return false;
-        if (drawCursor) DrawCursor();
+        if (!AcquireDesktop(out bool desktopChanged)) return false;
+        var cursor = drawCursor ? ReadCursor() : default;
+        if (!desktopChanged && _composed && cursor == _lastCursor)
+        {
+            // Nada mudou: Bits continua com a imagem anterior (com o cursor no mesmo lugar).
+            LastCaptureChanged = false;
+            return true;
+        }
+        ComposeDesktop();
+        if (cursor.Handle != IntPtr.Zero) DrawCursor(cursor);
+        _lastCursor = cursor;
+        _composed = true;
+        LastCaptureChanged = true;
         Native.GdiFlush();
         return true;
     }
 
-    protected abstract bool CaptureDesktop();
+    /// <summary>A última chamada a <see cref="Capture"/> produziu uma imagem diferente da anterior.</summary>
+    public bool LastCaptureChanged { get; private set; }
 
-    private void DrawCursor()
+    private bool _composed;
+    private CursorState _lastCursor;
+
+    private readonly record struct CursorState(IntPtr Handle, int X, int Y);
+
+    /// <summary>Obtém a imagem da área de trabalho. <paramref name="changed"/> indica se ela mudou.</summary>
+    protected abstract bool AcquireDesktop(out bool changed);
+
+    /// <summary>Coloca a imagem da área de trabalho (sem cursor) em <see cref="Bits"/>.</summary>
+    protected virtual void ComposeDesktop() { }
+
+    private static CursorState ReadCursor()
     {
         var ci = new Native.CURSORINFO { cbSize = Marshal.SizeOf<Native.CURSORINFO>() };
         if (!Native.GetCursorInfo(ref ci) || (ci.flags & Native.CURSOR_SHOWING) == 0 || ci.hCursor == IntPtr.Zero)
-            return;
+            return default;
+        return new CursorState(ci.hCursor, ci.ptScreenPos.X, ci.ptScreenPos.Y);
+    }
 
-        if (!_hotspots.TryGetValue(ci.hCursor, out var hs))
+    private void DrawCursor(CursorState ci)
+    {
+        if (!_hotspots.TryGetValue(ci.Handle, out var hs))
         {
             hs = (0, 0);
-            if (Native.GetIconInfo(ci.hCursor, out var ii))
+            if (Native.GetIconInfo(ci.Handle, out var ii))
             {
                 hs = (ii.xHotspot, ii.yHotspot);
                 if (ii.hbmMask != IntPtr.Zero) Native.DeleteObject(ii.hbmMask);
                 if (ii.hbmColor != IntPtr.Zero) Native.DeleteObject(ii.hbmColor);
             }
             if (_hotspots.Count > 128) _hotspots.Clear();
-            _hotspots[ci.hCursor] = hs;
+            _hotspots[ci.Handle] = hs;
         }
 
-        int x = ci.ptScreenPos.X - Bounds.X - hs.X;
-        int y = ci.ptScreenPos.Y - Bounds.Y - hs.Y;
+        int x = ci.X - Bounds.X - hs.X;
+        int y = ci.Y - Bounds.Y - hs.Y;
         if (x >= Width || y >= Height || x < -256 || y < -256) return;
-        Native.DrawIconEx(MemDc, x, y, ci.hCursor, 0, 0, 0, IntPtr.Zero, Native.DI_NORMAL);
+        Native.DrawIconEx(MemDc, x, y, ci.Handle, 0, 0, 0, IntPtr.Zero, Native.DI_NORMAL);
     }
 
     protected virtual void DisposeCore() { }
@@ -127,8 +157,12 @@ internal sealed class GdiCapturer : ScreenCapturer
 
     public override string Method => "GDI";
 
-    protected override bool CaptureDesktop() =>
-        Native.BitBlt(MemDc, 0, 0, Width, Height, ScreenDc, Bounds.X, Bounds.Y, Native.SRCCOPY);
+    // O BitBlt reescreve a imagem inteira (apagando o cursor desenhado antes): sempre "mudou".
+    protected override bool AcquireDesktop(out bool changed)
+    {
+        changed = true;
+        return Native.BitBlt(MemDc, 0, 0, Width, Height, ScreenDc, Bounds.X, Bounds.Y, Native.SRCCOPY);
+    }
 }
 
 /// <summary>
@@ -149,6 +183,7 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
     private IDXGIOutputDuplication? _dup;
     private ID3D11Texture2D? _staging;
     private bool _hasFrame;
+    private bool _cleanChanged;
     private long _nextRetry;
 
     public override string Method => "DXGI";
@@ -213,6 +248,7 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         long bytes = (long)Width * Height * 4;
         Buffer.MemoryCopy((void*)Bits, _cleanPtr, bytes, bytes);
         _hasFrame = true;
+        _cleanChanged = true;
     }
 
     private void CreateDuplication()
@@ -245,22 +281,30 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         }
     }
 
-    protected override bool CaptureDesktop()
+    protected override bool AcquireDesktop(out bool changed)
     {
         if (_dup is null)
         {
             // A duplicação se perde em mudanças de modo, UAC, tela de bloqueio… tenta recriar de tempos em tempos.
-            if (Environment.TickCount64 < _nextRetry) return CopyClean();
-            try
+            if (Environment.TickCount64 >= _nextRetry)
             {
-                CreateDuplication();
-                SeedFromGdi();
+                try
+                {
+                    CreateDuplication();
+                    SeedFromGdi();
+                }
+                catch (Exception ex)
+                {
+                    _dup?.Dispose();
+                    _dup = null;
+                    _nextRetry = Environment.TickCount64 + 500;
+                    Log.Warn("Recriando a captura DXGI", ex);
+                }
             }
-            catch (Exception ex)
+            if (_dup is null)
             {
-                _nextRetry = Environment.TickCount64 + 500;
-                Log.Warn("Recriando a captura DXGI", ex);
-                return false;
+                changed = TakeCleanChanged();
+                return _hasFrame;
             }
         }
 
@@ -288,6 +332,7 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
                         _context.Unmap(_staging!, 0);
                     }
                     _hasFrame = true;
+                    _cleanChanged = true;
                 }
             }
             finally
@@ -304,16 +349,22 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
             _dup = null;
             _nextRetry = 0;
         }
-        return CopyClean();
+        changed = TakeCleanChanged();
+        return _hasFrame;
+    }
+
+    private bool TakeCleanChanged()
+    {
+        bool c = _cleanChanged;
+        _cleanChanged = false;
+        return c;
     }
 
     /// <summary>Copia a última imagem limpa (sem cursor) para a DIB de saída.</summary>
-    private bool CopyClean()
+    protected override void ComposeDesktop()
     {
-        if (!_hasFrame) return false;
         long bytes = (long)Width * Height * 4;
         Buffer.MemoryCopy(_cleanPtr, (void*)Bits, bytes, bytes);
-        return true;
     }
 
     protected override void DisposeCore()

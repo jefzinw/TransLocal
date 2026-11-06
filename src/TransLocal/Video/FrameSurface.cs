@@ -21,6 +21,9 @@ internal sealed unsafe class FrameSurface : IDisposable
     private long _updates;
     private bool _disposed;
 
+    /// <summary>Redimensionamento rápido (menos qualidade) ao desenhar — para computadores mais simples.</summary>
+    public bool FastScaling { get; set; }
+
     public int Width { get { lock (Sync) return _width; } }
     public int Height { get { lock (Sync) return _height; } }
     public bool HasImage => Interlocked.Read(ref _updates) > 0;
@@ -180,7 +183,7 @@ internal sealed unsafe class FrameSurface : IDisposable
             }
             else
             {
-                Native.SetStretchBltMode(hdc, Native.HALFTONE);
+                Native.SetStretchBltMode(hdc, FastScaling ? Native.COLORONCOLOR : Native.HALFTONE);
                 Native.SetBrushOrgEx(hdc, 0, 0, IntPtr.Zero);
                 Native.StretchBlt(hdc, dest.X, dest.Y, dest.Width, dest.Height, _memDc, 0, 0, _width, _height, Native.SRCCOPY);
             }

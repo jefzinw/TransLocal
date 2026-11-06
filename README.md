@@ -47,17 +47,25 @@ Instale nos dois computadores. Não é preciso ter o .NET instalado.
 3. No computador que vai **enviar** a tela (ex.: o notebook): aba **Transmitir esta tela** › **Procurar receptores**, escolha o PC (prefira a linha “cabo…”) e clique em **Transmitir**.
 4. A tela abre no PC em tela cheia. Leve o mouse ao topo para ver os botões.
 
-Opções do transmissor: monitor a transmitir, quadros por segundo (até 60), qualidade, som do sistema e **permitir que o outro computador use o mouse e o teclado** (desligado por padrão).
+Opções do transmissor: monitor a transmitir, **resolução enviada**, quadros por segundo (até 60), qualidade, som do sistema e **permitir que o outro computador use o mouse, o teclado e os controles** (desligado por padrão).
 
-### Controlar o outro computador (mouse, teclado e controles USB)
+### Transmissão leve (notebooks e computadores mais simples)
+
+- **Resolução enviada: Automática** (padrão, no transmissor): a imagem é reduzida para o tamanho exato da tela de quem exibe (ex.: 1920×1080 → 1366×768). O computador que exibe não precisa redimensionar nada e decodifica menos pixels. Também é possível fixar um limite (1600×900 … 854×480) ou enviar a resolução original.
+- **Pedir transmissão leve** (no computador que exibe, aba *Receber*): pede ao transmissor no máximo 1366×768, 30 quadros/s e mais compressão, e usa um redimensionamento mais rápido na tela.
+- Com a tela parada, nada é reenviado: só as regiões que mudam viajam pela rede.
+
+### Controlar o outro computador (mouse, teclado e controles USB/Bluetooth)
 
 Exemplo: o notebook exibe a tela do PC e você quer jogar ou usar o PC pelo notebook.
 
 1. **No PC (que transmite):** aba **Transmitir** › marque *Permitir que o outro computador use o mouse, o teclado e os controles de jogo dele neste computador*. Para controles de jogo, clique em **Instalar suporte a controles** (instala o driver ViGEmBus pelo winget; o Windows pede permissão de administrador). Transmita.
-2. **No notebook (que exibe):** com *Começar já controlando…* marcado (padrão), o mouse, o teclado e os controles USB do notebook passam a comandar o PC assim que a tela abre.
+2. **No notebook (que exibe):** com *Começar já controlando…* marcado (padrão), o mouse, o teclado e os controles (USB ou **Bluetooth**) do notebook passam a comandar o PC assim que a tela abre.
 
-- Cada controle do notebook vira um **controle de Xbox 360 virtual** no PC, reconhecido pelos jogos; a vibração volta para o controle do notebook.
-- Controles reconhecidos: Xbox 360/One/Series e compatíveis (**XInput**). Controles de PS4/PS5 ou genéricos: ligue o modo “X-input” do controle ou use o Steam/DS4Windows no notebook.
+- Cada controle do notebook vira um **controle de Xbox 360 virtual** no PC, reconhecido pelos jogos; a vibração volta para o controle do notebook (inclusive DualShock/DualSense).
+- Controles reconhecidos (via [SDL3](https://www.libsdl.org/)): Xbox 360/One/Series, PlayStation 3/4/5, Switch Pro e centenas de modelos genéricos, por USB ou Bluetooth. Os botões são posicionais: o botão de baixo (✕ no PlayStation) vira o A.
+- **Controle não reconhecido ou com botões trocados?** Aba *Receber* › selecione o controle na lista › **Configurar botões do controle selecionado…** — um assistente pede cada botão, gatilho e analógico, e o ajuste fica salvo para aquele modelo.
+- Para parear por Bluetooth: *Configurações do Windows › Bluetooth e dispositivos › Adicionar dispositivo*, com o controle em modo de pareamento (PS4: Share + PS; PS5: Create + PS; Xbox: botão de pareamento; genéricos: veja o manual).
 - Os controles só são enviados enquanto a janela de exibição está em primeiro plano. **Ctrl+Alt+Shift+C** solta/retoma o controle.
 - Sem a Xbox Game Bar instalada, o Windows mostraria a janela “Obter um aplicativo para abrir este link ‘ms-gamebar’” a cada controle conectado; o TransLocal registra um manipulador silencioso para o seu usuário (desfeito na desinstalação, ou com `TransLocal.exe --restore-gamebar-prompt`).
 
@@ -82,7 +90,8 @@ O TransLocal transmite um monitor existente. Para estender a área de trabalho, 
 - **Cabo USB-C não cria rede:** os dois computadores precisam de USB4/Thunderbolt e o cabo precisa ser Thunderbolt/USB4. Veja se aparece “USB4 P2P Network Adapter” em *Gerenciador de Dispositivos › Adaptadores de rede*.
 - **HDMI travando em 5 quadros/s:** escolha um formato MJPEG (placas USB 2.0 só chegam a 30/60 quadros/s com compressão). Feche OBS, Câmera ou Teams se a placa estiver em uso.
 - **Imagem preta em parte da tela:** vídeos protegidos (DRM) não podem ser capturados pelo Windows.
-- **Controle de jogo não funciona:** na barra da janela de exibição (leve o mouse ao topo) aparece o estado dos controles. “Falta o driver no outro PC” → instale o suporte a controles no PC. “Nenhum” na aba *Receber* → o controle não é XInput (veja acima).
+- **Controle de jogo não funciona:** na barra da janela de exibição (leve o mouse ao topo) aparece o estado dos controles. “Falta o driver no outro PC” → instale o suporte a controles no PC. Na aba *Receber* aparece a lista de controles detectados neste computador; se o seu não aparecer, confira o pareamento Bluetooth; se aparecer como “não reconhecido”, use **Configurar botões**.
+- **Imagem lenta ou travando no computador que exibe:** marque *Pedir transmissão leve* nele e, no transmissor, deixe *Resolução enviada: Automática*.
 - **Controle não funciona em janelas de administrador:** o Windows bloqueia entrada simulada em programas elevados, a não ser que o TransLocal também seja executado como administrador. A tela de UAC e a tela de bloqueio não podem ser transmitidas.
 - **Registros:** aba *Configurações e ajuda › Abrir pasta de registros* (`%LOCALAPPDATA%\TransLocal`).
 
@@ -92,7 +101,8 @@ O TransLocal transmite um monitor existente. Para estender a área de trabalho, 
 - **Codificação:** a tela é dividida em faixas de 64 px; só os trechos que mudaram são enviados, em JPEG codificado em paralelo (~4 ms para um quadro 1080p inteiro). Controle de fluxo com no máximo 2 quadros em trânsito mantém o atraso baixo mesmo quando a rede é mais lenta.
 - **Rede:** TCP 52020 (vídeo, som, controle) e UDP 52021 (descoberta por broadcast em todas as interfaces, inclusive 169.254.x.x).
 - **Som:** loopback WASAPI do transmissor → PCM 16 bits → reprodução com descarte de atraso acumulado.
-- **Controles de jogo:** o receptor lê os controles XInput a cada 4 ms e envia só as mudanças; o transmissor os reproduz como controles de Xbox 360 virtuais (ViGEmBus) e devolve a vibração.
+- **Redução de resolução:** média de área (separável, ponto fixo, linhas em paralelo), ~6 ms para 1920×1080 → 1366×768; quando a tela não muda, captura, redução e compressão são puladas.
+- **Controles de jogo:** o receptor lê os controles pela SDL3 (USB/Bluetooth, com XInput direto como reserva) a cada 4 ms e envia só as mudanças; o transmissor os reproduz como controles de Xbox 360 virtuais (ViGEmBus) e devolve a vibração.
 - **HDMI:** dispositivos UVC via DirectShow (FlashCap), com repasse opcional do áudio da placa.
 
 Bibliotecas: [NAudio](https://github.com/naudio/NAudio) (MIT), [FlashCap](https://github.com/kekyo/FlashCap) (Apache-2.0), [Vortice.Windows](https://github.com/amerkoleci/Vortice.Windows) (MIT) — detalhes em [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
