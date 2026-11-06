@@ -26,6 +26,7 @@ internal sealed class SenderSession : IDisposable
     private readonly Screen _screen;
     private readonly LoopbackAudioSource? _audio;
     private readonly InputInjector? _injector;
+    private readonly VirtualGamepads? _gamepads;
     private readonly SemaphoreSlim _inflight = new(Proto.MaxFramesInFlight, Proto.MaxFramesInFlight);
     private readonly CancellationTokenSource _cts = new();
     private System.Threading.Timer? _pingTimer;
@@ -43,20 +44,33 @@ internal sealed class SenderSession : IDisposable
     public string RemoteEndPoint => _conn.RemoteEndPoint;
     public bool IsRunning => Volatile.Read(ref _ended) == 0;
 
+    /// <summary>Controles de jogo: "ok", "sem-driver" ou "desligado".</summary>
+    public string GamepadStatus { get; }
+
     /// <summary>Texto de estatísticas a cada segundo (thread de segundo plano).</summary>
     public event Action<string>? StatsUpdated;
 
     /// <summary>Fim da sessão; o texto é o motivo (null quando parada localmente).</summary>
     public event Action<SenderSession, string?>? Ended;
 
-    private SenderSession(Connection conn, SenderOptions opt, string receiverName, Screen screen, LoopbackAudioSource? audio)
+    private SenderSession(Connection conn, SenderOptions opt, string receiverName, Screen screen, LoopbackAudioSource? audio, string gamepadStatus)
     {
         _conn = conn;
         _opt = opt;
         _screen = screen;
         _audio = audio;
         ReceiverName = receiverName;
+        GamepadStatus = gamepadStatus;
         if (opt.AllowControl) _injector = new InputInjector(screen.Bounds);
+        if (gamepadStatus == VirtualGamepads.StatusOk)
+        {
+            _gamepads = new VirtualGamepads();
+            _gamepads.Rumble += (slot, large, small) =>
+            {
+                if (!IsRunning) return;
+                try { _conn.Send(MsgType.GamepadFeedback, GamepadCodec.EncodeRumble(slot, large, small)); } catch { }
+            };
+        }
     }
 
     public static async Task<SenderSession> ConnectAsync(string host, int port, SenderOptions opt, CancellationToken ct)
@@ -102,6 +116,13 @@ internal sealed class SenderSession : IDisposable
             catch (Exception ex) { Log.Warn("Som do sistema indisponível; transmitindo sem áudio", ex); }
         }
 
+        string gamepadStatus = VirtualGamepads.StatusDisabled;
+        if (opt.AllowControl)
+        {
+            gamepadStatus = VirtualGamepads.IsDriverInstalled(out var gpError) ? VirtualGamepads.StatusOk : VirtualGamepads.StatusNoDriver;
+            if (gpError is not null) Log.Info("Controles de jogo indisponíveis: " + gpError);
+        }
+
         try
         {
             conn.ReceiveTimeoutMs = 10_000;
@@ -114,6 +135,7 @@ internal sealed class SenderSession : IDisposable
                 AudioRate = audio?.SampleRate ?? 0,
                 AudioChannels = audio?.Channels ?? 0,
                 Control = opt.AllowControl,
+                Gamepads = gamepadStatus,
             });
 
             WelcomeMessage welcome;
@@ -125,7 +147,7 @@ internal sealed class SenderSession : IDisposable
             if (!welcome.Accepted)
                 throw new InvalidOperationException(welcome.Reason ?? "O receptor recusou a transmissão.");
 
-            var session = new SenderSession(conn, opt, welcome.Name, screen, audio);
+            var session = new SenderSession(conn, opt, welcome.Name, screen, audio, gamepadStatus);
             session.Start();
             return session;
         }
@@ -147,7 +169,7 @@ internal sealed class SenderSession : IDisposable
 
     private void Start()
     {
-        Log.Info($"Transmitindo {_screen.DeviceName} {_screen.Bounds} para {ReceiverName} ({RemoteEndPoint}), {_opt.Fps} fps, qualidade {_opt.Quality}, áudio={_audio is not null}, controle={_opt.AllowControl}");
+        Log.Info($"Transmitindo {_screen.DeviceName} {_screen.Bounds} para {ReceiverName} ({RemoteEndPoint}), {_opt.Fps} fps, qualidade {_opt.Quality}, áudio={_audio is not null}, controle={_opt.AllowControl}, controles de jogo={GamepadStatus}");
 
         new Thread(VideoLoop) { IsBackground = true, Name = "TransLocal vídeo", Priority = ThreadPriority.AboveNormal }.Start();
         new Thread(ReadLoop) { IsBackground = true, Name = "TransLocal leitura" }.Start();
@@ -268,6 +290,13 @@ internal sealed class SenderSession : IDisposable
                     case MsgType.Input:
                         if (_opt.AllowControl) _injector?.Apply(m.Span);
                         break;
+                    case MsgType.Gamepad:
+                        if (_gamepads is not null && GamepadCodec.TryDecode(m.Span, out var pad))
+                        {
+                            try { _gamepads.Apply(pad); }
+                            catch (Exception ex) { Log.Error($"Falha no controle virtual {pad.Slot + 1} (conectado={pad.Connected})", ex); }
+                        }
+                        break;
                     case MsgType.Ping:
                         _conn.Send(MsgType.Pong, m.Span);
                         break;
@@ -323,6 +352,7 @@ internal sealed class SenderSession : IDisposable
         _conn.Dispose();
         _audio?.Dispose();
         _injector?.ReleaseAll();
+        _gamepads?.Dispose();
         Log.Info($"Transmissão encerrada: {reason ?? "parada pelo usuário"}");
         try { Ended?.Invoke(this, reason); } catch (Exception ex) { Log.Error("Erro no evento de fim", ex); }
     }

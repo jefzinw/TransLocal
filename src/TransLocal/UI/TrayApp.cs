@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using TransLocal.Input;
 using TransLocal.Streaming;
 using TransLocal.Video;
 
@@ -25,6 +26,9 @@ internal sealed class TrayApp : ApplicationContext
     private ReceiverServer? _receiver;
     private ReceiverSession? _viewSession;
     private ViewerForm? _viewViewer;
+    private GamepadForwarder? _gamepadForwarder;
+    private System.Windows.Forms.Timer? _gamepadTimer;
+    private bool _gamepadWarned;
     private SenderSession? _sender;
     private HdmiCaptureSession? _hdmi;
     private ViewerForm? _hdmiViewer;
@@ -88,6 +92,7 @@ internal sealed class TrayApp : ApplicationContext
         _showWait = ThreadPool.RegisterWaitForSingleObject(_showEvent, (_, _) => Ui(() => ShowMain()), null, -1, false);
 
         SystemIntegration.RefreshAutoStartPath();
+        SystemIntegration.RestoreGameBarPromptIfGameBarInstalled();
         if (Settings.ReceiverEnabled) StartReceiver();
         if (firstRun) Settings.Save();
 
@@ -205,22 +210,72 @@ internal sealed class TrayApp : ApplicationContext
         _viewSession = s;
         var screen = Monitors.Resolve(Settings.ViewerMonitor);
         var viewer = new ViewerForm(s.SenderName, s.Surface, s.ControlAllowed ? s.SendInput : null, screen,
-            Settings.ViewerFullscreen, Settings.ShowStats, new Size(s.InitialWidth, s.InitialHeight));
+            Settings.ViewerFullscreen, Settings.ShowStats, new Size(s.InitialWidth, s.InitialHeight),
+            startWithControl: Settings.ViewerAutoControl);
         viewer.UserClosed += () => s.Close();
         s.FrameReady += viewer.NotifyFrame;
         s.StatsUpdated += viewer.SetStats;
         _viewViewer = viewer;
+        if (s.ControlAllowed) StartGamepads(s, viewer);
         viewer.Show();
         viewer.Activate();
         Balloon($"Exibindo a tela de {s.SenderName}",
-            "Leve o mouse ao topo da tela para ver os botões. Ctrl+Alt+Shift+Q fecha.");
+            s.ControlAllowed
+                ? "Mouse, teclado e controles USB comandam o outro computador. Ctrl+Alt+Shift+C solta o controle; Ctrl+Alt+Shift+Q fecha."
+                : "Leve o mouse ao topo da tela para ver os botões. Ctrl+Alt+Shift+Q fecha.");
         Changed();
+    }
+
+    /// <summary>Lê os controles USB deste computador e os envia enquanto a exibição estiver em foco.</summary>
+    private void StartGamepads(ReceiverSession s, ViewerForm viewer)
+    {
+        StopGamepads();
+        string status = s.GamepadStatus;
+        var forwarder = new GamepadForwarder(s.SendGamepad, () => viewer.InputActive, canSend: status == VirtualGamepads.StatusOk);
+        s.GamepadFeedback += forwarder.Rumble;
+        _gamepadForwarder = forwarder;
+        _gamepadWarned = false;
+        _gamepadTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        _gamepadTimer.Tick += (_, _) =>
+        {
+            int n = forwarder.ConnectedCount;
+            string plural = n == 1 ? "controle" : "controles";
+            string? info = n == 0 ? null : status switch
+            {
+                VirtualGamepads.StatusOk => viewer.InputActive ? $"Controles: {n} {plural} em uso" : $"Controles: {n} em espera",
+                VirtualGamepads.StatusNoDriver => "Controle detectado — falta o driver no outro PC",
+                "antigo" => "Controle detectado — atualize o TransLocal no outro PC",
+                _ => null,
+            };
+            viewer.SetGamepadInfo(info);
+            if (n > 0 && status != VirtualGamepads.StatusOk && !_gamepadWarned)
+            {
+                _gamepadWarned = true;
+                Balloon("Controle de jogo detectado",
+                    status == VirtualGamepads.StatusNoDriver
+                        ? "Para usá-lo, no outro computador abra TransLocal › Transmitir › “Instalar suporte a controles” e transmita de novo."
+                        : "Atualize o TransLocal no outro computador para usar controles de jogo.",
+                    ToolTipIcon.Warning);
+            }
+        };
+        _gamepadTimer.Start();
+        Log.Info($"Controles de jogo: transmissor={status}, conectados aqui={XInput.CountConnected()}");
+    }
+
+    private void StopGamepads()
+    {
+        _gamepadTimer?.Stop();
+        _gamepadTimer?.Dispose();
+        _gamepadTimer = null;
+        _gamepadForwarder?.Dispose();
+        _gamepadForwarder = null;
     }
 
     private void OnViewEnded(ReceiverSession s, string? reason)
     {
         if (_viewSession == s)
         {
+            StopGamepads();
             _viewViewer?.CloseFromCode();
             _viewViewer = null;
             _viewSession = null;
@@ -394,6 +449,7 @@ internal sealed class TrayApp : ApplicationContext
         IsExiting = true;
         Log.Info("Encerrando");
         try { _sender?.Stop(); } catch { }
+        StopGamepads();
         try { _viewSession?.Close(); } catch { }
         var hdmi = _hdmi;
         _hdmi = null;

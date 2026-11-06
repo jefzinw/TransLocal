@@ -26,6 +26,8 @@ internal enum MsgType : byte
     FrameAck = 0x11,
     Audio = 0x20,
     Input = 0x30,
+    Gamepad = 0x31,
+    GamepadFeedback = 0x32,
     Ping = 0x40,
     Pong = 0x41,
     Bye = 0x50,
@@ -42,6 +44,9 @@ internal sealed class HelloMessage
     public int AudioRate { get; set; }
     public int AudioChannels { get; set; }
     public bool Control { get; set; }
+
+    /// <summary>Controles de jogo: "ok", "sem-driver" ou "desligado" (null em versões antigas).</summary>
+    public string? Gamepads { get; set; }
 }
 
 internal sealed class WelcomeMessage
@@ -98,6 +103,7 @@ internal sealed class Connection : IDisposable
     private int _closed;
 
     public string RemoteEndPoint { get; }
+    public System.Net.IPAddress? RemoteAddress { get; }
     public long BytesSent;
     public long BytesReceived;
 
@@ -110,6 +116,7 @@ internal sealed class Connection : IDisposable
         _client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
         _stream = client.GetStream();
         RemoteEndPoint = client.Client.RemoteEndPoint?.ToString() ?? "?";
+        RemoteAddress = (client.Client.RemoteEndPoint as System.Net.IPEndPoint)?.Address;
     }
 
     public bool IsClosed => Volatile.Read(ref _closed) != 0;

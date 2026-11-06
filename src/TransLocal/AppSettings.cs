@@ -14,6 +14,9 @@ internal sealed class AppSettings
     public bool ReceiverPlayAudio { get; set; } = true;
     public bool ShowStats { get; set; }
 
+    /// <summary>Ao exibir, já começa controlando (mouse, teclado e controles) quando o outro computador permite.</summary>
+    public bool ViewerAutoControl { get; set; } = true;
+
     // Transmissor (este PC envia a sua tela)
     public string? SenderMonitor { get; set; }
     public int SenderFps { get; set; } = 30;

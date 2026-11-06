@@ -10,6 +10,9 @@ O executável do TransLocal inclui os componentes abaixo, distribuídos sob as l
 | Vortice.Windows (Direct3D11, DXGI, DirectX) | 3.8.3 | MIT | https://github.com/amerkoleci/Vortice.Windows |
 | Vortice.Mathematics | 2.1.0 | MIT | https://github.com/amerkoleci/Vortice.Mathematics |
 | SharpGen.Runtime / SharpGen.Runtime.COM | 2.4.2-beta | MIT | https://github.com/SharpGenTools/SharpGenTools |
+| Nefarius.ViGEm.Client | 1.21.256 | MIT | https://github.com/ViGEm/ViGEm.NET |
+
+O driver **ViGEmBus** (BSD-3-Clause, https://github.com/nefarius/ViGEmBus) não é distribuído com o TransLocal: quando o usuário pede, ele é instalado pelo winget a partir do pacote oficial.
 
 Textos completos das licenças:
 

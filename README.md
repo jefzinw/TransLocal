@@ -49,6 +49,18 @@ Instale nos dois computadores. Não é preciso ter o .NET instalado.
 
 Opções do transmissor: monitor a transmitir, quadros por segundo (até 60), qualidade, som do sistema e **permitir que o outro computador use o mouse e o teclado** (desligado por padrão).
 
+### Controlar o outro computador (mouse, teclado e controles USB)
+
+Exemplo: o notebook exibe a tela do PC e você quer jogar ou usar o PC pelo notebook.
+
+1. **No PC (que transmite):** aba **Transmitir** › marque *Permitir que o outro computador use o mouse, o teclado e os controles de jogo dele neste computador*. Para controles de jogo, clique em **Instalar suporte a controles** (instala o driver ViGEmBus pelo winget; o Windows pede permissão de administrador). Transmita.
+2. **No notebook (que exibe):** com *Começar já controlando…* marcado (padrão), o mouse, o teclado e os controles USB do notebook passam a comandar o PC assim que a tela abre.
+
+- Cada controle do notebook vira um **controle de Xbox 360 virtual** no PC, reconhecido pelos jogos; a vibração volta para o controle do notebook.
+- Controles reconhecidos: Xbox 360/One/Series e compatíveis (**XInput**). Controles de PS4/PS5 ou genéricos: ligue o modo “X-input” do controle ou use o Steam/DS4Windows no notebook.
+- Os controles só são enviados enquanto a janela de exibição está em primeiro plano. **Ctrl+Alt+Shift+C** solta/retoma o controle.
+- Sem a Xbox Game Bar instalada, o Windows mostraria a janela “Obter um aplicativo para abrir este link ‘ms-gamebar’” a cada controle conectado; o TransLocal registra um manipulador silencioso para o seu usuário (desfeito na desinstalação, ou com `TransLocal.exe --restore-gamebar-prompt`).
+
 ### Atalhos
 
 | Atalho | Onde | Ação |
@@ -70,6 +82,7 @@ O TransLocal transmite um monitor existente. Para estender a área de trabalho, 
 - **Cabo USB-C não cria rede:** os dois computadores precisam de USB4/Thunderbolt e o cabo precisa ser Thunderbolt/USB4. Veja se aparece “USB4 P2P Network Adapter” em *Gerenciador de Dispositivos › Adaptadores de rede*.
 - **HDMI travando em 5 quadros/s:** escolha um formato MJPEG (placas USB 2.0 só chegam a 30/60 quadros/s com compressão). Feche OBS, Câmera ou Teams se a placa estiver em uso.
 - **Imagem preta em parte da tela:** vídeos protegidos (DRM) não podem ser capturados pelo Windows.
+- **Controle de jogo não funciona:** na barra da janela de exibição (leve o mouse ao topo) aparece o estado dos controles. “Falta o driver no outro PC” → instale o suporte a controles no PC. “Nenhum” na aba *Receber* → o controle não é XInput (veja acima).
 - **Controle não funciona em janelas de administrador:** o Windows bloqueia entrada simulada em programas elevados, a não ser que o TransLocal também seja executado como administrador. A tela de UAC e a tela de bloqueio não podem ser transmitidas.
 - **Registros:** aba *Configurações e ajuda › Abrir pasta de registros* (`%LOCALAPPDATA%\TransLocal`).
 
@@ -79,6 +92,7 @@ O TransLocal transmite um monitor existente. Para estender a área de trabalho, 
 - **Codificação:** a tela é dividida em faixas de 64 px; só os trechos que mudaram são enviados, em JPEG codificado em paralelo (~4 ms para um quadro 1080p inteiro). Controle de fluxo com no máximo 2 quadros em trânsito mantém o atraso baixo mesmo quando a rede é mais lenta.
 - **Rede:** TCP 52020 (vídeo, som, controle) e UDP 52021 (descoberta por broadcast em todas as interfaces, inclusive 169.254.x.x).
 - **Som:** loopback WASAPI do transmissor → PCM 16 bits → reprodução com descarte de atraso acumulado.
+- **Controles de jogo:** o receptor lê os controles XInput a cada 4 ms e envia só as mudanças; o transmissor os reproduz como controles de Xbox 360 virtuais (ViGEmBus) e devolve a vibração.
 - **HDMI:** dispositivos UVC via DirectShow (FlashCap), com repasse opcional do áudio da placa.
 
 Bibliotecas: [NAudio](https://github.com/naudio/NAudio) (MIT), [FlashCap](https://github.com/kekyo/FlashCap) (Apache-2.0), [Vortice.Windows](https://github.com/amerkoleci/Vortice.Windows) (MIT) — detalhes em [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
@@ -97,6 +111,7 @@ Diagnóstico (resultados em `%LOCALAPPDATA%\TransLocal\TransLocal.log`):
 ```powershell
 TransLocal.exe --selftest <pasta>   # transmissão completa pela interface local; salva a imagem recebida
 TransLocal.exe --bench              # mede captura, codificação e decodificação
+TransLocal.exe --gamepad-test       # cria um controle virtual e confere pelo XInput (requer ViGEmBus)
 ```
 
 Estrutura:
@@ -109,7 +124,7 @@ src/TransLocal/
   Streaming/              SenderSession (transmissor) e ReceiverServer (receptor)
   Video/                  captura DXGI/GDI, codificador por faixas, superfície de exibição, HDMI
   Audio/                  som do sistema, reprodução e repasse da placa
-  Input/                  controle remoto de mouse e teclado
+  Input/                  controle remoto de mouse e teclado; controles de jogo (XInput → Xbox 360 virtual)
   UI/                     área de notificação, janela principal, janela de exibição
 installer/TransLocal.iss  instalador (Inno Setup)
 tools/make-icon.ps1       gera assets/TransLocal.ico

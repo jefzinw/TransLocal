@@ -12,7 +12,7 @@ internal sealed class SurfaceView : Control
     private readonly FrameSurface _surface;
     private Rectangle _dest;
     private int _invalidatePending;
-    private bool _controlEnabled;
+    private volatile bool _controlEnabled;
     private ushort _lastNx = ushort.MaxValue, _lastNy = ushort.MaxValue;
 
     public SurfaceView(FrameSurface surface)
@@ -241,6 +241,7 @@ internal sealed class ViewerForm : Form
     private readonly SurfaceView _view;
     private readonly Panel _bar;
     private readonly Label _barTitle;
+    private readonly Label _gamepadLabel;
     private readonly Button _btnFull;
     private readonly Button _btnControl;
     private readonly Button _btnStats;
@@ -250,8 +251,13 @@ internal sealed class ViewerForm : Form
     private bool _fullscreen;
     private bool _showStats;
     private bool _closingFromCode;
+    private volatile bool _windowActive;
     private Rectangle _windowedBounds;
     private string? _lastStats;
+
+    /// <summary>Verdadeiro quando o controle está ligado e esta janela está em primeiro plano
+    /// (só então os controles de jogo são enviados). Lido por outra thread.</summary>
+    public bool InputActive => _view.ControlEnabled && _windowActive;
 
     /// <summary>O usuário fechou a janela (não chamado quando fechada por código).</summary>
     public event Action? UserClosed;
@@ -262,7 +268,8 @@ internal sealed class ViewerForm : Form
 
     protected override bool ShowWithoutActivation => NoActivate;
 
-    public ViewerForm(string title, FrameSurface surface, Action<byte[]>? sendInput, Screen target, bool fullscreen, bool showStats, Size initialImageSize)
+    public ViewerForm(string title, FrameSurface surface, Action<byte[]>? sendInput, Screen target, bool fullscreen, bool showStats,
+        Size initialImageSize, bool startWithControl = false)
     {
         _title = title;
         _controlAvailable = sendInput is not null;
@@ -298,12 +305,19 @@ internal sealed class ViewerForm : Form
             WrapContents = false,
             BackColor = Color.Transparent,
         };
-        _btnControl = BarButton(_controlAvailable ? "Controlar: desligado" : "Sem controle", (_, _) => ToggleControl());
+        _gamepadLabel = new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.FromArgb(200, 220, 255),
+            Margin = new Padding(4, 8, 8, 0),
+            Visible = false,
+        };
+        _btnControl = BarButton(_controlAvailable ? "Controlar: desligado" : "Sem controle (o outro PC não permitiu)", (_, _) => ToggleControl());
         _btnControl.Enabled = _controlAvailable;
         _btnStats = BarButton("Estatísticas", (_, _) => ToggleStats());
         _btnFull = BarButton("Tela cheia", (_, _) => ToggleFullscreen());
         var btnClose = BarButton("Fechar", (_, _) => Close());
-        flow.Controls.AddRange(new Control[] { _btnControl, _btnStats, _btnFull, btnClose });
+        flow.Controls.AddRange(new Control[] { _gamepadLabel, _btnControl, _btnStats, _btnFull, btnClose });
         _bar.Controls.Add(_barTitle);
         _bar.Controls.Add(flow);
 
@@ -323,6 +337,35 @@ internal sealed class ViewerForm : Form
 
         if (fullscreen) SetFullscreen(true, target);
         UpdateStatsButton();
+        if (startWithControl && _controlAvailable) ToggleControl();
+    }
+
+    /// <summary>Texto sobre os controles de jogo na barra (null esconde).</summary>
+    public void SetGamepadInfo(string? text)
+    {
+        if (!IsHandleCreated || IsDisposed) return;
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (_gamepadLabel.Text == (text ?? "") && _gamepadLabel.Visible == (text is not null)) return;
+                _gamepadLabel.Text = text ?? "";
+                _gamepadLabel.Visible = text is not null;
+            });
+        }
+        catch (InvalidOperationException) { }
+    }
+
+    protected override void OnActivated(EventArgs e)
+    {
+        base.OnActivated(e);
+        _windowActive = true;
+    }
+
+    protected override void OnDeactivate(EventArgs e)
+    {
+        base.OnDeactivate(e);
+        _windowActive = false;
     }
 
     private Button BarButton(string text, EventHandler onClick)
@@ -409,7 +452,7 @@ internal sealed class ViewerForm : Form
         _view.ControlEnabled = !_view.ControlEnabled;
         _btnControl.Text = _view.ControlEnabled ? "Controlar: ligado" : "Controlar: desligado";
         _barTitle.Text = _view.ControlEnabled
-            ? $"{_title} — mouse e teclado enviados (Ctrl+Alt+Shift+C para soltar)"
+            ? $"{_title} — controlando (Ctrl+Alt+Shift+C para soltar)"
             : _title;
     }
 

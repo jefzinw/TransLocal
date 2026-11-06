@@ -9,6 +9,9 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // Manipulador “mudo” de links (ex.: ms-gamebar): sai imediatamente, sem janela.
+        if (args.Length > 0 && args[0].Equals("--noop", StringComparison.OrdinalIgnoreCase)) return 0;
+
         Log.Init();
         ApplicationConfiguration.Initialize();
 
@@ -28,16 +31,28 @@ internal static class Program
         if (Has("--cleanup"))
         {
             SystemIntegration.SetAutoStart(false);
+            SystemIntegration.RestoreGameBarPrompt();
+            return 0;
+        }
+        if (Has("--fix-gamebar-prompt"))
+        {
+            SystemIntegration.SuppressGameBarPromptIfNeeded();
+            return 0;
+        }
+        if (Has("--restore-gamebar-prompt"))
+        {
+            SystemIntegration.RestoreGameBarPrompt();
             return 0;
         }
 
         // ---- Diagnóstico ----
-        if (Has("--bench") || Has("--selftest") || Has("--ui-screenshot"))
+        if (Has("--bench") || Has("--selftest") || Has("--ui-screenshot") || Has("--gamepad-test"))
         {
             Log.Echo = Native.AttachConsole(Native.ATTACH_PARENT_PROCESS);
             try
             {
                 if (Has("--bench")) return DevTools.Bench();
+                if (Has("--gamepad-test")) return DevTools.GamepadTest();
                 if (Has("--selftest")) return DevTools.SelfTest(Arg("--selftest") ?? Log.DataDirectory);
                 return DevTools.UiScreenshots(Arg("--ui-screenshot") ?? Log.DataDirectory);
             }

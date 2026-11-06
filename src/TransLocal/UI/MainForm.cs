@@ -41,6 +41,9 @@ internal sealed class MainForm : Form
     private readonly CheckBox _chkFullscreen = new();
     private readonly CheckBox _chkPlayAudio = new();
     private readonly CheckBox _chkStats = new();
+    private readonly CheckBox _chkAutoControl = new();
+    private readonly Label _padsHere = new();
+    private readonly System.Windows.Forms.Timer _padsTimer = new() { Interval = 1500 };
 
     // Transmitir
     private readonly Button _btnScan = new();
@@ -52,6 +55,8 @@ internal sealed class MainForm : Form
     private readonly ComboBox _cmbQuality = new();
     private readonly CheckBox _chkSendAudio = new();
     private readonly CheckBox _chkAllowControl = new();
+    private readonly Label _gpStatus = new();
+    private readonly Button _btnGpInstall = new();
     private readonly Button _btnSend = new();
     private readonly Label _sendStatus = new();
 
@@ -134,8 +139,16 @@ internal sealed class MainForm : Form
         base.OnFormClosing(e);
     }
 
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        base.OnVisibleChanged(e);
+        if (!Visible) _padsTimer.Stop();
+        else if (_tabs.SelectedTab == _tabReceive) _padsTimer.Start();
+    }
+
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        _padsTimer.Dispose();
         _app.StateChanged -= RefreshState;
         System.Net.NetworkInformation.NetworkChange.NetworkAddressChanged -= OnNetworkChanged;
         base.OnFormClosed(e);
@@ -317,9 +330,34 @@ internal sealed class MainForm : Form
         _chkStats.CheckedChanged += (_, _) => SaveSetting(s => s.ShowStats = _chkStats.Checked);
         Add(t, _chkStats);
 
+        Add(t, Heading("Controlar o outro computador daqui"));
+        SetupCheck(_chkAutoControl, "Começar já controlando quando o outro computador permitir (mouse, teclado e controles de jogo USB)");
+        _chkAutoControl.CheckedChanged += (_, _) => SaveSetting(s => s.ViewerAutoControl = _chkAutoControl.Checked);
+        Add(t, _chkAutoControl);
+        SetupStatus(_padsHere);
+        Add(t, _padsHere);
+        _padsTimer.Tick += (_, _) => RefreshPadsHere();
+        Add(t, Note("O outro computador precisa marcar “Permitir que o outro computador use o mouse, o teclado e os controles” na aba Transmitir " +
+                    "e, para controles de jogo, instalar o suporte a controles (botão na mesma aba).\n" +
+                    "Controles reconhecidos: Xbox 360/One/Series e compatíveis (XInput). Controles de PS4/PS5 ou genéricos: ligue o modo “X-input” do controle " +
+                    "(muitos têm uma chave ou combinação de botões) ou use o Steam/DS4Windows neste computador.\n" +
+                    "Os controles só são enviados enquanto a janela de exibição estiver em primeiro plano."));
+
         Add(t, Note("Na janela de exibição: F11 alterna tela cheia • Esc sai da tela cheia • leve o mouse ao topo da tela para ver a barra de botões.\n" +
-                    "Ctrl+Alt+Shift+Q fecha • Ctrl+Alt+Shift+C liga/desliga o controle do outro computador (quando ele permitir) • Ctrl+Alt+Shift+F tela cheia."));
+                    "Ctrl+Alt+Shift+Q fecha • Ctrl+Alt+Shift+C liga/desliga o controle do outro computador • Ctrl+Alt+Shift+F tela cheia."));
         Finish(t);
+    }
+
+    private void RefreshPadsHere()
+    {
+        int n = Input.XInput.CountConnected();
+        _padsHere.Text = n switch
+        {
+            0 => "Controles de jogo conectados aqui: nenhum (XInput)",
+            1 => "Controles de jogo conectados aqui: 1 ✔",
+            _ => $"Controles de jogo conectados aqui: {n} ✔",
+        };
+        _padsHere.ForeColor = n > 0 ? Good : Muted;
     }
 
     private void BuildSendTab()
@@ -386,9 +424,28 @@ internal sealed class MainForm : Form
         _chkSendAudio.CheckedChanged += (_, _) => SaveSetting(s => s.SenderAudio = _chkSendAudio.Checked);
         Add(t, _chkSendAudio);
 
-        SetupCheck(_chkAllowControl, "Permitir que o outro computador use o mouse e o teclado deste");
+        SetupCheck(_chkAllowControl, "Permitir que o outro computador use o mouse, o teclado e os controles de jogo dele neste computador");
         _chkAllowControl.CheckedChanged += (_, _) => SaveSetting(s => s.SenderAllowControl = _chkAllowControl.Checked);
         Add(t, _chkAllowControl);
+
+        _gpStatus.AutoSize = true;
+        _gpStatus.Margin = new Padding(20, 8, 10, 0);
+        _gpStatus.Text = "Controles de jogo: verificando…";
+        _gpStatus.ForeColor = Muted;
+        SetupButton(_btnGpInstall, "Instalar suporte a controles");
+        _btnGpInstall.Visible = false;
+        _btnGpInstall.Click += async (_, _) =>
+        {
+            _btnGpInstall.Enabled = false;
+            _gpStatus.Text = "Controles de jogo: instalando o driver ViGEmBus (aceite o pedido do Windows)…";
+            bool ok = await SystemIntegration.InstallGamepadDriverAsync();
+            _btnGpInstall.Enabled = true;
+            SetGamepadDriverLabel(ok);
+            if (!ok)
+                MessageBox.Show(this, "O driver não foi instalado. Se a página de download abriu, instale o ViGEmBus por ela e volte aqui.",
+                    "Controles de jogo", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        };
+        Add(t, Row(_gpStatus, _btnGpInstall));
 
         SetupButton(_btnSend, "Transmitir", primary: true);
         _btnSend.Click += async (_, _) => await ToggleSendAsync();
@@ -532,11 +589,30 @@ internal sealed class MainForm : Form
         {
             _loading = false;
         }
+        _chkAutoControl.Checked = _app.Settings.ViewerAutoControl;
         _ = Task.Run(() =>
         {
             bool fw = SystemIntegration.HasFirewallRule();
-            try { BeginInvoke(() => SetFirewallLabel(fw)); } catch { }
+            bool gp = Input.VirtualGamepads.IsDriverInstalled(out _);
+            try
+            {
+                BeginInvoke(() =>
+                {
+                    SetFirewallLabel(fw);
+                    SetGamepadDriverLabel(gp);
+                });
+            }
+            catch { }
         });
+    }
+
+    private void SetGamepadDriverLabel(bool installed)
+    {
+        _gpStatus.Text = installed
+            ? "Controles de jogo: suporte instalado ✔ (driver ViGEmBus)"
+            : "Controles de jogo: falta o driver ViGEmBus neste computador";
+        _gpStatus.ForeColor = installed ? Good : Muted;
+        _btnGpInstall.Visible = !installed;
     }
 
     private static void FillMonitors(ComboBox combo, string? selected)
@@ -604,9 +680,15 @@ internal sealed class MainForm : Form
         {
             LoadHdmiDevices();
         }
-        else if (_tabs.SelectedTab == _tabReceive)
+        if (_tabs.SelectedTab == _tabReceive)
         {
             RefreshAddresses();
+            RefreshPadsHere();
+            _padsTimer.Start();
+        }
+        else
+        {
+            _padsTimer.Stop();
         }
     }
 

@@ -41,6 +41,7 @@ Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortugue
 
 [Tasks]
 Name: "autostart"; Description: "Iniciar o TransLocal junto com o Windows (fica pronto para receber transmissões)"; GroupDescription: "Opções:"
+Name: "gamepad"; Description: "Instalar suporte a controles de jogo (driver ViGEmBus) — necessário só no computador que transmite e será controlado"; GroupDescription: "Opções:"; Flags: unchecked
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
@@ -54,6 +55,8 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 ; Ligações diretas por cabo são classificadas como rede pública: a regra vale para todos os perfis.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; Check: IsAdminInstallMode
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#AppName}"" dir=in action=allow program=""{app}\{#AppExe}"" enable=yes profile=any description=""Permite receber transmissões de tela do TransLocal"""; Flags: runhidden; Check: IsAdminInstallMode; StatusMsg: "Liberando o TransLocal no Firewall do Windows..."
+; O winget roda como o usuário e pede, ele mesmo, a permissão de administrador para o driver.
+Filename: "{cmd}"; Parameters: "/c winget install --id ViGEm.ViGEmBus -e --silent --accept-package-agreements --accept-source-agreements"; Flags: runasoriginaluser runhidden waituntilterminated; Tasks: gamepad; StatusMsg: "Instalando o suporte a controles de jogo (ViGEmBus)..."
 Filename: "{app}\{#AppExe}"; Parameters: "--set-autostart on"; Flags: runasoriginaluser runhidden waituntilterminated; Tasks: autostart
 Filename: "{app}\{#AppExe}"; Parameters: "--set-autostart off"; Flags: runasoriginaluser runhidden waituntilterminated; Tasks: not autostart
 Filename: "{app}\{#AppExe}"; Description: "Abrir o TransLocal agora"; Flags: nowait postinstall skipifsilent runasoriginaluser

@@ -11,6 +11,7 @@
 param(
     [string]$Name = 'TransLocal',
     [string]$Version = '1.0.0',
+    [string]$Changes = '',
     [switch]$SkipRelease
 )
 
@@ -76,16 +77,17 @@ if (-not $SkipRelease) {
         if ($LASTEXITCODE -ne 0) { Fail "Falha no build." }
     }
 
+    $changesBlock = if ($Changes) { "`n**Novidades**`n$Changes`n" } else { '' }
     $notes = @"
 ## TransLocal $Version
 
 Transmita a tela de um computador para outro por cabo, ou exiba um notebook ligado por HDMI a uma placa de captura.
-
+$changesBlock
 **Downloads**
 - **TransLocal-Setup-$Version.exe**: instalador (atalho no Menu Iniciar, regra no Firewall do Windows, início automático opcional).
 - **TransLocal.exe**: executável único, roda sem instalar.
 
-Instale nos dois computadores. Não é preciso ter o .NET instalado.
+Instale nos dois computadores. Não é preciso ter o .NET instalado. Para atualizar, basta executar o instalador novo (ele fecha a versão antiga sozinho).
 
 > O executável não tem assinatura digital: na primeira execução o Windows pode mostrar “O Windows protegeu o computador”. Clique em **Mais informações › Executar assim mesmo**.
 

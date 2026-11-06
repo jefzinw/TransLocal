@@ -165,14 +165,29 @@ internal static class DevTools
         await ended.Task.WaitAsync(TimeSpan.FromSeconds(5));
         session.Surface.Dispose();
 
-        // Nova sessão e encerramento pelo transmissor.
+        // Controles de jogo: formato da mensagem e leitura do XInput deste computador.
+        var padIn = new Input.GamepadState(2, true, 0x1F3F, 10, 250, -32768, 32767, 1234, -4321);
+        Check(Input.GamepadCodec.TryDecode(Input.GamepadCodec.Encode(padIn), out var padOut) && padOut == padIn, "controle de jogo: codificação ida e volta");
+        Log.Info($"SELFTEST controles XInput conectados neste computador: {Input.XInput.CountConnected()}");
+        bool driver = Input.VirtualGamepads.IsDriverInstalled(out var driverError);
+        Log.Info($"SELFTEST driver ViGEmBus neste computador: {(driver ? "instalado" : "ausente (" + driverError + ")")}");
+
+        // Nova sessão com controle permitido, encerrada pelo transmissor.
         var started2 = new TaskCompletionSource<ReceiverSession>(TaskCreationOptions.RunContinuationsAsynchronously);
         var ended2 = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         server.SessionStarted += s => started2.TrySetResult(s);
         server.SessionEnded += (_, reason) => ended2.TrySetResult(reason);
-        var sender2 = await SenderSession.ConnectAsync("127.0.0.1", port, opt, CancellationToken.None);
+        var optControl = new SenderOptions { Name = "Transmissor-Teste", Fps = 30, Quality = 75, Audio = false, AllowControl = true };
+        var sender2 = await SenderSession.ConnectAsync("127.0.0.1", port, optControl, CancellationToken.None);
         var session2 = await started2.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        string expected = driver ? Input.VirtualGamepads.StatusOk : Input.VirtualGamepads.StatusNoDriver;
+        Check(sender2.GamepadStatus == expected, $"transmissor anuncia controles de jogo (“{sender2.GamepadStatus}”)");
+        // Transmissão vinda do próprio computador: controle bloqueado (evita ciclo de mouse e de controles virtuais).
+        Check(session2.FromThisComputer && !session2.ControlAllowed && session2.GamepadStatus == Input.VirtualGamepads.StatusDisabled,
+            "controle bloqueado quando a transmissão vem do próprio computador");
+        session2.SendGamepad(Input.GamepadCodec.Encode(padIn with { Slot = 0 })); // deve ser ignorado
         await Task.Delay(800);
+        Check(sender2.IsRunning && Input.XInput.CountConnected() == 0, "nenhum controle virtual criado; transmissão segue ativa");
         sender2.Stop();
         var reasonAtReceiver = await ended2.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Check(reasonAtReceiver is not null, $"receptor avisado do fim (“{reasonAtReceiver}”)");
@@ -180,6 +195,61 @@ internal static class DevTools
 
         server.Stop();
         Log.Info(failures == 0 ? "SELFTEST concluído: tudo certo" : $"SELFTEST concluído com {failures} falha(s)");
+        return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Cria um controle virtual (ViGEmBus), aplica estados e confere lendo de volta pelo XInput deste computador.
+    /// </summary>
+    public static int GamepadTest()
+    {
+        int failures = 0;
+        void Check(bool ok, string what)
+        {
+            Log.Info($"PADTEST {(ok ? "OK  " : "FALHOU")} {what}");
+            if (!ok) failures++;
+        }
+
+        bool driver = Input.VirtualGamepads.IsDriverInstalled(out var err);
+        Check(driver, $"driver ViGEmBus {(driver ? "presente" : "ausente: " + err)}");
+        if (!driver) return 1;
+
+        int before = Input.XInput.CountConnected();
+        var slotsBefore = Enumerable.Range(0, 4).Where(i => Input.XInput.TryGetState(i, out _, out _)).ToHashSet();
+        Log.Info($"PADTEST controles XInput antes: {before}");
+
+        using var pads = new Input.VirtualGamepads();
+        var state = new Input.GamepadState(0, true, 0x1000 | 0x0001, 0, 200, 12000, -8000, 0, 0); // A + Cima, RT, analógico esquerdo
+        try
+        {
+            pads.Apply(state);
+            Check(true, "controle virtual criado e conectado");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("PADTEST falha ao conectar", ex);
+            return 1;
+        }
+
+        int newSlot = -1;
+        for (int i = 0; i < 40 && newSlot < 0; i++)
+        {
+            Thread.Sleep(50);
+            newSlot = Enumerable.Range(0, 4).FirstOrDefault(s => !slotsBefore.Contains(s) && Input.XInput.TryGetState(s, out _, out _), -1);
+        }
+        Check(newSlot >= 0, $"controle virtual visível no XInput (slot {newSlot + 1})");
+        if (newSlot >= 0)
+        {
+            pads.Apply(state with { Buttons = 0x1000 | 0x0001 });
+            Thread.Sleep(100);
+            Input.XInput.TryGetState(newSlot, out var read, out _);
+            Check(read.Buttons == state.Buttons && read.RightTrigger == 200 && read.LeftX == 12000 && read.LeftY == -8000,
+                $"estado lido de volta: botões=0x{read.Buttons:X4} RT={read.RightTrigger} LX={read.LeftX} LY={read.LeftY}");
+        }
+
+        pads.Apply(state with { Connected = false });
+        Thread.Sleep(500);
+        Check(Input.XInput.CountConnected() == before, "controle virtual removido");
         return failures == 0 ? 0 : 1;
     }
 

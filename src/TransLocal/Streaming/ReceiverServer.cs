@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using NAudio.Wave;
 using TransLocal.Audio;
+using TransLocal.Input;
 using TransLocal.Video;
 
 namespace TransLocal.Streaming;
@@ -124,7 +125,7 @@ internal sealed class ReceiverServer : IDisposable
             }
 
             conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = true, Name = _name() });
-            Log.Info($"Recebendo de {hello.Name} ({conn.RemoteEndPoint}) {hello.Width}×{hello.Height}, áudio={hello.Audio}, controle={hello.Control}");
+            Log.Info($"Recebendo de {hello.Name} ({conn.RemoteEndPoint}) {hello.Width}×{hello.Height}, áudio={hello.Audio}, controle={hello.Control}, controles de jogo={hello.Gamepads ?? "?"}");
             try { SessionStarted?.Invoke(session); } catch (Exception ex) { Log.Error("Erro ao abrir exibição", ex); }
 
             string? reason = session.Run();
@@ -165,19 +166,35 @@ internal sealed class ReceiverSession
     public FrameSurface Surface { get; } = new();
     public string SenderName => _hello.Name;
     public string RemoteEndPoint => _conn.RemoteEndPoint;
-    public bool ControlAllowed => _hello.Control;
+
+    /// <summary>A transmissão vem deste mesmo computador (teste). Controle fica bloqueado para não entrar em ciclo.</summary>
+    public bool FromThisComputer { get; }
+
+    public bool ControlAllowed => _hello.Control && !FromThisComputer;
     public int InitialWidth => _hello.Width;
     public int InitialHeight => _hello.Height;
     public long FramesReceived;
 
+    /// <summary>Controles de jogo no transmissor: "ok", "sem-driver", "desligado" ou "antigo" (versão sem suporte).</summary>
+    public string GamepadStatus => !ControlAllowed
+        ? VirtualGamepads.StatusDisabled
+        : _hello.Gamepads ?? "antigo";
+
     public event Action? FrameReady;
     public event Action<string>? StatsUpdated;
+
+    /// <summary>Vibração pedida pelo jogo no outro computador: (slot, motor grande, motor pequeno).</summary>
+    public event Action<int, byte, byte>? GamepadFeedback;
 
     public ReceiverSession(Connection conn, HelloMessage hello, bool playAudio)
     {
         _conn = conn;
         _hello = hello;
         _playAudio = playAudio;
+        var ip = conn.RemoteAddress;
+        if (ip is not null && ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+        FromThisComputer = ip is not null &&
+                           (System.Net.IPAddress.IsLoopback(ip) || NetInfo.GetLocalAddresses().Any(a => a.Address.Equals(ip)));
     }
 
     /// <summary>Executa até a transmissão terminar. Retorna o motivo (null se fechada aqui).</summary>
@@ -212,6 +229,9 @@ internal sealed class ReceiverSession
                     case MsgType.Audio:
                         audio?.Add(m.Span);
                         break;
+                    case MsgType.GamepadFeedback when m.Length >= 3:
+                        GamepadFeedback?.Invoke(m.Span[0], m.Span[1], m.Span[2]);
+                        break;
                     case MsgType.Ping:
                         _conn.Send(MsgType.Pong, m.Span);
                         break;
@@ -238,6 +258,12 @@ internal sealed class ReceiverSession
     {
         if (!ControlAllowed || _closing) return;
         try { _conn.Send(MsgType.Input, payload); } catch { }
+    }
+
+    public void SendGamepad(byte[] payload)
+    {
+        if (GamepadStatus != VirtualGamepads.StatusOk || _closing) return;
+        try { _conn.Send(MsgType.Gamepad, payload); } catch { }
     }
 
     /// <summary>Encerra a exibição a partir deste computador.</summary>
