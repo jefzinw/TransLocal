@@ -241,6 +241,12 @@ internal static class DevTools
         Check(DiagFiles.Sanitize("de 192.168.1.43 em " + Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)) == "de x.x.x.x em %USERPROFILE%",
             "relatório para o GitHub remove IP e pasta do usuário");
         Check(ConversionSelfTest(out var convDetail), "conversão de quadros 10 bits / HDR / RGBA para a transmissão" + convDetail);
+        Check(ReedSolomonSelfTest(out var rsDetail), "correção de erros Reed-Solomon recupera pacotes perdidos" + rsDetail);
+        foreach (double loss in new[] { 0.0, 0.05, 0.15 })
+        {
+            bool ok = UdpSelfTest(loss, out var udpDetail);
+            Check(ok, $"vídeo por UDP cifrado{(loss > 0 ? $" com {loss:P0} de perda simulada" : "")}: {udpDetail}");
+        }
         Check(SecureFrameSelfTest(out var sfDetail), "quadro da tela segura pela memória compartilhada (escrita do agente, leitura do TransLocal)" + sfDetail);
         var lan = NetInfo.GetLocalAddresses().FirstOrDefault(a => !a.Kind.StartsWith("Tailscale") && !a.Kind.StartsWith("ZeroTier"));
         Check(!NetInfo.IsSameLocalNetwork(System.Net.IPAddress.Parse("100.101.102.103")) &&
@@ -461,6 +467,62 @@ internal static class DevTools
     /// --codec-test: 180 quadros 1366×768 com movimento (tela atual + faixa e quadro andando, como num jogo),
     /// codificados em H.264 e decodificados de volta. Mede tempo, taxa a 60 q/s, fidelidade e compara com JPEG.
     /// </summary>
+    /// <summary>Apaga pedaços ao acaso (até o limite da paridade) e confere que os dados voltam iguais.</summary>
+    private static bool ReedSolomonSelfTest(out string detail)
+    {
+        var rng = new Random(7);
+        int cases = 0;
+        foreach (var (k, m) in new[] { (1, 1), (5, 1), (10, 3), (48, 10), (48, 24) })
+        {
+            for (int rep = 0; rep < 20; rep++)
+            {
+                int size = 64;
+                var shards = new byte[k + m][];
+                for (int i = 0; i < k + m; i++) { shards[i] = new byte[size]; if (i < k) rng.NextBytes(shards[i]); }
+                var original = shards.Take(k).Select(x => (byte[])x.Clone()).ToArray();
+                Streaming.ReedSolomon.Encode(shards, k, m, size);
+                var present = Enumerable.Repeat(true, k + m).ToArray();
+                foreach (int idx in Enumerable.Range(0, k + m).OrderBy(_ => rng.Next()).Take(m)) { present[idx] = false; Array.Clear(shards[idx]); }
+                if (!Streaming.ReedSolomon.Recover(shards, present, k, m, size)) { detail = $" (falhou em k={k}, m={m})"; return false; }
+                for (int i = 0; i < k; i++)
+                    if (!shards[i].AsSpan().SequenceEqual(original[i])) { detail = $" (dados errados em k={k}, m={m})"; return false; }
+                cases++;
+            }
+        }
+        detail = $" ({cases} casos, até 24 de 72 pedaços apagados)";
+        return true;
+    }
+
+    /// <summary>Transmissão UDP de verdade (loopback): quadros de vários tamanhos, cifrados, com perda simulada.</summary>
+    private static bool UdpSelfTest(double loss, out string detail)
+    {
+        Environment.SetEnvironmentVariable("TRANSLOCAL_UDP_LOSS", loss.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        using var sender = new Streaming.UdpVideoSender(System.Net.IPAddress.Loopback) { Fec = loss > 0.1 ? 0.5 : loss > 0 ? 0.3 : 0.1 };
+        Environment.SetEnvironmentVariable("TRANSLOCAL_UDP_LOSS", null);
+        using var receiver = new Streaming.UdpVideoReceiver(sender.Key, sender.Session, new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, sender.Port));
+        var got = new System.Collections.Concurrent.ConcurrentDictionary<int, byte[]>();
+        receiver.FrameReady += f => got[f.Id] = f.Data.AsSpan(0, f.Length).ToArray();
+        var ready = Stopwatch.StartNew();
+        while (!sender.Active && ready.ElapsedMilliseconds < 3000) Thread.Sleep(10);
+        if (!sender.Active) { detail = "o receptor não se apresentou por UDP"; return false; }
+        var rng = new Random(11);
+        var frames = new Dictionary<int, byte[]>();
+        for (int id = 1; id <= 200; id++)
+        {
+            var data = new byte[id % 50 == 1 ? 120_000 : rng.Next(500, 25_000)]; // quadro-chave grande de vez em quando
+            rng.NextBytes(data);
+            frames[id] = data;
+            sender.SendFrame(id, id % 50 == 1, 1366, 768, data);
+            Thread.Sleep(1);
+        }
+        Thread.Sleep(300);
+        int intact = frames.Count(f => got.TryGetValue(f.Key, out var g) && g.AsSpan().SequenceEqual(f.Value));
+        int wrong = frames.Count(f => got.TryGetValue(f.Key, out var g) && !g.AsSpan().SequenceEqual(f.Value));
+        long recovered = Interlocked.Read(ref receiver.FramesRecovered);
+        detail = $"{intact}/200 quadros chegaram inteiros ({recovered} reconstruídos pela paridade), {wrong} corrompidos";
+        return wrong == 0 && intact >= (loss == 0 ? 200 : loss < 0.1 ? 194 : 180) && (loss == 0 || recovered > 0);
+    }
+
     /// <summary>
     /// Caminho da placa de vídeo de ponta a ponta: codifica, decodifica (DXVA) e mostra numa janela de verdade pela
     /// cadeia de troca, sem a imagem passar pelo processador; depois fotografa a tela (composição do Windows) e

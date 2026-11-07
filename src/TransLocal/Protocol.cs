@@ -20,7 +20,9 @@ internal static class Proto
 
     /// <summary>Limite antes da autenticação: só mensagens pequenas do aperto de mão.</summary>
     public const int HandshakeMaxBytes = 16 * 1024;
-    public const int MaxFramesInFlight = 2;
+    /// <summary>Quadros enviados ainda não mostrados do outro lado (TCP). Com 2, um atraso total acima de ~33 ms já
+    /// fazia o PC pular quadros a 60 q/s.</summary>
+    public const int MaxFramesInFlight = 4;
 
     public static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
 }
@@ -52,6 +54,8 @@ internal enum MsgType : byte
     FrameAck = 0x11,
     VideoH264 = 0x12,       // transmissor → receptor: [id:int32][largura:u16][altura:u16][flags:u8 (1 = quadro-chave)][Annex B]
     KeyframeRequest = 0x13, // receptor → transmissor: decodificador perdeu a sequência, mande um quadro-chave
+    UdpSetup = 0x14,        // transmissor → receptor: JSON {Port, Key, Session} — vídeo por UDP cifrado (chave pelo TLS)
+    NetReport = 0x15,       // receptor → transmissor, 1×/s: [pacotes u32][perdidos u32][quadros perdidos u32][quadros recuperados u32]
     Audio = 0x20,
     Input = 0x30,
     Gamepad = 0x31,
@@ -97,6 +101,17 @@ internal sealed class WelcomeMessage
 
     /// <summary>Formatos de vídeo que este receptor decodifica além dos blocos JPEG (ex.: "h264"). Null em versões antigas.</summary>
     public string[]? Codecs { get; set; }
+
+    /// <summary>Transportes de vídeo extras que o receptor aceita (ex.: "udp1"). Null em versões antigas (só TCP).</summary>
+    public string[]? Transports { get; set; }
+}
+
+/// <summary>Combinação do vídeo por UDP, enviada pelo canal TLS já autenticado.</summary>
+internal sealed class UdpSetupMessage
+{
+    public int Port { get; set; }
+    public string Key { get; set; } = "";
+    public uint Session { get; set; }
 }
 
 /// <summary>Preferências do receptor enviadas no handshake.</summary>

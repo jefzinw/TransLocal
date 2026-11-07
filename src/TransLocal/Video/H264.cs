@@ -220,10 +220,10 @@ internal sealed unsafe class H264Encoder : IDisposable
         Conservative = conservative;
         if (!conservative)
         {
-            Set(MF.MaxBitRate, (uint)(bitrate * 1.5));
-            // Buffer de ~1 quadro (como em jogos na nuvem): nenhum quadro, nem o quadro-chave, fica muito maior que
-            // a média — é isso que evita os "soluços" de rede a cada quadro-chave.
-            Set(MF.BufferSize, (uint)Math.Max(bitrate / Math.Max(fps, 1), 64_000));
+            Set(MF.MaxBitRate, (uint)(bitrate * 2));
+            // Buffer de ~3 quadros: absorve cenas de muito movimento sem pixelar (com 1 quadro a imagem desmanchava)
+            // e ainda limita o tamanho do quadro-chave, que sai em rajadas curtas pelo UDP.
+            Set(MF.BufferSize, (uint)Math.Max(bitrate * 3L / Math.Max(fps, 1), 192_000));
         }
         Set(MF.LowLatency, true);
         Set(MF.BPictureCount, 0u);
@@ -298,7 +298,7 @@ internal sealed unsafe class H264Encoder : IDisposable
         bool ok = Set(MF.MeanBitRate, (uint)bitrate);
         if (ok)
         {
-            Set(MF.MaxBitRate, (uint)(bitrate * 1.5));
+            Set(MF.MaxBitRate, (uint)(bitrate * 2));
             CurrentBitrate = bitrate;
         }
         return ok;
@@ -313,8 +313,9 @@ internal sealed unsafe class H264Encoder : IDisposable
     /// <summary>Taxa de bits recomendada: ~0,07–0,12 bit por pixel por quadro conforme a qualidade escolhida.</summary>
     public static int BitrateFor(int w, int h, int fps, int quality)
     {
-        double bpp = quality >= 90 ? 0.12 : quality >= 70 ? 0.09 : 0.07;
-        return (int)Math.Clamp(w * (double)h * fps * bpp, 2_000_000, 30_000_000);
+        // Referência dos apps de jogos na nuvem: ~10 Mbit/s para 1366×768/720p a 60 q/s, ~20 Mbit/s para 1080p60.
+        double bpp = quality >= 90 ? 0.16 : quality >= 70 ? 0.12 : 0.09;
+        return (int)Math.Clamp(w * (double)h * fps * bpp, 3_000_000, 40_000_000);
     }
 
     /// <summary>Ajustes da 1.6 (sem buffer de 1 quadro nem limite de pico): reserva se a placa não entregar quadros.</summary>

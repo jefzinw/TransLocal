@@ -250,6 +250,7 @@ internal sealed class ReceiverServer : IDisposable
                 ScreenHeight = prefs.ScreenHeight,
                 Light = prefs.Light,
                 Codecs = Video.H264Decoder.IsAvailable ? new[] { "h264" } : null,
+                Transports = Environment.GetEnvironmentVariable("TRANSLOCAL_NO_UDP") == "1" ? null : new[] { "udp1" },
             });
             Log.Info($"Recebendo de {hello.Name} ({conn.RemoteEndPoint}) {hello.Width}×{hello.Height}, áudio={hello.Audio}, controle={hello.Control}, controles de jogo={hello.Gamepads ?? "?"}");
             session.StartDiagnostics();
@@ -406,42 +407,14 @@ internal sealed class ReceiverSession
                         break;
                     case MsgType.VideoH264 when m.Length > 9:
                     {
-                        long t1 = Stopwatch.GetTimestamp();
                         var span = m.Span;
-                        int vid = BinaryPrimitives.ReadInt32LittleEndian(span);
-                        int vw = BinaryPrimitives.ReadUInt16LittleEndian(span[4..]);
-                        int vh = BinaryPrimitives.ReadUInt16LittleEndian(span[6..]);
-                        if (_decoder is null && !_decoderFailed)
-                        {
-                            _decoder = Video.H264Decoder.TryCreate(hardware: true, Gpu, vw, vh);
-                            _decoderFailed = _decoder is null;
-                            _codecLabel = _decoder is null ? "H.264 sem decodificador" : $"H.264 decodificado pel{(_decoder.Hardware ? "a placa de vídeo" : "o processador")}";
-                            Log.Info(_decoder is null ? "H.264: sem decodificador neste computador" : $"Decodificando H.264: {_decoder.Name} ({(_decoder.Hardware ? "placa de vídeo" : "processador")})");
-                        }
-                        bool produced = false, error = _decoder is null;
-                        // Se a exibição pela placa de vídeo cair, o decodificador passa sozinho a entregar pelo processador.
-                        var sink = GpuSink;
-                        if (_decoder is not null && vw > 0 && vh > 0 && vw <= 8192 && vh <= 8192)
-                            produced = _decoder.Decode(span[9..], vw, vh, Surface, sink, out error);
-                        bool onGpu = produced && _decoder!.LastOnGpu;
-                        Interlocked.Add(ref _statDecodeTicks, Stopwatch.GetTimestamp() - t1);
-                        if (produced)
-                        {
-                            Interlocked.Increment(ref _statFrames);
-                            Interlocked.Increment(ref FramesReceived);
-                            if (onGpu) Interlocked.Increment(ref _gpuFrames);
-                        }
-                        // Confirmação depois do quadro já estar na tela (o transmissor mede o atraso real com ela).
-                        BinaryPrimitives.WriteInt32LittleEndian(ack, vid);
-                        _conn.Send(MsgType.FrameAck, ack);
-                        if (error && Environment.TickCount64 - _lastKeyRequest > 1000)
-                        {
-                            _lastKeyRequest = Environment.TickCount64;
-                            _conn.Send(MsgType.KeyframeRequest, ReadOnlySpan<byte>.Empty);
-                        }
-                        if (produced && !onGpu) FrameReady?.Invoke();
+                        HandleH264(BinaryPrimitives.ReadInt32LittleEndian(span), BinaryPrimitives.ReadUInt16LittleEndian(span[4..]),
+                            BinaryPrimitives.ReadUInt16LittleEndian(span[6..]), (span[8] & 1) != 0, span[9..], viaUdp: false);
                         break;
                     }
+                    case MsgType.UdpSetup:
+                        StartUdp(m.ReadJson<UdpSetupMessage>());
+                        break;
                     case MsgType.Audio:
                         audio?.Add(m.Span);
                         break;
@@ -482,8 +455,12 @@ internal sealed class ReceiverSession
         {
             audio?.Dispose();
             Diag?.Dispose();
-            _decoder?.Dispose();
-            _decoder = null;
+            _udp?.Dispose();
+            lock (_videoGate)
+            {
+                _decoder?.Dispose();
+                _decoder = null;
+            }
             Native.timeEndPeriod(1);
             Thread.CurrentThread.Priority = priority;
             Streaming.Realtime.Revert(mmcss);
@@ -494,6 +471,98 @@ internal sealed class ReceiverSession
                 _gpu = null;
             }
         }
+    }
+
+    private readonly object _videoGate = new();
+    private Streaming.UdpVideoReceiver? _udp;
+    private string _udpLabel = "";
+    private long _udpBytes, _framesSkipped;
+    private int _lastVideoId = int.MinValue;
+    private bool _waitKey;
+
+    /// <summary>O transmissor ofereceu vídeo por UDP: abre o socket e se apresenta (o vídeo passa a vir por ele).</summary>
+    private void StartUdp(UdpSetupMessage setup)
+    {
+        if (_udp is not null || Environment.GetEnvironmentVariable("TRANSLOCAL_NO_UDP") == "1") return;
+        var ip = _conn.RemoteAddress;
+        if (ip is null || setup.Port <= 0 || setup.Port > 65535) return;
+        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+        byte[] key;
+        try { key = Convert.FromBase64String(setup.Key); } catch { return; }
+        if (key.Length != 32) return;
+        try
+        {
+            var udp = new Streaming.UdpVideoReceiver(key, setup.Session, new System.Net.IPEndPoint(ip, setup.Port));
+            udp.FrameReady += f =>
+            {
+                Interlocked.Add(ref _udpBytes, f.Length);
+                HandleH264(f.Id, f.Width, f.Height, f.Key, f.Data.AsSpan(0, f.Length), viaUdp: true);
+            };
+            udp.FrameLost += _ => RequestKey(fast: true);
+            _udp = udp;
+            Log.Info($"Vídeo por UDP oferecido por {SenderName}: apresentando-se a {ip}:{setup.Port}");
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("UDP indisponível neste computador; vídeo segue pelo TCP", ex);
+        }
+    }
+
+    private void RequestKey(bool fast)
+    {
+        _waitKey = true;
+        long now = Environment.TickCount64;
+        if (now - Interlocked.Read(ref _lastKeyRequest) < (fast ? 150 : 1000)) return;
+        Interlocked.Exchange(ref _lastKeyRequest, now);
+        if (!_closing) try { _conn.Send(MsgType.KeyframeRequest, ReadOnlySpan<byte>.Empty); } catch { }
+    }
+
+    /// <summary>Decodifica e mostra um quadro H.264 (chega pelo TCP ou pelo UDP, cada um na sua thread).</summary>
+    private void HandleH264(int vid, int vw, int vh, bool key, ReadOnlySpan<byte> annexB, bool viaUdp)
+    {
+        Span<byte> ack = stackalloc byte[4];
+        bool produced = false, error = false, onGpu = false;
+        lock (_videoGate)
+        {
+            long t1 = Stopwatch.GetTimestamp();
+            // Pelo UDP um quadro pode sumir inteiro: sem ele, os seguintes sairiam borrados ("pixelando") até o próximo
+            // quadro-chave. Melhor segurar a imagem por alguns milissegundos e pedir um quadro-chave já.
+            if (viaUdp && _lastVideoId != int.MinValue && vid != _lastVideoId + 1 && vid > _lastVideoId && !key) RequestKey(fast: true);
+            if (vid > _lastVideoId || _lastVideoId == int.MinValue) _lastVideoId = vid;
+            if (key) _waitKey = false;
+            if (_waitKey && viaUdp)
+            {
+                Interlocked.Increment(ref _framesSkipped);
+            }
+            else
+            {
+                if (_decoder is null && !_decoderFailed)
+                {
+                    _decoder = Video.H264Decoder.TryCreate(hardware: true, Gpu, vw, vh);
+                    _decoderFailed = _decoder is null;
+                    _codecLabel = _decoder is null ? "H.264 sem decodificador" : $"H.264 decodificado pel{(_decoder.Hardware ? "a placa de vídeo" : "o processador")}";
+                    Log.Info(_decoder is null ? "H.264: sem decodificador neste computador" : $"Decodificando H.264: {_decoder.Name} ({(_decoder.Hardware ? "placa de vídeo" : "processador")})");
+                }
+                error = _decoder is null;
+                // Se a exibição pela placa de vídeo cair, o decodificador passa sozinho a entregar pelo processador.
+                var sink = GpuSink;
+                if (_decoder is not null && vw > 0 && vh > 0 && vw <= 8192 && vh <= 8192)
+                    produced = _decoder.Decode(annexB, vw, vh, Surface, sink, out error);
+                onGpu = produced && _decoder!.LastOnGpu;
+            }
+            Interlocked.Add(ref _statDecodeTicks, Stopwatch.GetTimestamp() - t1);
+        }
+        if (produced)
+        {
+            Interlocked.Increment(ref _statFrames);
+            Interlocked.Increment(ref FramesReceived);
+            if (onGpu) Interlocked.Increment(ref _gpuFrames);
+        }
+        // Confirmação depois do quadro já estar na tela (o transmissor mede o atraso real com ela).
+        BinaryPrimitives.WriteInt32LittleEndian(ack, vid);
+        if (!_closing) try { _conn.Send(MsgType.FrameAck, ack); } catch { }
+        if (error) RequestKey(fast: false);
+        if (produced && !onGpu) FrameReady?.Invoke();
     }
 
     /// <summary>Começa o diagnóstico compartilhado (chamado quando a exibição é aceita).</summary>
@@ -546,7 +615,23 @@ internal sealed class ReceiverSession
         int gpu = Interlocked.Exchange(ref _gpuFrames, 0);
         string label = _codecLabel + (gpu > 0 && gpu >= frames / 2 ? " → exibição pela placa de vídeo" : "");
         string remote = _remoteStats is { Length: > 0 } r ? $" • {r}" : "";
+        if (_udp is { } u && u.Receiving)
+        {
+            // Relatório 1×/s ao transmissor: ele ajusta a paridade e a taxa de bits pela perda real do caminho.
+            long pk = Interlocked.Exchange(ref u.Packets, 0), lost = Interlocked.Exchange(ref u.PacketsLost, 0);
+            long fl = Interlocked.Exchange(ref u.FramesLost, 0), fr = Interlocked.Exchange(ref u.FramesRecovered, 0);
+            fl += Interlocked.Exchange(ref _framesSkipped, 0);
+            Span<byte> rep = stackalloc byte[16];
+            BinaryPrimitives.WriteUInt32LittleEndian(rep, (uint)Math.Min(pk, uint.MaxValue));
+            BinaryPrimitives.WriteUInt32LittleEndian(rep[4..], (uint)Math.Min(lost, uint.MaxValue));
+            BinaryPrimitives.WriteUInt32LittleEndian(rep[8..], (uint)fl);
+            BinaryPrimitives.WriteUInt32LittleEndian(rep[12..], (uint)fr);
+            if (!_closing) try { _conn.Send(MsgType.NetReport, rep); } catch { }
+            double loss = pk + lost > 0 ? lost / (double)(pk + lost) : 0;
+            _udpLabel = $" • UDP: perda {loss:P1}, {fr} quadro(s) salvos pela correção, {fl} perdido(s)";
+        }
         string decWord = gpu > 0 ? "decodificação + exibição" : "decodificação";
-        StatsUpdated?.Invoke($"{SenderName} • {Surface.Width}×{Surface.Height} • {frames / secs:0} quadros/s • {delta * 8 / secs / 1_000_000:0.0} Mbit/s • {label} • {decWord} {decMs:0.0} ms{remote}");
+        long udpBytes = _udp is null ? 0 : Interlocked.Exchange(ref _udpBytes, 0);
+        StatsUpdated?.Invoke($"{SenderName} • {Surface.Width}×{Surface.Height} • {frames / secs:0} quadros/s • {(delta + udpBytes) * 8 / secs / 1_000_000:0.0} Mbit/s • {label} • {decWord} {decMs:0.0} ms{_udpLabel}{remote}");
     }
 }

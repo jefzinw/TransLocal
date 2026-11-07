@@ -26,7 +26,7 @@ internal sealed class SenderOptions
 }
 
 /// <summary>Limites efetivos da transmissão, combinando a configuração local e o pedido do receptor.</summary>
-internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fps, int Quality, bool Light, bool H264 = false)
+internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fps, int Quality, bool Light, bool H264 = false, bool Udp = false)
 {
     public static StreamLimits Compute(SenderOptions opt, WelcomeMessage welcome)
     {
@@ -56,9 +56,13 @@ internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fp
             mh = mh <= 0 ? LightMode.MaxHeight : Math.Min(mh, LightMode.MaxHeight);
             // Com H.264 o notebook decodifica pela placa de vídeo: 60 quadros/s cabem no modo leve.
             fps = Math.Min(fps, h264 ? 60 : LightMode.MaxFps);
-            quality = Math.Min(quality, LightMode.MaxQuality);
+            // O limite de qualidade do modo leve é para os blocos JPEG (pesados de decodificar). No H.264 o custo de
+            // decodificar não depende da qualidade: reduzi-la só pixelava a imagem.
+            if (!h264) quality = Math.Min(quality, LightMode.MaxQuality);
         }
-        return new StreamLimits(mw, mh, fps, quality, welcome.Light, h264);
+        bool udp = h264 && welcome.Transports?.Contains("udp1", StringComparer.OrdinalIgnoreCase) == true &&
+                   Environment.GetEnvironmentVariable("TRANSLOCAL_NO_UDP") != "1";
+        return new StreamLimits(mw, mh, fps, quality, welcome.Light, h264, udp);
     }
 }
 
@@ -74,7 +78,15 @@ internal sealed class SenderSession : IDisposable
     private readonly StreamLimits _limits;
     private Size _sendSize;
     private bool _cursorCaptured;
-    private readonly SemaphoreSlim _inflight = new(Proto.MaxFramesInFlight, Proto.MaxFramesInFlight);
+    private SemaphoreSlim _inflight = new(Proto.MaxFramesInFlight, Proto.MaxFramesInFlight);
+
+    // Vídeo por UDP (com paridade Reed-Solomon e AES-GCM); o TCP fica para controle, som e confirmações.
+    private UdpVideoSender? _udp;
+    private volatile bool _udpWasActive;
+    private int _lastAckedId;
+    private double _lossRate;
+    private int _framesLostWindow, _framesRecoveredWindow;
+    private volatile string _transportLabel = "TCP";
     private readonly CancellationTokenSource _cts = new();
     private volatile bool _keyRequested;
     private volatile string _codecLabel = "JPEG por blocos";
@@ -110,7 +122,7 @@ internal sealed class SenderSession : IDisposable
 
     // Taxa de bits adaptativa (H.264): cai rápido quando a rede engasga e sobe devagar quando volta.
     private volatile int _targetBitrate;
-    private int _maxBitrate, _goodSeconds;
+    private int _maxBitrate, _goodSeconds, _badSeconds;
     private readonly Queue<double> _latHistory = new();
     private IDisposable? _wifi;
 
@@ -287,6 +299,22 @@ internal sealed class SenderSession : IDisposable
         }
 
         _wifi = Realtime.WifiLowLatency();
+        if (_limits.Udp && _conn.RemoteAddress is { } peer)
+        {
+            try
+            {
+                _udp = new UdpVideoSender(peer);
+                _udp.PeerReady += ep => Log.Info($"Vídeo por UDP com correção de erros: {ReceiverName} recebe em {ep} (paridade {_udp.Fec:P0})");
+                _conn.SendJson(MsgType.UdpSetup, new UdpSetupMessage { Port = _udp.Port, Key = Convert.ToBase64String(_udp.Key), Session = _udp.Session });
+                _transportLabel = "TCP (aguardando UDP)";
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("UDP indisponível; vídeo segue pelo TCP", ex);
+                _udp?.Dispose();
+                _udp = null;
+            }
+        }
         new Thread(VideoLoop) { IsBackground = true, Name = "TransLocal vídeo", Priority = ThreadPriority.Highest }.Start();
         new Thread(ReadLoop) { IsBackground = true, Name = "TransLocal leitura", Priority = ThreadPriority.AboveNormal }.Start();
 
@@ -404,11 +432,28 @@ internal sealed class SenderSession : IDisposable
                     }
                 }
 
-                if (!_inflight.Wait(0))
+                bool viaUdp = _udp?.Active == true;
+                var inflight = _inflight;
+                bool acquired = false;
+                if (viaUdp)
                 {
-                    // O receptor ainda não mostrou os quadros anteriores: a rede ou ele estão atrasados.
-                    Interlocked.Increment(ref _statBlocked);
-                    if (!_inflight.Wait(500, ct)) continue;
+                    // Por UDP nada fica preso na fila: só segura se o receptor estiver muitos quadros atrás.
+                    if (Volatile.Read(ref _frameId) - Volatile.Read(ref _lastAckedId) > 8)
+                    {
+                        Interlocked.Increment(ref _statBlocked);
+                        Thread.Sleep(2);
+                        continue;
+                    }
+                }
+                else
+                {
+                    if (!inflight.Wait(0))
+                    {
+                        // O receptor ainda não mostrou os quadros anteriores: a rede ou ele estão atrasados.
+                        Interlocked.Increment(ref _statBlocked);
+                        if (!inflight.Wait(500, ct)) continue;
+                    }
+                    acquired = true;
                 }
 
                 // Taxa de bits adaptativa decidida em Tick(): aplicada aqui, na thread do codificador.
@@ -508,7 +553,7 @@ internal sealed class SenderSession : IDisposable
                 }
                 finally
                 {
-                    if (!sent) _inflight.Release();
+                    if (acquired && !sent) try { inflight.Release(); } catch (SemaphoreFullException) { }
                 }
 
                 if (capturer?.WaitsForFrames == true) continue; // o ritmo vem da própria tela
@@ -552,13 +597,22 @@ internal sealed class SenderSession : IDisposable
                 {
                     case MsgType.FrameAck:
                         try { _inflight.Release(); } catch (SemaphoreFullException) { }
-                        if (m.Length >= 4) FrameShown(BinaryPrimitives.ReadInt32LittleEndian(m.Span));
+                        if (m.Length >= 4)
+                        {
+                            int acked = BinaryPrimitives.ReadInt32LittleEndian(m.Span);
+                            int prev;
+                            while ((prev = Volatile.Read(ref _lastAckedId)) < acked && Interlocked.CompareExchange(ref _lastAckedId, acked, prev) != prev) { }
+                            FrameShown(acked);
+                        }
                         break;
                     case MsgType.Input:
                         if (_opt.AllowControl) ApplyInput(m.Span);
                         break;
                     case MsgType.Diag:
                         _diag?.Received(m.Span);
+                        break;
+                    case MsgType.NetReport when m.Length >= 16:
+                        OnNetReport(m.Span);
                         break;
                     case MsgType.KeyframeRequest:
                         _keyRequested = true;
@@ -618,6 +672,15 @@ internal sealed class SenderSession : IDisposable
         string rtt = double.IsNaN(_rttMs) ? "–" : $"{_rttMs:0.#} ms";
         string size = _sendSize.IsEmpty ? "" : $"{_sendSize.Width}×{_sendSize.Height}{(_limits.Light ? " (leve)" : "")} • ";
         int blocked = Interlocked.Exchange(ref _statBlocked, 0);
+        if (_udpWasActive && _udp is { Active: false })
+        {
+            // O receptor parou de se apresentar por UDP (rede mudou, firewall): volta ao TCP com quadro-chave.
+            _udpWasActive = false;
+            _transportLabel = "TCP (UDP interrompido)";
+            _inflight = new SemaphoreSlim(Proto.MaxFramesInFlight, Proto.MaxFramesInFlight);
+            _keyRequested = true;
+            Log.Warn("UDP: o receptor parou de responder; vídeo voltou ao TCP");
+        }
         double latAvg = double.NaN, latMax = double.NaN;
         lock (_latGate)
         {
@@ -636,9 +699,10 @@ internal sealed class SenderSession : IDisposable
         string rate = _targetBitrate > 0 && _limits.H264 && _maxBitrate > 0
             ? $" • alvo {_targetBitrate / 1e6:0.0} Mbit/s{(_targetBitrate < _maxBitrate ? " (rede limitada)" : "")}"
             : "";
-        StatsUpdated?.Invoke($"{size}{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s{rate} • {_codecLabel} • codificação {encMs:0} ms • " +
+        string transport = _udpWasActive ? $"UDP (perda {_lossRate:P1}, paridade {_udp?.Fec ?? 0:P0})" : _transportLabel;
+        StatsUpdated?.Invoke($"{size}{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s{rate} • {_codecLabel} • {transport} • codificação {encMs:0} ms • " +
                              $"atraso da imagem {lat} • ida e volta {rtt}");
-        try { _conn.Send(MsgType.Stats, System.Text.Encoding.UTF8.GetBytes($"atraso da imagem {lat} • ida e volta {rtt} • enviado {mbps:0.0} Mbit/s{rate}")); }
+        try { _conn.Send(MsgType.Stats, System.Text.Encoding.UTF8.GetBytes($"atraso da imagem {lat} • ida e volta {rtt} • enviado {mbps:0.0} Mbit/s{rate} • {transport}")); }
         catch { }
 
         try { CheckCompatibility(frames / secs, mbps, rtt); }
@@ -704,6 +768,29 @@ internal sealed class SenderSession : IDisposable
         }
     }
 
+    /// <summary>Relatório do receptor (UDP): perda de pacotes antes da correção e quadros perdidos/recuperados.</summary>
+    private void OnNetReport(ReadOnlySpan<byte> r)
+    {
+        long packets = BinaryPrimitives.ReadUInt32LittleEndian(r);
+        long lost = BinaryPrimitives.ReadUInt32LittleEndian(r[4..]);
+        int framesLost = (int)BinaryPrimitives.ReadUInt32LittleEndian(r[8..]);
+        int recovered = (int)BinaryPrimitives.ReadUInt32LittleEndian(r[12..]);
+        double rate = packets + lost > 0 ? lost / (double)(packets + lost) : 0;
+        _lossRate = rate;
+        Interlocked.Add(ref _framesLostWindow, framesLost);
+        Interlocked.Add(ref _framesRecoveredWindow, recovered);
+        if (_udp is { } udp)
+        {
+            // Paridade proporcional à perda medida: 10% com a rede limpa, até 50% num Wi-Fi ruim.
+            double fec = Math.Clamp(0.10 + rate * 4, 0.10, 0.50);
+            if (Math.Abs(fec - udp.Fec) >= 0.05)
+            {
+                Log.Info($"UDP: perda de {rate:P1} → paridade {fec:P0} (quadros recuperados {recovered}, perdidos {framesLost})");
+                udp.Fec = fec;
+            }
+        }
+    }
+
     /// <summary>
     /// Controle de taxa de bits como nos serviços de jogos na nuvem: se o atraso sobe acima do normal desta ligação
     /// (fila se formando no Wi-Fi) ou o receptor deixa quadros esperando, reduz 30% na hora; com a rede folgada por
@@ -717,17 +804,24 @@ internal sealed class SenderSession : IDisposable
         while (_latHistory.Count > 10) _latHistory.Dequeue();
         double baseline = _latHistory.Min();
         double frameMs = 1000.0 / Math.Max(1, _limits.Fps);
-        // Quadros esperando só contam junto com atraso subindo (numa ligação longa, como pela internet, esperar é normal).
-        bool congested = latAvg > baseline + Math.Max(15, frameMs * 1.5) ||
-                         (blocked > Math.Max(3, fps * 0.15) && latAvg > baseline + frameMs / 2);
-        int min = Math.Max(1_000_000, _maxBitrate / 4);
+        // Só reage a sinais claros de rede saturada: quadros perdidos por UDP / perda alta, ou atraso bem acima do
+        // normal por 2 s seguidos. Variações pequenas de atraso (decodificação, Wi-Fi) não derrubam mais a qualidade.
+        int framesLost = Interlocked.Exchange(ref _framesLostWindow, 0);
+        Interlocked.Exchange(ref _framesRecoveredWindow, 0);
+        bool udpBad = _udpWasActive && (framesLost > 0 || _lossRate > 0.08);
+        bool latencyBad = latAvg > baseline + Math.Max(40, frameMs * 3);
+        _badSeconds = latencyBad ? _badSeconds + 1 : 0;
+        bool congested = udpBad || _badSeconds >= 2;
+        // Piso alto: abaixo da metade da taxa escolhida a imagem pixela — melhor perder alguns quadros.
+        int min = Math.Max(3_000_000, _maxBitrate / 2);
         int target = _targetBitrate;
         if (congested)
         {
             _goodSeconds = 0;
-            target = Math.Max(min, (int)(target * 0.7));
+            target = Math.Max(min, (int)(target * 0.85));
+            _badSeconds = 0;
         }
-        else if (++_goodSeconds >= 3 && target < _maxBitrate)
+        else if (++_goodSeconds >= 2 && target < _maxBitrate)
         {
             target = Math.Min(_maxBitrate, (int)(target * 1.1));
         }
@@ -776,6 +870,18 @@ internal sealed class SenderSession : IDisposable
         var msg = new byte[9 + data.Length];
         int id = Interlocked.Increment(ref _frameId);
         if (captureTs != 0) RememberCapture(id, captureTs);
+        if (_udp is { Active: true } udp)
+        {
+            if (!_udpWasActive)
+            {
+                _udpWasActive = true;
+                _transportLabel = "UDP + correção de erros";
+            }
+            udp.SendFrame(id, key, _sendSize.Width, _sendSize.Height, data);
+            Interlocked.Add(ref _conn.BytesSent, data.Length); // estatística de taxa
+            Interlocked.Increment(ref _statFrames);
+            return true;
+        }
         BinaryPrimitives.WriteInt32LittleEndian(msg, id);
         BinaryPrimitives.WriteUInt16LittleEndian(msg.AsSpan(4), (ushort)_sendSize.Width);
         BinaryPrimitives.WriteUInt16LittleEndian(msg.AsSpan(6), (ushort)_sendSize.Height);
@@ -812,6 +918,7 @@ internal sealed class SenderSession : IDisposable
         ElevatedInputBridge.Current?.TrySendInput(InputCodec.EncodeReleaseAll());
         _gamepads?.Dispose();
         _wifi?.Dispose();
+        _udp?.Dispose();
         Log.Info($"Transmissão encerrada: {reason ?? "parada pelo usuário"}");
         _diag?.Dispose();
         try { Ended?.Invoke(this, reason); } catch (Exception ex) { Log.Error("Erro no evento de fim", ex); }
