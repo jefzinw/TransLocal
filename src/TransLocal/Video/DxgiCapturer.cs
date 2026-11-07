@@ -65,11 +65,22 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
     private bool _legacyLogged;
     private string _api = "";
 
+    // Tela segura do Windows (UAC, Ctrl+Alt+Del): o DXGI devolve "acesso negado" para programas comuns.
+    private bool _accessDenied;
+    private bool _secureActive;
+    private Input.SecureFrameBuffer? _secure;
+
     public override string Method => "DXGI";
+
+    /// <summary>
+    /// A tela segura do Windows está à frente e não há agente SYSTEM para capturá-la: a imagem fica parada.
+    /// </summary>
+    public bool SecureDesktop => _dup is null && _accessDenied && !_secureActive;
 
     /// <summary>Estado para diagnóstico: API, formato, ou o que está usando enquanto o DXGI não volta.</summary>
     public string State => _dup is not null
         ? $"DXGI {_api}{(_lastFormat == Format.Unknown ? "" : " " + _lastFormat)}"
+        : _accessDenied ? (_secureActive ? "tela segura do Windows (UAC) pelo agente SYSTEM" : $"tela segura do Windows (UAC), acesso negado ({_failures} falhas), última imagem")
         : _gdiActive ? $"DXGI perdido ({_failures} falhas), usando GDI"
         : Blocked ? $"DXGI perdido ({_failures} falhas), bloqueada (só preto)"
         : $"DXGI perdido ({_failures} falhas), última imagem";
@@ -89,11 +100,39 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         {
             Open();
         }
+        catch (Exception ex) when (IsAccessDenied(ex))
+        {
+            // Começou com a tela segura à frente (ex.: confirmação do UAC do jogo): espera ela sair.
+            ReleaseDevice();
+            _accessDenied = true;
+            _failures = 1;
+            _nextRetry = Environment.TickCount64 + 1000;
+            Log.Info("Captura DXGI: acesso negado ao iniciar (tela segura do Windows?); tentando de novo");
+        }
         catch
         {
             Dispose();
             throw;
         }
+    }
+
+    private static bool IsAccessDenied(Exception ex) => ex.HResult == unchecked((int)0x80070005);
+
+    /// <summary>Quadro da tela segura pelo agente SYSTEM do serviço (se estiver ligado).</summary>
+    private bool TrySecureFrame()
+    {
+        var bridge = Input.ElevatedInputBridge.Current;
+        if (bridge is null || !bridge.IsConnected || !bridge.IsSystemAgent) return false;
+        _secure ??= new Input.SecureFrameBuffer(Width, Height);
+        bridge.RequestSecureFrames(_secure.Name, Bounds);
+        if (_secure.TryRead(_cleanPtr, out _))
+        {
+            if (!_secureActive) Log.Info("Transmitindo a tela segura do Windows (UAC) pelo agente SYSTEM do serviço");
+            _secureActive = true;
+            _hasFrame = true;
+            _cleanChanged = true;
+        }
+        return _secureActive;
     }
 
     private void Open()
@@ -223,13 +262,16 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
                 {
                     _dup?.Dispose();
                     _dup = null;
+                    if (IsAccessDenied(ex)) _accessDenied = true;
                     RegisterFailure($"recriação falhou: {ex.GetType().Name}: {ex.Message}");
                 }
             }
             if (_dup is null)
             {
                 // Enquanto o DXGI não volta (jogo em tela cheia), tenta a captura GDI para a imagem não congelar.
-                if (_quickLosses >= 2 || _failures >= 4) GdiFallback();
+                // Tela segura: o GDI daria preto; a imagem vem do agente SYSTEM (ou fica a última).
+                if (_accessDenied) TrySecureFrame();
+                else if (_quickLosses >= 2 || _failures >= 4) GdiFallback();
                 changed = TakeCleanChanged();
                 return _hasFrame;
             }
@@ -268,6 +310,8 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
                     _quickLosses = 0;
                     _gdiActive = false;
                     _gdiBlackLogged = false;
+                    _accessDenied = false;
+                    _secureActive = false;
                     Blocked = false;
                 }
             }
@@ -284,6 +328,8 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
             _dup = null;
             bool quick = Environment.TickCount64 - _openedAt < 2000;
             _quickLosses = quick ? _quickLosses + 1 : 0;
+            _accessDenied = false; // perda comum; a próxima recriação diz se é a tela segura
+            _secureActive = false;
             RegisterFailure($"interrompida (0x{hr.Code:X8}{(quick ? ", logo após recriar" : "")})");
         }
         changed = TakeCleanChanged();
@@ -443,7 +489,12 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         Buffer.MemoryCopy(_cleanPtr, (void*)Bits, bytes, bytes);
     }
 
-    protected override void DisposeCore() => ReleaseDevice();
+    protected override void DisposeCore()
+    {
+        ReleaseDevice();
+        _secure?.Dispose();
+        _secure = null;
+    }
 }
 
 /// <summary>Meio-float linear (scRGB, área de trabalho HDR) → 8 bits sRGB, por tabela (65 536 entradas).</summary>

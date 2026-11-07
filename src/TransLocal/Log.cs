@@ -21,12 +21,15 @@ internal static class Log
     /// </summary>
     public static event Action<string, string>? Written;
 
-    public static void Init(string fileName = "TransLocal.log")
+    public static void Init(string fileName = "TransLocal.log") => InitAt(DataDirectory, fileName);
+
+    /// <summary>Registro em outra pasta (o serviço e o agente SYSTEM usam ProgramData, legível pelo usuário).</summary>
+    public static void InitAt(string directory, string fileName)
     {
         try
         {
-            Directory.CreateDirectory(DataDirectory);
-            _path = Path.Combine(DataDirectory, fileName);
+            Directory.CreateDirectory(directory);
+            _path = Path.Combine(directory, fileName);
             var fi = new FileInfo(_path);
             if (fi.Exists && fi.Length > 2 * 1024 * 1024)
             {

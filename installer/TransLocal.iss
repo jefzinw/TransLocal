@@ -61,9 +61,13 @@ Filename: "{app}\{#AppExe}"; Parameters: "--set-autostart on"; Flags: runasorigi
 Filename: "{app}\{#AppExe}"; Parameters: "--set-autostart off"; Flags: runasoriginaluser runhidden waituntilterminated; Tasks: not autostart
 Filename: "{app}\{#AppExe}"; Description: "Abrir o TransLocal agora"; Flags: nowait postinstall skipifsilent runasoriginaluser
 ; Atualização automática (instalador silencioso com /RELAUNCH=1): reabre o TransLocal ao terminar.
+; Serviço do TransLocal (se o usuário ativou): volta a rodar com os arquivos novos.
+Filename: "{sys}\sc.exe"; Parameters: "start TransLocalService"; Flags: runhidden; Check: ServiceExists
 Filename: "{app}\{#AppExe}"; Parameters: "--updated --minimized"; Flags: nowait runasoriginaluser; Check: ShouldRelaunch
 
 [UninstallRun]
+Filename: "{sys}\sc.exe"; Parameters: "stop TransLocalService"; Flags: runhidden; RunOnceId: "PararServico"
+Filename: "{sys}\sc.exe"; Parameters: "delete TransLocalService"; Flags: runhidden; RunOnceId: "RemoverServico"
 Filename: "{app}\{#AppExe}"; Parameters: "--cleanup"; Flags: runhidden; RunOnceId: "RemoverInicio"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; RunOnceId: "RemoverFirewall"
 ; Tarefa do controle de programas de administrador (se o usuário ativou). O auxiliar é fechado junto com o app.
@@ -80,11 +84,22 @@ begin
     Result := MS >= ((1 shl 16) or 2);
 end;
 
+function ServiceExists(): Boolean;
+begin
+  Result := RegKeyExists(HKLM, 'SYSTEM\CurrentControlSet\Services\TransLocalService');
+end;
+
 procedure CloseRunningApp();
 var
   ResultCode: Integer;
   Exe: String;
 begin
+  { O serviço mantém o agente aberto: para antes de fechar os processos e trocar os arquivos. }
+  if ServiceExists() then
+  begin
+    Exec(ExpandConstant('{sys}\sc.exe'), 'stop TransLocalService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(2000);
+  end;
   Exe := ExpandConstant('{app}\{#AppExe}');
   if FileExists(Exe) and SupportsQuit(Exe) then
   begin

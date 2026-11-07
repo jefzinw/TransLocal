@@ -90,7 +90,27 @@ internal sealed class TrayApp : ApplicationContext
         Log.Info($"Identidade deste aparelho: {Identity.ShortId}");
 
         Streaming.DiagRelay.ShareEnabled = Settings.ShareDiagnostics;
-        if (Settings.ElevatedControl) EnableElevatedBridge();
+        if (Settings.ElevatedControl || Input.ServiceSetup.IsInstalled()) EnableElevatedBridge();
+        if (Settings.ElevatedControl && !Input.ServiceSetup.IsInstalled() && Input.ElevatedInput.TrustedLocation)
+        {
+            // Ativado na 1.4.x (tarefa agendada, sem alcançar o UAC): oferece o serviço uma vez ao abrir.
+            var offer = new System.Windows.Forms.Timer { Interval = 6000 };
+            offer.Tick += (_, _) =>
+            {
+                offer.Dispose();
+                Balloon("Atualize o controle de administrador",
+                    "Agora o TransLocal também alcança as confirmações do Windows (UAC), como o Parsec. " +
+                    "Clique aqui para instalar o serviço (o Windows pede confirmação).",
+                    ToolTipIcon.Info, async () =>
+                    {
+                        var (ok, message) = await SetElevatedControlAsync(true);
+                        Balloon(ok ? "Serviço do TransLocal instalado" : "Não foi possível instalar",
+                            ok ? "Programas de administrador e confirmações do Windows agora podem ser controlados." : message ?? "",
+                            ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+                    });
+            };
+            offer.Start();
+        }
 
         Audio.AudioOutput.Initialize(Settings.ReceiverAudioDevice);
         Audio.AudioOutput.PreferredChanged += id =>
@@ -298,9 +318,10 @@ internal sealed class TrayApp : ApplicationContext
     /// <summary>Aviso no PC: um programa de administrador está bloqueando o controle; clicar ativa a opção.</summary>
     private void OfferElevatedControl(string program)
     {
-        if (Settings.ElevatedControl || !Input.ElevatedInput.TrustedLocation) return;
-        Balloon($"{program} está rodando como administrador",
-            "O outro computador não consegue usar mouse e teclado nele. Clique aqui para ativar “Controlar programas abertos como administrador” (o Windows pede confirmação).",
+        if (Input.ServiceSetup.IsInstalled() || !Input.ElevatedInput.TrustedLocation) return;
+        Balloon($"{program} bloqueia o controle remoto",
+            "O outro computador não consegue ver ou usar isso. Clique aqui para instalar o serviço do TransLocal " +
+            "(programas de administrador e confirmações do Windows, como o Parsec). O Windows pede confirmação.",
             ToolTipIcon.Warning,
             async () =>
             {
@@ -855,10 +876,9 @@ internal sealed class TrayApp : ApplicationContext
             if (!Input.ElevatedInput.TrustedLocation)
                 return (false, "Esta opção só funciona no TransLocal instalado (pelo instalador, em Arquivos de Programas). " +
                                "Assim nenhum outro programa consegue trocar o executável que roda como administrador.");
-            string sid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value ?? "";
             var (ok, error) = await Task.Run(() =>
             {
-                bool r = Input.ElevatedInput.RunElevated($"--register-elevated-input {sid}", out var e);
+                bool r = Input.ElevatedInput.RunElevated("--install-service", out var e);
                 return (r, e);
             });
             if (!ok) return (false, $"Não foi possível ativar: {error}.");
@@ -877,7 +897,7 @@ internal sealed class TrayApp : ApplicationContext
             Changed();
             // Remove a tarefa para nada ficar rodando como administrador; se o UAC for recusado,
             // o auxiliar só volta no próximo logon e fica esperando sem fazer nada.
-            await Task.Run(() => Input.ElevatedInput.RunElevated("--unregister-elevated-input", out _));
+            await Task.Run(() => Input.ElevatedInput.RunElevated("--uninstall-service", out _));
             Log.Info("Controle de programas de administrador desativado");
             return (true, null);
         }

@@ -241,6 +241,9 @@ internal static class DevTools
         Check(DiagFiles.Sanitize("de 192.168.1.43 em " + Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)) == "de x.x.x.x em %USERPROFILE%",
             "relatório para o GitHub remove IP e pasta do usuário");
         Check(ConversionSelfTest(out var convDetail), "conversão de quadros 10 bits / HDR / RGBA para a transmissão" + convDetail);
+        Check(SecureFrameSelfTest(out var sfDetail), "quadro da tela segura pela memória compartilhada (escrita do agente, leitura do TransLocal)" + sfDetail);
+        string desk = Input.DesktopFollower.InputDesktopName();
+        Check(desk.Equals("Default", StringComparison.OrdinalIgnoreCase), $"área de trabalho de entrada identificada (“{desk}”)");
 
         var senderEnded = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         sender.Ended += (_, reason) => senderEnded.TrySetResult(reason);
@@ -390,6 +393,33 @@ internal static class DevTools
         Input.ControllerService.Shutdown();
         Log.Info(failures == 0 ? "SELFTEST concluído: tudo certo" : $"SELFTEST concluído com {failures} falha(s)");
         return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Escreve um quadro como o agente faria e lê do lado do TransLocal; nomes que não são do TransLocal são recusados.
+    /// </summary>
+    private static unsafe bool SecureFrameSelfTest(out string detail)
+    {
+        detail = "";
+        const int w = 64, h = 32;
+        using var reader = new Input.SecureFrameBuffer(w, h);
+        if (Input.SecureFrameBuffer.OpenForWriting(@"Local\OutroPrograma.Quadro") is not null) { detail = " — aceitou nome estranho"; return false; }
+        using var writer = Input.SecureFrameBuffer.OpenForWriting(reader.Name);
+        if (writer is null) { detail = " — agente não abriu a área"; return false; }
+        var src = new uint[w * h];
+        for (int i = 0; i < src.Length; i++) src[i] = 0xFF000000u | (uint)i;
+        var dst = new uint[w * h];
+        fixed (uint* s = src, d = dst)
+        {
+            if (reader.TryRead((byte*)d, out _)) { detail = " — leu quadro antes de existir"; return false; }
+            writer.Write((IntPtr)s, w, h, secureDesktop: true);
+            if (!reader.TryRead((byte*)d, out bool secure) || !secure) { detail = " — quadro não lido"; return false; }
+            if (reader.TryRead((byte*)d, out _)) { detail = " — leu o mesmo quadro duas vezes"; return false; }
+            writer.Write((IntPtr)s, w + 1, h, secureDesktop: true);
+            if (reader.TryRead((byte*)d, out _)) { detail = " — aceitou tamanho errado"; return false; }
+        }
+        for (int i = 0; i < src.Length; i++) if (src[i] != dst[i]) { detail = $" — pixel {i} diferente"; return false; }
+        return true;
     }
 
     /// <summary>

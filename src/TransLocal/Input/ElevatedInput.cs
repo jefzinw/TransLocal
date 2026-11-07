@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using TransLocal.Streaming;
 
@@ -23,9 +24,9 @@ namespace TransLocal.Input;
 internal static class ElevatedInput
 {
     public const string TaskName = "TransLocal Controle Elevado";
-    public const byte KindInput = 1, KindMonitor = 2, KindPing = 3, KindQuit = 4;
+    public const byte KindInput = 1, KindMonitor = 2, KindPing = 3, KindQuit = 4, KindCaptureRequest = 5;
 
-    public static string PipeName => $"TransLocal.ElevatedInput.{CurrentSession}";
+    public static string PipeName => $"TransLocal.ElevatedInput.{CurrentSession}{(UnelevatedTest ? ".teste" : "")}";
 
     private static int CurrentSession
     {
@@ -186,6 +187,9 @@ internal static class ElevatedInput
         }
     }
 
+    /// <summary>Remove só a tarefa agendada antiga e fecha o auxiliar dela (ao instalar o serviço).</summary>
+    public static void RemoveTaskOnly() => Unregister();
+
     /// <summary>Executado elevado (--unregister-elevated-input): remove a tarefa e fecha o auxiliar.</summary>
     public static int Unregister()
     {
@@ -247,12 +251,18 @@ internal static class ElevatedInput
 
     // ---------------- Auxiliar elevado ----------------
 
-    /// <summary>--elevated-input: conecta ao TransLocal desta sessão e aplica os comandos de entrada.</summary>
-    public static int RunHelper()
+    /// <summary>
+    /// --elevated-input (auxiliar da tarefa, administrador) ou --system-agent SID (agente do serviço, SYSTEM):
+    /// conecta ao TransLocal desta sessão e aplica os comandos de entrada. O agente SYSTEM também segue a área de
+    /// trabalho segura do Windows (UAC) e, quando o TransLocal pede, captura essa tela para a transmissão.
+    /// </summary>
+    public static int RunHelper(string? agentUserSid = null)
     {
-        if (!ProcessInfo.CurrentIsElevated() && !UnelevatedTest)
+        bool systemAgent = agentUserSid is not null;
+        bool isSystem = WindowsIdentity.GetCurrent().IsSystem;
+        if (systemAgent ? !isSystem : (!ProcessInfo.CurrentIsElevated() && !UnelevatedTest))
         {
-            Log.Warn("Controle elevado: este processo não está elevado; encerrando");
+            Log.Warn(systemAgent ? "Agente: não está rodando como SYSTEM; encerrando" : "Controle elevado: este processo não está elevado; encerrando");
             return 2;
         }
         if (!TrustedLocation)
@@ -260,11 +270,14 @@ internal static class ElevatedInput
             Log.Warn($"Controle elevado: executável fora de Arquivos de Programas ({ExePath}); encerrando");
             return 3;
         }
-        using var mutex = new Mutex(true, @"Local\TransLocal.ElevatedInput", out bool first);
+        using var mutex = new Mutex(true, @"Local\TransLocal.ElevatedInput" + (UnelevatedTest ? ".teste" : ""), out bool first);
         if (!first) return 0;
 
-        Log.Info($"Controle elevado ativo (sessão {CurrentSession})");
+        string role = systemAgent ? "Agente SYSTEM" : "Controle elevado";
+        Log.Info($"{role} ativo (sessão {CurrentSession})");
         var injector = new InputInjector(Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1920, 1080));
+        using var follower = systemAgent ? new DesktopFollower() : null;
+        var capture = systemAgent ? new SecureDesktopCapture() : null;
         int session = CurrentSession;
         var buffer = new byte[256];
         while (true)
@@ -278,11 +291,11 @@ internal static class ElevatedInput
                 if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out uint serverPid) ||
                     ProcessInfo.SessionOf((int)serverPid) != session || !SameExecutable((int)serverPid))
                 {
-                    Log.Warn($"Controle elevado: pipe criado por outro programa (pid {serverPid}); ignorado");
+                    Log.Warn($"{role}: pipe criado por outro programa (pid {serverPid}); ignorado");
                     Thread.Sleep(5000);
                     continue;
                 }
-                Log.Info($"Controle elevado ligado ao TransLocal (pid {serverPid})");
+                Log.Info($"{role} ligado ao TransLocal (pid {serverPid})");
                 try
                 {
                     while (true)
@@ -294,15 +307,21 @@ internal static class ElevatedInput
                         switch (msg[0])
                         {
                             case KindInput when len > 1:
+                                // A entrada vai para a área de trabalho ativa: a normal ou a segura (UAC).
+                                if (follower is not null && follower.Follow(out bool changed) && changed)
+                                    Log.Info($"Agente: área de trabalho de entrada agora é “{follower.Current}”");
                                 injector.Apply(msg[1..]);
                                 break;
                             case KindMonitor when len >= 17:
-                                injector.SetMonitor(new Rectangle(
-                                    BitConverter.ToInt32(msg[1..]), BitConverter.ToInt32(msg[5..]),
-                                    BitConverter.ToInt32(msg[9..]), BitConverter.ToInt32(msg[13..])));
+                                injector.SetMonitor(ReadRect(msg[1..]));
+                                break;
+                            case KindCaptureRequest when len > 17 && capture is not null:
+                                capture.Request(System.Text.Encoding.UTF8.GetString(msg[17..]), ReadRect(msg[1..]));
                                 break;
                             case KindQuit:
                                 injector.ReleaseAll();
+                                // O agente do serviço é mantido pelo serviço; desligar a opção remove o serviço.
+                                if (systemAgent) break;
                                 Log.Info("Controle elevado encerrado a pedido do TransLocal");
                                 return 0;
                         }
@@ -312,16 +331,19 @@ internal static class ElevatedInput
                 {
                     injector.ReleaseAll();
                 }
-                Log.Info("Controle elevado: TransLocal desconectou; aguardando");
+                Log.Info($"{role}: TransLocal desconectou; aguardando");
             }
             catch (IOException) { Thread.Sleep(1000); }
             catch (Exception ex)
             {
-                Log.Warn("Controle elevado: erro", ex);
+                Log.Warn($"{role}: erro", ex);
                 Thread.Sleep(2000);
             }
         }
     }
+
+    private static Rectangle ReadRect(ReadOnlySpan<byte> b) =>
+        new(BitConverter.ToInt32(b), BitConverter.ToInt32(b[4..]), BitConverter.ToInt32(b[8..]), BitConverter.ToInt32(b[12..]));
 
     private static bool ReadExactly(Stream s, byte[] buf, int len)
     {
@@ -393,8 +415,13 @@ internal sealed class ElevatedInputBridge : IDisposable
             NamedPipeServerStream? pipe = null;
             try
             {
-                pipe = new NamedPipeServerStream(ElevatedInput.PipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly | PipeOptions.WriteThrough);
+                // Só o usuário atual e o sistema (agente do serviço); nada pela rede.
+                var security = new PipeSecurity();
+                security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User!, PipeAccessRights.FullControl, AccessControlType.Allow));
+                security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), PipeAccessRights.ReadWrite, AccessControlType.Allow));
+                security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.NetworkSid, null), PipeAccessRights.FullControl, AccessControlType.Deny));
+                pipe = NamedPipeServerStreamAcl.Create(ElevatedInput.PipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous | PipeOptions.WriteThrough, 0, 0, security);
 
                 // O auxiliar inicia no logon; se não veio (acabou de ser ativado, atualização), pede à tarefa.
                 var wait = pipe.WaitForConnectionAsync(ct);
@@ -406,7 +433,7 @@ internal sealed class ElevatedInputBridge : IDisposable
 
                 if (!ElevatedInput.GetNamedPipeClientProcessId(pipe.SafePipeHandle, out uint pid) ||
                     ProcessInfo.SessionOf((int)pid) != ProcessInfo.SessionOf(Environment.ProcessId) ||
-                    !ElevatedInput.SameExecutable((int)pid) || (!ProcessInfo.IsProcessElevated((int)pid) && !ElevatedInput.UnelevatedTest))
+                    !ElevatedInput.SameExecutable((int)pid) || (!ProcessInfo.IsPrivileged((int)pid) && !ElevatedInput.UnelevatedTest))
                 {
                     Log.Warn($"Controle elevado: conexão recusada (pid {pid} não é o auxiliar do TransLocal)");
                     pipe.Dispose();
@@ -416,7 +443,9 @@ internal sealed class ElevatedInputBridge : IDisposable
 
                 lock (_write) _pipe = pipe;
                 _connected = true;
-                Log.Info($"Controle elevado conectado (auxiliar pid {pid}): programas de administrador podem ser controlados");
+                IsSystemAgent = ProcessInfo.TokenInaccessible((int)pid);
+                Log.Info($"Controle elevado conectado ({(IsSystemAgent ? "agente SYSTEM do serviço" : "auxiliar")} pid {pid}): programas de administrador " +
+                         (IsSystemAgent ? "e confirmações do Windows (UAC) podem ser controlados" : "podem ser controlados"));
                 ConnectionChanged?.Invoke(true);
                 if (!_monitor.IsEmpty) SetMonitor(_monitor);
 
@@ -460,7 +489,34 @@ internal sealed class ElevatedInputBridge : IDisposable
         long now = Environment.TickCount64;
         if (now - _lastStartAttempt < 30_000) return;
         _lastStartAttempt = now;
-        if (ElevatedInput.TaskInstalled()) ElevatedInput.StartHelper();
+        // Com o serviço instalado, é ele quem mantém o agente; senão, a tarefa agendada (1.4.x).
+        if (!ServiceSetup.IsInstalled() && ElevatedInput.TaskInstalled()) ElevatedInput.StartHelper();
+    }
+
+    /// <summary>O lado conectado é o agente SYSTEM do serviço (alcança a tela segura do UAC).</summary>
+    public bool IsSystemAgent { get; private set; }
+
+    private long _lastCaptureRequest;
+
+    /// <summary>
+    /// Pede ao agente SYSTEM o quadro da área de trabalho segura (UAC), escrito na área compartilhada
+    /// <paramref name="mappingName"/>. Repetir enquanto precisar (a cada ~0,5 s); o agente para sozinho depois.
+    /// </summary>
+    public void RequestSecureFrames(string mappingName, Rectangle bounds)
+    {
+        if (!_connected || !IsSystemAgent) return;
+        long now = Environment.TickCount64;
+        if (now - _lastCaptureRequest < 500) return;
+        _lastCaptureRequest = now;
+        var name = System.Text.Encoding.UTF8.GetBytes(mappingName);
+        if (name.Length > 150) return;
+        Span<byte> b = stackalloc byte[16 + name.Length];
+        BitConverter.TryWriteBytes(b, bounds.X);
+        BitConverter.TryWriteBytes(b[4..], bounds.Y);
+        BitConverter.TryWriteBytes(b[8..], bounds.Width);
+        BitConverter.TryWriteBytes(b[12..], bounds.Height);
+        name.CopyTo(b[16..]);
+        Send(ElevatedInput.KindCaptureRequest, b);
     }
 
     /// <summary>Envia um comando de entrada ao auxiliar. False se ele não está ligado (use a injeção local).</summary>

@@ -13,6 +13,7 @@ O executável do TransLocal inclui os componentes abaixo, distribuídos sob as l
 | Nefarius.ViGEm.Client | 1.21.256 | MIT | https://github.com/ViGEm/ViGEm.NET |
 | SDL3 (Simple DirectMedia Layer) | 3.5 | zlib | https://github.com/libsdl-org/SDL |
 | QRCoder | 1.8.1 | MIT | https://github.com/Shane32/QRCoder |
+| System.ServiceProcess.ServiceController (serviço do Windows) | 10.0.14 | MIT | https://github.com/dotnet/runtime |
 | .NET para Android (app de celular) | 10.0 | MIT | https://github.com/dotnet/android |
 | ppy.SDL3-CS (ligações .NET da SDL3) | 2026.1002.1 | MIT | https://github.com/ppy/SDL3-CS |
 

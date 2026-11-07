@@ -96,6 +96,29 @@ internal static partial class ProcessInfo
         finally { CloseHandle(h); }
     }
 
+    /// <summary>
+    /// O processo roda acima do usuário comum: elevado (administrador) ou com um token que o usuário nem consegue
+    /// consultar (SYSTEM, como o agente do serviço).
+    /// </summary>
+    public static bool IsPrivileged(int pid) => IsProcessElevated(pid) || TokenInaccessible(pid);
+
+    /// <summary>Dá para abrir o processo, mas não o token dele (processo de outra conta, ex.: SYSTEM).</summary>
+    public static bool TokenInaccessible(int pid)
+    {
+        IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+        if (h == IntPtr.Zero) return false;
+        try
+        {
+            if (OpenProcessToken(h, TOKEN_QUERY, out var token))
+            {
+                CloseHandle(token);
+                return false;
+            }
+            return Marshal.GetLastWin32Error() == 5; // acesso negado
+        }
+        finally { CloseHandle(h); }
+    }
+
     public static bool CurrentIsElevated()
     {
         using var p = Process.GetCurrentProcess();

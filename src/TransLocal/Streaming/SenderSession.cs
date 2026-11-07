@@ -79,6 +79,8 @@ internal sealed class SenderSession : IDisposable
     private DiagRelay? _diag;
     private volatile string _captureState = "";
     private volatile bool _captureBlocked;
+    private volatile bool _captureSecure;
+    private bool _secureNoticeSent;
     private bool _blockedNoticeSent;
     private int _elevatedNoticePid;
     private long _lastSnapshotTick;
@@ -373,6 +375,7 @@ internal sealed class SenderSession : IDisposable
                     {
                         _captureState = dx.State;
                         _captureBlocked = dx.Blocked;
+                        _captureSecure = dx.SecureDesktop;
                     }
                     else _captureState = capturer.Method;
                     if (got && (capturer.LastCaptureChanged || needFrame))
@@ -521,7 +524,7 @@ internal sealed class SenderSession : IDisposable
             {
                 _elevatedNoticePid = fg.Pid;
                 string how = bridge is null
-                    ? "No PC, aba Transmitir, ative “Controlar programas abertos como administrador”."
+                    ? "No PC, aba Transmitir, ative “Controlar programas de administrador e confirmações do Windows”."
                     : "O controle de administrador está ativado, mas o auxiliar não respondeu; reinicie o TransLocal no PC.";
                 SendNotice($"{fg.Name} está aberto como administrador no PC: o Windows bloqueia mouse e teclado vindos de outros programas. {how}");
                 if (bridge is null) try { ElevatedBlocked?.Invoke(fg.Name); } catch { }
@@ -532,6 +535,17 @@ internal sealed class SenderSession : IDisposable
             _elevatedNoticePid = 0;
         }
 
+        // Confirmação do Windows (UAC) ou tela de bloqueio à frente, sem o serviço para capturá-la e respondê-la.
+        if (_captureSecure && !_secureNoticeSent)
+        {
+            _secureNoticeSent = true;
+            SendNotice("O PC está mostrando uma confirmação do Windows (UAC) ou a tela de bloqueio. Ela só pode ser vista e respondida daqui " +
+                       "com o serviço do TransLocal: no PC, aba Transmitir, ative “Controlar programas de administrador e confirmações do Windows”. " +
+                       "Até lá, responda no próprio PC.");
+            try { ElevatedBlocked?.Invoke("Uma confirmação do Windows (UAC)"); } catch { }
+        }
+        else if (!_captureSecure) _secureNoticeSent = false;
+
         if (_captureBlocked && !_blockedNoticeSent)
         {
             _blockedNoticeSent = true;
@@ -541,7 +555,8 @@ internal sealed class SenderSession : IDisposable
         else if (!_captureBlocked) _blockedNoticeSent = false;
 
         // Estado resumido: só quando muda (ou a cada 30 s), para o arquivo de diagnóstico ser leve.
-        string control = !_opt.AllowControl ? "desligado" : bridge is null ? "comum" : elevatedOk ? "comum + administrador" : "comum (auxiliar ausente)";
+        string control = !_opt.AllowControl ? "desligado" : bridge is null ? "comum"
+            : elevatedOk ? (bridge.IsSystemAgent ? "comum + administrador + UAC (serviço)" : "comum + administrador (tarefa)") : "comum (auxiliar ausente)";
         string snapshot = $"captura: {_captureState} • primeiro plano: {fg} • cursor {(_cursorCaptured ? "preso (relativo)" : "livre")} • controle: {control}";
         long now = Environment.TickCount64;
         if (snapshot != _lastSnapshot || now - _lastSnapshotTick > 30_000)

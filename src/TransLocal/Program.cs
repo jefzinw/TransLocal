@@ -56,7 +56,17 @@ internal static class Program
             return 0;
         }
 
-        // ---- Controle de programas de administrador ----
+        // ---- Serviço do TransLocal (programas de administrador e confirmações do UAC) ----
+        if (Has("--service")) return Input.TransLocalService.RunAsService();
+        if (Has("--system-agent"))
+        {
+            Log.InitAt(Input.TransLocalService.ServiceLogDirectory, "agente.log");
+            return Input.ElevatedInput.RunHelper(Arg("--system-agent") ?? "?");
+        }
+        if (Has("--install-service")) return Input.ServiceSetup.Install();
+        if (Has("--uninstall-service")) return Input.ServiceSetup.Uninstall();
+
+        // ---- Controle de programas de administrador (tarefa agendada, versões 1.4.x) ----
         if (Has("--elevated-input"))
         {
             // Auxiliar elevado: registro próprio (dois processos no mesmo arquivo se atrapalham).

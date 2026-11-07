@@ -505,7 +505,7 @@ internal sealed partial class MainForm : Form
         _chkAllowControl.CheckedChanged += (_, _) => SaveSetting(s => s.SenderAllowControl = _chkAllowControl.Checked);
         Add(t, _chkAllowControl);
 
-        SetupCheck(_chkElevated, "Controlar também programas abertos como administrador (Gerenciador de Tarefas, alguns jogos)");
+        SetupCheck(_chkElevated, "Controlar programas de administrador e confirmações do Windows (UAC)");
         _chkElevated.Margin = new Padding(20, 0, 0, 0);
         _chkElevated.CheckedChanged += async (_, _) =>
         {
@@ -1020,14 +1020,17 @@ internal sealed partial class MainForm : Form
     {
         if (_elevatedBusy) return;
         var bridge = Input.ElevatedInputBridge.Current;
+        bool service = Input.ServiceSetup.IsInstalled();
         _elevatedStatus.Text =
             !Input.ElevatedInput.TrustedLocation && !_app.Settings.ElevatedControl
-                ? "Disponível na versão instalada (instalador). O Windows pede permissão uma vez."
+                ? "Disponível na versão instalada (instalador). Instala o serviço do TransLocal; o Windows pede permissão uma vez."
             : !_app.Settings.ElevatedControl
-                ? "Desligado: o Windows bloqueia mouse e teclado vindos do outro computador em janelas de administrador."
-            : bridge?.IsConnected == true
-                ? "Ativo: o auxiliar de administrador está ligado."
-                : "Ativado — aguardando o auxiliar de administrador iniciar…";
+                ? "Desligado: Gerenciador de Tarefas, jogos “como administrador” e confirmações do UAC não recebem mouse/teclado do outro computador."
+            : !service
+                ? "Ativo pela versão anterior (sem as confirmações do UAC). Desmarque e marque de novo para instalar o serviço."
+            : bridge?.IsConnected == true && bridge.IsSystemAgent
+                ? "Ativo: serviço do TransLocal ligado (programas de administrador e confirmações do UAC)."
+                : "Serviço instalado — aguardando o agente iniciar…";
     }
 
     private void RefreshState()
