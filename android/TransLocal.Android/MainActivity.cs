@@ -10,19 +10,21 @@ using TransLocal.Streaming;
 
 namespace TransLocal.Mobile;
 
-[Activity(Label = "@string/app_name", MainLauncher = true, Theme = "@android:style/Theme.Material.Light.NoActionBar",
+[Activity(Label = "@string/app_name", MainLauncher = true, Theme = "@android:style/Theme.Material.NoActionBar",
     LaunchMode = global::Android.Content.PM.LaunchMode.SingleTop)]
 public class MainActivity : Activity
 {
-    private static readonly Color Accent = Color.Rgb(0, 103, 192);
-    private static readonly Color Muted = Color.Rgb(100, 100, 100);
-
     private PhoneStore _store = null!;
     private TextView _status = null!;
+    private View _statusDot = null!;
     private LinearLayout _pending = null!;
-    private TextView _code = null!;
+    private CodeRing _ring = null!;
     private TextView _codeInfo = null!;
-    private TextView _pcInfo = null!;
+    private TextView _pcName = null!;
+    private TextView _pcId = null!;
+    private TextView _pcAddress = null!;
+    private TextView _pcLink = null!;
+    private TextView _pendingCount = null!;
     private Handler _handler = null!;
     private bool _busy;
 
@@ -66,92 +68,125 @@ public class MainActivity : Activity
 
     // ------------------------------------------------------------------ interface
 
-    private int Dp(int v) => (int)(v * Resources!.DisplayMetrics!.Density);
+    private int Dp(int v) => Ui.Dp(this, v);
 
-    private TextView Text(string text, float sp, Color color, bool bold = false)
+    private LinearLayout Row(params View[] views)
     {
-        var t = new TextView(this) { Text = text };
-        t.SetTextSize(global::Android.Util.ComplexUnitType.Sp, sp);
-        t.SetTextColor(color);
-        if (bold) t.SetTypeface(Typeface.DefaultBold, TypefaceStyle.Bold);
-        t.SetPadding(0, Dp(6), 0, Dp(6));
-        return t;
+        var row = new LinearLayout(this) { Orientation = Orientation.Horizontal };
+        row.LayoutParameters = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) { TopMargin = Dp(12) };
+        for (int i = 0; i < views.Length; i++)
+            row.AddView(views[i], new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f) { LeftMargin = i == 0 ? 0 : Dp(8) });
+        return row;
     }
 
-    private Button Btn(string text, Action onClick, bool primary = false)
+    private static LinearLayout CardHeader(Activity a, string title, View? right = null)
     {
-        var b = new Button(this) { Text = text };
-        b.SetAllCaps(false);
-        if (primary)
-        {
-            b.SetBackgroundColor(Accent);
-            b.SetTextColor(Color.White);
-        }
-        b.Click += (_, _) => onClick();
-        var lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) { TopMargin = Dp(8) };
-        b.LayoutParameters = lp;
-        return b;
+        var row = new LinearLayout(a) { Orientation = Orientation.Horizontal };
+        row.SetGravity(GravityFlags.CenterVertical);
+        row.AddView(Ui.Label(a, title, 17, Ui.Text, bold: true), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
+        if (right is not null) row.AddView(right);
+        return row;
     }
 
     private void BuildUi()
     {
+        Window!.SetStatusBarColor(Ui.Background);
+        Window.SetNavigationBarColor(Ui.Background);
+
         var root = new LinearLayout(this) { Orientation = Orientation.Vertical };
-        root.SetPadding(Dp(20), Dp(28), Dp(20), Dp(28));
+        root.SetPadding(Dp(18), Dp(18), Dp(18), Dp(28));
+        root.SetBackgroundColor(Ui.Background);
 
-        root.AddView(Text("TransLocal", 26, Accent, bold: true));
-        _status = Text("", 15, Muted);
-        root.AddView(_status);
+        // Topo: logotipo + nome, selo de conexão à direita.
+        var top = new LinearLayout(this) { Orientation = Orientation.Horizontal };
+        top.SetGravity(GravityFlags.CenterVertical);
+        var logo = new FrameLayout(this) { Background = Ui.Oval(Color.Rgb(246, 246, 248)) };
+        var glyph = Ui.Label(this, "▭", 18, Color.Rgb(18, 18, 20), bold: true);
+        glyph.Gravity = GravityFlags.Center;
+        logo.AddView(glyph, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.MatchParent));
+        logo.AddView(new View(this) { Background = Ui.Oval(Ui.Accent) }, new FrameLayout.LayoutParams(Dp(10), Dp(10)) { Gravity = GravityFlags.Top | GravityFlags.End, TopMargin = Dp(2), RightMargin = Dp(2) });
+        top.AddView(logo, new LinearLayout.LayoutParams(Dp(40), Dp(40)) { RightMargin = Dp(10) });
+        top.AddView(Ui.Label(this, "TransLocal", 19, Ui.Text, bold: true), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
+        var chip = Ui.Chip(this, out _statusDot, out _status);
+        top.AddView(chip, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WrapContent, ViewGroup.LayoutParams.WrapContent));
+        root.AddView(top);
 
+        var title = Ui.Label(this, "Aprovações", 30, Ui.Text, light: true);
+        title.SetPadding(0, Dp(22), 0, 0);
+        root.AddView(title);
+        root.AddView(Ui.Label(this, "Autorize quem pede a tela do seu computador.", 14, Ui.Muted));
+
+        // Pedidos pendentes (aparecem em destaque laranja).
         _pending = new LinearLayout(this) { Orientation = Orientation.Vertical };
         root.AddView(_pending);
 
-        root.AddView(Text("Código de autorização", 15, Color.Black, bold: true));
-        _code = Text("— — —", 44, Accent, bold: true);
-        _code.Typeface = Typeface.Monospace;
-        _code.Gravity = GravityFlags.CenterHorizontal;
-        root.AddView(_code);
-        _codeInfo = Text("", 13, Muted);
-        _codeInfo.Gravity = GravityFlags.CenterHorizontal;
-        root.AddView(_codeInfo);
-        root.AddView(Text("Para entrar sem esperar a aprovação, digite este código no aparelho que pede acesso (ele muda a cada 30 s).", 13, Muted));
+        // Código de autorização no anel.
+        var codeCard = Ui.Card(this);
+        _codeInfo = Ui.Label(this, "", 12, Ui.Text, bold: true);
+        _codeInfo.Background = Ui.Rounded(this, Color.Rgb(30, 30, 34), 999, Ui.Border);
+        _codeInfo.SetPadding(Dp(12), Dp(6), Dp(12), Dp(6));
+        codeCard.AddView(CardHeader(this, "Código de autorização", _codeInfo));
+        _ring = new CodeRing(this);
+        codeCard.AddView(_ring, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) { TopMargin = Dp(14), BottomMargin = Dp(6) });
+        var codeHelp = Ui.Label(this, "Para entrar sem esperar a aprovação, digite este código no aparelho que pede acesso. Ele muda a cada 30 s.", 13, Ui.Muted);
+        codeHelp.Gravity = GravityFlags.CenterHorizontal;
+        codeCard.AddView(codeHelp);
+        root.AddView(codeCard);
 
-        root.AddView(Text("Computador", 15, Color.Black, bold: true));
-        _pcInfo = Text("", 14, Color.DarkGray);
-        root.AddView(_pcInfo);
-        root.AddView(Btn("Parear com um computador", StartPairing, primary: true));
-        root.AddView(Btn("Alterar endereço do computador (ex.: Tailscale)", ChangeAddress));
-        root.AddView(Btn("Permitir funcionar em segundo plano", AskBatteryExemption));
-        root.AddView(Btn("Esquecer este computador", ForgetPc));
+        // Computador pareado: blocos de informação.
+        var pcCard = Ui.Card(this);
+        _pendingCount = Ui.Label(this, "", 12, Ui.Text, bold: true);
+        _pendingCount.Background = Ui.Rounded(this, Color.Rgb(30, 30, 34), 999, Ui.Border);
+        _pendingCount.SetPadding(Dp(12), Dp(6), Dp(12), Dp(6));
+        pcCard.AddView(CardHeader(this, "Computador", _pendingCount));
+        _pcName = Ui.Label(this, "", 24, Ui.Text, light: true);
+        _pcName.SetPadding(0, Dp(8), 0, 0);
+        pcCard.AddView(_pcName);
+        pcCard.AddView(Row(Ui.Tile(this, "Conexão", out _pcLink, Ui.Accent), Ui.Tile(this, "ID", out _pcId, Ui.Good)));
+        var addrTile = Ui.Tile(this, "Endereço", out _pcAddress, Ui.Accent2);
+        addrTile.LayoutParameters = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) { TopMargin = Dp(8) };
+        pcCard.AddView(addrTile);
+        pcCard.AddView(Ui.Pill(this, "Parear com um computador", StartPairing, primary: true));
+        pcCard.AddView(Row(Ui.Pill(this, "Alterar endereço", ChangeAddress), Ui.Pill(this, "Esquecer", ForgetPc)));
+        pcCard.AddView(Ui.Pill(this, "Permitir funcionar em segundo plano", AskBatteryExemption));
+        root.AddView(pcCard);
 
-        root.AddView(Text(
-            "Como funciona: com o celular pareado, o PC envia para cá cada pedido de acesso remoto e você aprova ou nega. " +
+        var help = Ui.Card(this);
+        help.AddView(CardHeader(this, "Como funciona"));
+        var how = Ui.Label(this,
+            "Com o celular pareado, o PC envia para cá cada pedido de acesso remoto e você aprova ou nega. " +
             "Para funcionar fora de casa, instale o Tailscale no PC, no notebook e neste celular, com a mesma conta, " +
-            "e use o endereço 100.x.x.x do PC.", 13, Muted));
+            "e use o endereço 100.x.x.x do PC.", 13.5f, Ui.Muted);
+        how.SetPadding(0, Dp(6), 0, 0);
+        help.AddView(how);
+        root.AddView(help);
 
-        var scroll = new ScrollView(this);
+        var scroll = new ScrollView(this) { FillViewport = true };
+        scroll.SetBackgroundColor(Ui.Background);
         scroll.AddView(root);
         SetContentView(scroll);
     }
 
     private void Refresh()
     {
-        _status.Text = PhoneState.Status;
-        _status.SetTextColor(PhoneState.Connected ? Color.Rgb(16, 124, 16) : Muted);
+        _status.Text = PhoneState.Connected ? "Conectado" : "Desconectado";
+        _statusDot.Background = Ui.Oval(PhoneState.Connected ? Ui.Good : Ui.Muted);
 
         // Pedidos pendentes
         _pending.RemoveAllViews();
         foreach (var r in PhoneState.Pending)
         {
-            var card = new LinearLayout(this) { Orientation = Orientation.Vertical };
-            card.SetBackgroundColor(Color.Rgb(255, 244, 214));
-            card.SetPadding(Dp(14), Dp(10), Dp(14), Dp(10));
-            var lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) { TopMargin = Dp(8), BottomMargin = Dp(8) };
-            card.LayoutParameters = lp;
-            card.AddView(Text($"{r.DeviceName} quer acessar {_store.PcName}", 17, Color.Black, bold: true));
-            card.AddView(Text($"ID do aparelho: {r.DeviceId}. Permita só se foi você.", 13, Muted));
+            var card = Ui.Card(this, highlight: true);
+            var badge = Ui.Label(this, "Pedido de acesso", 12, Color.White, bold: true);
+            badge.Background = Ui.Gradient(this, 999, Ui.Accent, Ui.AccentLight);
+            badge.SetPadding(Dp(10), Dp(4), Dp(10), Dp(4));
+            card.AddView(badge, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WrapContent, ViewGroup.LayoutParams.WrapContent));
+            var who = Ui.Label(this, $"{r.DeviceName} quer acessar {_store.PcName}", 19, Ui.Text, bold: true);
+            who.SetPadding(0, Dp(10), 0, Dp(2));
+            card.AddView(who);
+            card.AddView(Ui.Label(this, $"ID do aparelho: {r.DeviceId}. Permita só se foi você.", 13, Ui.Muted));
             string id = r.Id;
-            card.AddView(Btn("Permitir", () => Respond(id, true), primary: true));
-            card.AddView(Btn("Negar", () => Respond(id, false)));
+            card.AddView(Row(Ui.Pill(this, "Negar", () => Respond(id, false)), Ui.Pill(this, "Permitir", () => Respond(id, true), primary: true)));
             _pending.AddView(card);
         }
 
@@ -161,23 +196,40 @@ public class MainActivity : Activity
             try
             {
                 string c = Totp.FromBase32(secret).Current();
-                _code.Text = $"{c[..3]} {c[3..]}";
-                _codeInfo.Text = $"muda em {Totp.SecondsLeft} s";
+                _ring.Code = $"{c[..3]} {c[3..]}";
+                int left = Totp.SecondsLeft;
+                _ring.Caption = $"muda em {left} s";
+                _ring.Fraction = left / 30f;
+                _codeInfo.Text = $"{left} s";
             }
             catch
             {
-                _code.Text = "— — —";
+                _ring.Code = "— — —";
             }
         }
         else
         {
-            _code.Text = "— — —";
-            _codeInfo.Text = "aparece depois de conectar ao computador pareado";
+            _ring.Code = "— — —";
+            _ring.Caption = "conecte ao computador pareado";
+            _ring.Fraction = 0;
+            _codeInfo.Text = "aguardando";
         }
+        _ring.Invalidate();
 
-        _pcInfo.Text = _store.HasPc
-            ? $"{_store.PcName} (ID {DeviceIdentity.FormatShortId(_store.PcFingerprint!)})\nEndereço: {_store.PcAddress}"
-            : "Nenhum computador pareado.";
+        int pending = PhoneState.Pending.Count;
+        _pendingCount.Text = pending == 0 ? "nenhum pedido" : $"{pending} pedido(s)";
+        if (_store.HasPc)
+        {
+            _pcName.Text = _store.PcName;
+            _pcId.Text = DeviceIdentity.FormatShortId(_store.PcFingerprint!);
+            _pcAddress.Text = _store.PcAddress ?? "—";
+            _pcLink.Text = PhoneState.Connected ? "Ativa" : "Sem sinal";
+        }
+        else
+        {
+            _pcName.Text = "Nenhum computador pareado";
+            _pcId.Text = _pcAddress.Text = _pcLink.Text = "—";
+        }
     }
 
     private void Respond(string id, bool approve)
@@ -216,7 +268,7 @@ public class MainActivity : Activity
 
         var labels = found.Select(f => $"{f.Name}  (ID {f.Id})\n{f.Address}").ToList();
         labels.Add("Digitar o endereço…");
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, global::Android.Resource.Style.ThemeMaterialDialogAlert)
             .SetTitle(found.Count == 0 ? "Nenhum computador encontrado na rede" : "Escolha o computador")!
             .SetItems(labels.ToArray(), (_, e) =>
             {
@@ -232,7 +284,7 @@ public class MainActivity : Activity
         var input = new EditText(this) { Hint = hint, Text = _store.PcAddress ?? "" };
         input.SetSingleLine(true);
         input.InputType = global::Android.Text.InputTypes.ClassText | global::Android.Text.InputTypes.TextVariationUri;
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, global::Android.Resource.Style.ThemeMaterialDialogAlert)
             .SetTitle(title)!
             .SetView(input)!
             .SetPositiveButton("OK", (_, _) =>
@@ -297,7 +349,7 @@ public class MainActivity : Activity
             {
                 string why = ex is AggregateException ae ? ae.InnerException?.Message ?? ex.Message : ex.Message;
                 Log.Warn("Pareamento falhou", ex);
-                RunOnUiThread(() => new AlertDialog.Builder(this).SetTitle("Não foi possível parear")!.SetMessage(why)!
+                RunOnUiThread(() => new AlertDialog.Builder(this, global::Android.Resource.Style.ThemeMaterialDialogAlert).SetTitle("Não foi possível parear")!.SetMessage(why)!
                     .SetPositiveButton("OK", (IDialogInterfaceOnClickListener?)null)!.Show());
             }
             finally
@@ -311,7 +363,7 @@ public class MainActivity : Activity
     private bool AskPairingCode(PairingPrompt p)
     {
         var tcs = new TaskCompletionSource<bool>();
-        RunOnUiThread(() => new AlertDialog.Builder(this)
+        RunOnUiThread(() => new AlertDialog.Builder(this, global::Android.Resource.Style.ThemeMaterialDialogAlert)
             .SetTitle($"Parear com {p.PeerName}?")!
             .SetMessage($"Código:\n\n{p.Code}\n\nConfira se o MESMO código aparece na tela do computador e confirme lá também. " +
                         "Se for diferente, cancele.")!
@@ -364,7 +416,7 @@ public class MainActivity : Activity
     private void ForgetPc()
     {
         if (!_store.HasPc) return;
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, global::Android.Resource.Style.ThemeMaterialDialogAlert)
             .SetTitle("Esquecer o computador?")!
             .SetMessage($"O celular deixará de receber os pedidos de acesso de {_store.PcName}. No PC, remova também o pareamento do celular.")!
             .SetPositiveButton("Esquecer", (_, _) =>

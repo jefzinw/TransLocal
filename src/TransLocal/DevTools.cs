@@ -1417,12 +1417,12 @@ internal static class DevTools
         }
         form.Dispose();
 
-        // Janela de exibição (em janela, com estatísticas), alimentada por uma captura real.
+        // Janela de exibição (em janela, com estatísticas), com uma imagem sintética (não fotografa a tela do usuário).
         var screen = Screen.PrimaryScreen ?? Screen.AllScreens[0];
         using var surface = new FrameSurface();
-        using (var cap = ScreenCapturer.Create(screen))
+        using (var cap = new SyntheticCapturer(new Rectangle(0, 0, 1366, 768)))
         {
-            cap.Capture(true);
+            cap.Capture(false);
             using var frame = new Bitmap(cap.Width, cap.Height, cap.Stride, System.Drawing.Imaging.PixelFormat.Format32bppRgb, cap.Bits);
             surface.EnsureSize(cap.Width, cap.Height);
             surface.CopyFromBitmap(frame, 0, 0);

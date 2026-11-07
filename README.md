@@ -66,6 +66,8 @@ Opções do transmissor: monitor a transmitir, **resolução enviada**, quadros 
 - **Qualidade (1.8):** ~10 Mbit/s para 1366×768 a 60 q/s e ~20 Mbit/s para 1080p60 na qualidade alta; o modo leve não reduz mais a qualidade do H.264 (só a dos blocos JPEG), e a taxa adaptativa nunca desce abaixo da metade da escolhida.
 - **Tudo pela placa de vídeo, nos dois lados (1.9):** no PC, a captura fica na placa, o cursor é desenhado nela, o processador de vídeo da placa reduz e converte a imagem e o codificador lê essa textura direto — nada passa pelo processador (antes, só reduzir 1920×1080 para 1366×768 levava ~11 ms por quadro e limitava a transmissão a ~36 q/s). No notebook, o H.264 é decodificado direto pela placa (D3D11VA, como no Moonlight) e vai para a tela sem cópia: ~1,5 ms por quadro, mesmo em placas simples como a Intel UHD 600. Medido: 59 q/s a 60 q/s, atraso da imagem de ~13 ms entre captura e tela (sem contar o Wi-Fi).
 - **Perfil High do H.264 (1.9):** quando o notebook decodifica pela placa, o PC usa o perfil High (CABAC + transformada 8×8): imagem mais nítida pela mesma taxa de bits.
+- **Qualidade de imagem (2.0):** taxa de bits pensada para jogos em rede de casa (como o Moonlight): 1366×768 a 30 q/s ~9 Mbit/s, a 60 q/s ~15 Mbit/s; 1080p60 até ~35 Mbit/s na qualidade máxima. A redução da imagem no PC e a exibição no notebook usam o modo de alta qualidade do processador de vídeo da placa.
+- **Visual novo (2.0):** tema escuro com cartões arredondados, navegação em pílulas, interruptores e destaques em laranja e roxo, no Windows e no app do celular (o código de autorização aparece num anel que esvazia até trocar).
 
 ### Controlar o outro computador (mouse, teclado e controles USB/Bluetooth)
 

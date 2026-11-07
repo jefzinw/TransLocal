@@ -18,73 +18,75 @@ internal sealed class ComboItem<T>
 
 internal sealed partial class MainForm : Form
 {
-    private static readonly Color Accent = Color.FromArgb(0, 103, 192);
-    private static readonly Color Muted = Color.FromArgb(96, 96, 96);
-    private static readonly Color Good = Color.FromArgb(16, 124, 16);
+    private static readonly Color Accent = Theme.AccentLight;
+    private static readonly Color Muted = Theme.Muted;
+    private static readonly Color Good = Theme.Good;
+    private static readonly Color Bad = Theme.Bad;
 
     private readonly TrayApp _app;
     private bool _loading;
     private bool _scanning;
     private bool _scannedOnce;
 
-    private readonly TabControl _tabs = new();
-    private readonly TabPage _tabReceive = new("Receber nesta tela");
-    private readonly TabPage _tabSend = new("Transmitir esta tela");
-    private readonly TabPage _tabHdmi = new("HDMI (placa de captura)");
-    private readonly TabPage _tabSettings = new("Configurações e ajuda");
+    private readonly PageHost _tabs = new();
+    private readonly PagePanel _tabReceive = new("Receber");
+    private readonly PagePanel _tabSend = new("Transmitir");
+    private readonly PagePanel _tabHdmi = new("HDMI");
+    private readonly PagePanel _tabSettings = new("Configurações");
+    private ModernHeader _header = null!;
 
     // Receber
     private readonly Label _recvStatus = new();
-    private readonly CheckBox _chkReceive = new();
+    private readonly CheckBox _chkReceive = new ToggleCheck();
     private readonly Label _addresses = new();
     private readonly ComboBox _cmbViewerMonitor = new();
-    private readonly CheckBox _chkFullscreen = new();
-    private readonly CheckBox _chkPlayAudio = new();
-    private readonly CheckBox _chkStats = new();
-    private readonly CheckBox _chkAutoControl = new();
+    private readonly CheckBox _chkFullscreen = new ToggleCheck();
+    private readonly CheckBox _chkPlayAudio = new ToggleCheck();
+    private readonly CheckBox _chkStats = new ToggleCheck();
+    private readonly CheckBox _chkAutoControl = new ToggleCheck();
     private readonly Label _padsHere = new();
     private readonly ListBox _lstPads = new();
-    private readonly Button _btnPadSetup = new();
-    private readonly CheckBox _chkLight = new();
+    private readonly Button _btnPadSetup = new PillButton();
+    private readonly CheckBox _chkLight = new ToggleCheck();
     private readonly ComboBox _cmbResolution = new();
     private readonly System.Windows.Forms.Timer _padsTimer = new() { Interval = 1500 };
 
     // Transmitir
-    private readonly Button _btnScan = new();
+    private readonly Button _btnScan = new PillButton();
     private readonly Label _scanStatus = new();
     private readonly ListView _lvReceivers = new();
     private readonly TextBox _txtAddress = new();
     private readonly ComboBox _cmbSendMonitor = new();
     private readonly ComboBox _cmbFps = new();
     private readonly ComboBox _cmbQuality = new();
-    private readonly CheckBox _chkSendAudio = new();
-    private readonly CheckBox _chkAllowControl = new();
-    private readonly CheckBox _chkElevated = new();
+    private readonly CheckBox _chkSendAudio = new ToggleCheck();
+    private readonly CheckBox _chkAllowControl = new ToggleCheck();
+    private readonly CheckBox _chkElevated = new ToggleCheck();
     private readonly Label _elevatedStatus = new();
-    private readonly CheckBox _chkShareDiag = new();
+    private readonly CheckBox _chkShareDiag = new ToggleCheck();
     private bool _elevatedBusy;
     private readonly Label _gpStatus = new();
-    private readonly Button _btnGpInstall = new();
-    private readonly Button _btnSend = new();
+    private readonly Button _btnGpInstall = new PillButton();
+    private readonly Button _btnSend = new PillButton();
     private readonly Label _sendStatus = new();
 
     // HDMI
     private readonly ComboBox _cmbHdmiDevice = new();
-    private readonly Button _btnHdmiRefresh = new();
+    private readonly Button _btnHdmiRefresh = new PillButton();
     private readonly ComboBox _cmbHdmiFormat = new();
     private readonly ComboBox _cmbHdmiAudio = new();
-    private readonly CheckBox _chkHdmiFullscreen = new();
-    private readonly Button _btnHdmiOpen = new();
+    private readonly CheckBox _chkHdmiFullscreen = new ToggleCheck();
+    private readonly Button _btnHdmiOpen = new PillButton();
     private readonly Label _hdmiStatus = new();
 
     // Configurações
     private readonly TextBox _txtName = new();
-    private readonly CheckBox _chkAutoUpdate = new();
-    private readonly Button _btnCheckUpdate = new();
+    private readonly CheckBox _chkAutoUpdate = new ToggleCheck();
+    private readonly Button _btnCheckUpdate = new PillButton();
     private readonly Label _updateStatus = new();
-    private readonly CheckBox _chkAutostart = new();
+    private readonly CheckBox _chkAutostart = new ToggleCheck();
     private readonly Label _fwStatus = new();
-    private readonly Button _btnFirewall = new();
+    private readonly Button _btnFirewall = new PillButton();
 
     public MainForm(TrayApp app)
     {
@@ -95,14 +97,19 @@ internal sealed partial class MainForm : Form
         Text = "TransLocal — transmissão de tela por cabo";
         Icon = SystemIntegration.AppIcon;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(760, 640);
-        MinimumSize = new Size(640, 520);
+        ClientSize = new Size(1000, 760);
+        MinimumSize = new Size(780, 560);
+        Font = Theme.Font(9.5F);
 
         var header = BuildHeader();
-        _tabs.Dock = DockStyle.Fill;
-        _tabs.Padding = new Point(12, 6);
-        _tabs.TabPages.AddRange(new[] { _tabReceive, _tabSend, _tabRemote, _tabHdmi, _tabSettings });
-        _tabs.SelectedIndexChanged += (_, _) => OnTabChanged();
+        _tabs.AddRange(_tabReceive, _tabSend, _tabRemote, _tabHdmi, _tabSettings);
+        _header.Tabs.SetItems(_tabs.Pages.Select(pg => pg.Text));
+        _header.Tabs.SelectedChanged += i => _tabs.SelectedIndex = i;
+        _tabs.SelectedIndexChanged += (_, _) =>
+        {
+            _header.Tabs.SelectedIndex = _tabs.SelectedIndex;
+            OnTabChanged();
+        };
 
         BuildReceiveTab();
         BuildSendTab();
@@ -112,6 +119,7 @@ internal sealed partial class MainForm : Form
 
         Controls.Add(_tabs);
         Controls.Add(header);
+        Theme.Apply(this);
         ResumeLayout(false);
         PerformLayout();
 
@@ -177,47 +185,63 @@ internal sealed partial class MainForm : Form
 
     private Control BuildHeader()
     {
-        var panel = new Panel { Dock = DockStyle.Top, Height = 64, BackColor = Accent, Padding = new Padding(16, 8, 16, 8) };
-        var title = new Label
-        {
-            Text = "TransLocal",
-            Font = new Font("Segoe UI Semibold", 16F),
-            ForeColor = Color.White,
-            AutoSize = true,
-            Location = new Point(14, 6),
-        };
-        var sub = new Label
-        {
-            Text = "Veja e use a tela de um computador em outro — por cabo de rede, USB4/Thunderbolt, cabo bridge USB ou placa de captura HDMI.",
-            ForeColor = Color.FromArgb(225, 236, 250),
-            AutoSize = true,
-            Location = new Point(16, 38),
-        };
-        panel.Controls.Add(title);
-        panel.Controls.Add(sub);
-        return panel;
+        _header = new ModernHeader();
+        return _header;
     }
 
-    private static TableLayoutPanel NewPage(TabPage page)
+    /// <summary>Títulos grandes de cada página (as pílulas usam os nomes curtos).</summary>
+    private static readonly Dictionary<string, (string Title, string Sub)> PageTitles = new()
+    {
+        ["Receber"] = ("Receber nesta tela", "Mostre aqui a tela de outro computador — por cabo, Wi-Fi ou de fora de casa."),
+        ["Transmitir"] = ("Transmitir esta tela", "Envie a imagem, o som e o controle deste computador para outro."),
+        ["Acesso remoto"] = ("Acesso remoto", "Use este computador de fora de casa, com aprovação pelo celular."),
+        ["HDMI"] = ("Placa de captura HDMI", "Veja um videogame, câmera ou outro computador ligado pela placa de captura."),
+        ["Configurações"] = ("Configurações e ajuda", "Nome, atualizações, inicialização, firewall e diagnóstico."),
+    };
+
+    private static TableLayoutPanel NewPage(PagePanel page)
     {
         var t = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
             AutoScroll = true,
-            Padding = new Padding(14, 12, 14, 12),
+            Padding = new Padding(28, 4, 28, 20),
+            BackColor = Theme.Background,
         };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         page.Controls.Add(t);
-        page.UseVisualStyleBackColor = true;
+        if (PageTitles.TryGetValue(page.Text, out var title))
+        {
+            AddRow(t, new Label { Text = title.Title, Font = Theme.Light(22F), ForeColor = Theme.Text, AutoSize = true, Margin = new Padding(0, 4, 0, 0) });
+            AddRow(t, new Label { Text = title.Sub, ForeColor = Theme.Muted, AutoSize = true, Margin = new Padding(2, 2, 0, 16) });
+        }
         return t;
     }
 
-    private static void Add(TableLayoutPanel t, Control c)
+    // Cada título de seção abre um cartão novo; o que vem depois entra nele (até o próximo título).
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<TableLayoutPanel, Card> CurrentCard = new();
+
+    private static void AddRow(TableLayoutPanel t, Control c)
     {
         t.RowCount++;
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         t.Controls.Add(c, 0, t.RowCount - 1);
+    }
+
+    private static void Add(TableLayoutPanel t, Control c)
+    {
+        if (t is Card) { AddRow(t, c); return; }
+        if (c.Tag as string == "heading")
+        {
+            var card = new Card();
+            AddRow(t, card);
+            CurrentCard.AddOrUpdate(t, card);
+            card.AddRow(c);
+            return;
+        }
+        if (CurrentCard.TryGetValue(t, out var current)) current.AddRow(c);
+        else AddRow(t, c);
     }
 
     /// <summary>Linha final vazia que absorve a sobra de altura, mantendo o conteúdo no topo.</summary>
@@ -237,9 +261,11 @@ internal sealed partial class MainForm : Form
     private static Label Heading(string text) => new()
     {
         Text = text,
-        Font = new Font("Segoe UI Semibold", 11F),
+        Font = Theme.Semibold(12F),
+        ForeColor = Theme.Text,
         AutoSize = true,
-        Margin = new Padding(0, 6, 0, 6),
+        Margin = new Padding(0, 0, 0, 10),
+        Tag = "heading",
     };
 
     private static Label Note(string text) => new()
@@ -286,16 +312,8 @@ internal sealed partial class MainForm : Form
         b.Text = text;
         b.AutoSize = true;
         b.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        b.Padding = new Padding(10, 3, 10, 3);
-        b.Margin = new Padding(0, 3, 10, 3);
-        if (primary)
-        {
-            b.BackColor = Accent;
-            b.ForeColor = Color.White;
-            b.FlatStyle = FlatStyle.Flat;
-            b.FlatAppearance.BorderSize = 0;
-            b.Font = new Font("Segoe UI Semibold", 9.75F);
-        }
+        b.Margin = new Padding(0, 4, 10, 4);
+        if (b is PillButton pill) pill.Primary = primary;
     }
 
     private void BuildReceiveTab()
@@ -304,7 +322,7 @@ internal sealed partial class MainForm : Form
         Add(t, Heading("Mostrar neste computador a tela de outro"));
 
         _recvStatus.AutoSize = true;
-        _recvStatus.Font = new Font("Segoe UI Semibold", 10.5F);
+        _recvStatus.Font = Theme.Semibold(11F);
         _recvStatus.Margin = new Padding(0, 0, 0, 8);
         Add(t, _recvStatus);
 
@@ -343,11 +361,12 @@ internal sealed partial class MainForm : Form
         _chkStats.CheckedChanged += (_, _) => SaveSetting(s => s.ShowStats = _chkStats.Checked);
         Add(t, _chkStats);
 
-        SetupCheck(_chkLight, $"Pedir transmissão leve — para computadores mais simples (até {LightMode.MaxWidth}×{LightMode.MaxHeight}, {LightMode.MaxFps} quadros/s, mais compressão)");
+        SetupCheck(_chkLight, $"Pedir transmissão leve — para computadores mais simples (até {LightMode.MaxWidth}×{LightMode.MaxHeight})");
         _chkLight.CheckedChanged += (_, _) => SaveSetting(s => s.ReceiverLight = _chkLight.Checked);
         Add(t, _chkLight);
         Add(t, Note("A imagem já chega na resolução desta tela quando o outro computador usa “Resolução enviada: Automática” (padrão), " +
-                    "o que deixa a exibição mais leve. O modo leve reduz também os quadros por segundo e a banda."));
+                    "o que deixa a exibição mais leve. Com vídeo H.264 (os dois na 1.6+), o modo leve mantém 60 quadros/s e a qualidade; " +
+                    "sem ele (blocos JPEG), reduz também os quadros por segundo e a banda."));
 
         Add(t, Heading("Controlar o outro computador daqui"));
         SetupCheck(_chkAutoControl, "Começar já controlando quando o outro computador permitir (mouse, teclado e controles de jogo)");
@@ -643,7 +662,7 @@ internal sealed partial class MainForm : Form
             try { await _app.CheckForUpdatesAsync(manual: true); }
             finally { _btnCheckUpdate.Enabled = true; }
         };
-        var btnReleases = new Button();
+        var btnReleases = new PillButton();
         SetupButton(btnReleases, "Abrir página de versões");
         btnReleases.Click += (_, _) => SystemIntegration.OpenUrl(Updater.ReleasesPage);
         Add(t, Row(_btnCheckUpdate, btnReleases));
@@ -678,14 +697,14 @@ internal sealed partial class MainForm : Form
             if (!_loading) Streaming.DiagRelay.ShareEnabled = _chkShareDiag.Checked;
         };
         Add(t, _chkShareDiag);
-        var btnDiag = new Button();
+        var btnDiag = new PillButton();
         SetupButton(btnDiag, "Abrir relatórios de diagnóstico");
         btnDiag.Click += (_, _) =>
         {
             System.IO.Directory.CreateDirectory(Streaming.DiagFiles.Directory);
             SystemIntegration.OpenFolder(Streaming.DiagFiles.Directory);
         };
-        var btnIssue = new Button();
+        var btnIssue = new PillButton();
         SetupButton(btnIssue, "Relatar um problema no GitHub…");
         btnIssue.Click += (_, _) =>
         {
@@ -700,7 +719,7 @@ internal sealed partial class MainForm : Form
                     "do registro e um resumo do estado (captura, programa em primeiro plano, controle). Fica salvo nos dois, um arquivo por sessão. " +
                     "Na janela de exibição, Ctrl+Alt+Shift+D mostra o diagnóstico ao vivo. Nada sai dos seus computadores sem você mandar."));
 
-        var btnLogs = new Button();
+        var btnLogs = new PillButton();
         SetupButton(btnLogs, "Abrir pasta de registros");
         btnLogs.Click += (_, _) => SystemIntegration.OpenFolder(Log.DataDirectory);
         Add(t, Row(btnLogs, Caption($"Versão {SystemIntegration.Version} • portas TCP {Proto.VideoPort} e UDP {Proto.DiscoveryPort}")));
@@ -826,7 +845,7 @@ internal sealed partial class MainForm : Form
     private void SetFirewallLabel(bool ok)
     {
         _fwStatus.Text = ok ? "liberado ✔" : "não liberado — o outro computador pode não conseguir conectar";
-        _fwStatus.ForeColor = ok ? Good : Color.FromArgb(168, 0, 0);
+        _fwStatus.ForeColor = ok ? Good : Bad;
         _btnFirewall.Visible = !ok;
     }
 
@@ -1044,7 +1063,7 @@ internal sealed partial class MainForm : Form
         if (_app.ReceiverError is { } err)
         {
             _recvStatus.Text = "⚠ " + err;
-            _recvStatus.ForeColor = Color.FromArgb(168, 0, 0);
+            _recvStatus.ForeColor = Bad;
         }
         else if (_app.ViewingFrom is { } from)
         {
@@ -1064,6 +1083,12 @@ internal sealed partial class MainForm : Form
         _loading = true;
         _chkReceive.Checked = _app.Settings.ReceiverEnabled;
         _loading = false;
+
+        if (_app.IsSending) _header.SetStatus($"Transmitindo para {_app.SendingTo}", Theme.Accent);
+        else if (_app.ViewingFrom is { } viewing) _header.SetStatus($"Exibindo {viewing}", Theme.Accent2);
+        else if (_app.ReceiverError is not null) _header.SetStatus("Recepção com problema", Theme.Bad);
+        else if (_app.IsReceiving) _header.SetStatus("Pronto para receber", Theme.Good);
+        else _header.SetStatus("Recepção desligada", Theme.Muted);
 
         // Transmitir
         if (_app.IsSending)

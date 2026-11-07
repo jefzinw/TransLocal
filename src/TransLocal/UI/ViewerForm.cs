@@ -251,8 +251,9 @@ internal sealed class SurfaceView : Control
         {
             var size = TextRenderer.MeasureText(e.Graphics, text, Font);
             var box = new Rectangle(8, Height - size.Height - 16, size.Width + 16, size.Height + 8);
-            using var bg = new SolidBrush(Color.FromArgb(200, 20, 20, 20));
-            e.Graphics.FillRectangle(bg, box);
+            using var bg = new SolidBrush(Color.FromArgb(215, 18, 18, 21));
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var path = Theme.Rounded(box, 12)) e.Graphics.FillPath(bg, path);
             TextRenderer.DrawText(e.Graphics, text, Font, new Point(box.X + 8, box.Y + 4), Color.White);
         }
         if (Notice is { Length: > 0 } notice)
@@ -261,8 +262,9 @@ internal sealed class SurfaceView : Control
             var flags = TextFormatFlags.WordBreak | TextFormatFlags.HorizontalCenter;
             var size = TextRenderer.MeasureText(e.Graphics, notice, Font, new Size(maxW, 0), flags);
             var box = new Rectangle((Width - size.Width) / 2 - 12, 12, size.Width + 24, size.Height + 14);
-            using var bg = new SolidBrush(Color.FromArgb(225, 120, 72, 0));
-            e.Graphics.FillRectangle(bg, box);
+            using var bg = new SolidBrush(Color.FromArgb(225, Theme.Accent));
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var path = Theme.Rounded(box, 14)) e.Graphics.FillPath(bg, path);
             TextRenderer.DrawText(e.Graphics, notice, Font, new Rectangle(box.X + 12, box.Y + 7, size.Width, size.Height), Color.White, flags);
         }
     }
@@ -471,11 +473,13 @@ internal sealed class ViewerForm : Form
         _view.LocalCommand += OnLocalCommand;
         _view.RelativeModeChanged += UpdateTitleForMouseMode;
 
-        _bar = new Panel { Height = 40, BackColor = Color.FromArgb(32, 32, 32), Dock = DockStyle.Top, Padding = new Padding(6, 4, 6, 4) };
+        _bar = new Panel { Height = 46, BackColor = Theme.Background, Dock = DockStyle.Top, Padding = new Padding(10, 4, 10, 4) };
+        Theme.DarkTitleBar(this);
         _barTitle = new Label
         {
             Text = title,
-            ForeColor = Color.White,
+            Font = Theme.Semibold(11F),
+            ForeColor = Theme.Text,
             AutoSize = false,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -567,20 +571,16 @@ internal sealed class ViewerForm : Form
 
     private Button BarButton(string text, EventHandler onClick)
     {
-        var b = new Button
+        var b = new PillButton
         {
             Text = text,
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            FlatStyle = FlatStyle.Flat,
-            ForeColor = Color.White,
-            BackColor = Color.FromArgb(52, 52, 52),
-            Margin = new Padding(4, 2, 0, 2),
-            Padding = new Padding(6, 0, 6, 0),
+            Margin = new Padding(6, 3, 0, 3),
             TabStop = false,
-            Height = 30,
+            Font = Theme.Semibold(9F),
+            MinimumSize = new Size(0, 32),
         };
-        b.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
         b.Click += (s, e) =>
         {
             onClick(s, e);
@@ -765,7 +765,7 @@ internal sealed class ViewerForm : Form
     private void ShowAudioMenu()
     {
         if (_btnAudio is null) return;
-        var menu = new ContextMenuStrip { ShowCheckMargin = true, ShowImageMargin = false };
+        var menu = new ContextMenuStrip { ShowCheckMargin = true, ShowImageMargin = false, Renderer = new Theme.MenuRenderer() };
         string? preferred = AudioOutput.Preferred;
         var def = new ToolStripMenuItem($"Padrão do Windows ({Short(AudioOutput.DefaultName(), 40)}) — muda sozinho ao ligar um fone")
         {

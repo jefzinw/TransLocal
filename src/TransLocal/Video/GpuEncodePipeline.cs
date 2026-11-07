@@ -70,7 +70,7 @@ internal sealed unsafe class GpuEncodePipeline : IDisposable
             InputWidth = (uint)_srcW, InputHeight = (uint)_srcH,
             OutputWidth = (uint)dstW, OutputHeight = (uint)dstH,
             InputFrameRate = new Rational((uint)fps, 1), OutputFrameRate = new Rational((uint)fps, 1),
-            Usage = VideoUsage.OptimalSpeed,
+            Usage = VideoUsage.OptimalQuality, // redução com filtro melhor (custo desprezível na placa)
         };
         _vdev.CreateVideoProcessorEnumerator(ref desc, out _vpEnum!).CheckError();
         _vdev.CreateVideoProcessor(_vpEnum, 0, out _vp!).CheckError();

@@ -41,24 +41,24 @@ internal sealed class ConfirmationForm : Form
                 Font = new Font("Segoe UI Semibold", 30F),
                 TextAlign = ContentAlignment.MiddleCenter,
                 Bounds = new Rectangle(20, y, 480, 64),
-                ForeColor = Color.FromArgb(0, 103, 192),
+                ForeColor = Theme.AccentLight,
             };
             Controls.Add(big);
             y += 70;
         }
-        var info = new Label { Text = details, AutoSize = false, Bounds = new Rectangle(20, y, 480, 60), ForeColor = Color.FromArgb(70, 70, 70) };
+        var info = new Label { Text = details, AutoSize = false, Bounds = new Rectangle(20, y, 480, 60), ForeColor = Theme.Muted };
         Controls.Add(info);
         y += 64;
 
         _countdown.Bounds = new Rectangle(20, y + 8, 220, 24);
-        _countdown.ForeColor = Color.FromArgb(120, 120, 120);
-        var accept = new Button { Text = acceptText, Bounds = new Rectangle(250, y, 140, 34), BackColor = Color.FromArgb(0, 103, 192), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
-        accept.FlatAppearance.BorderSize = 0;
-        var reject = new Button { Text = rejectText, Bounds = new Rectangle(398, y, 102, 34) };
+        _countdown.ForeColor = Theme.Muted;
+        var accept = new PillButton { Text = acceptText, Bounds = new Rectangle(236, y, 154, 36), Primary = true };
+        var reject = new PillButton { Text = rejectText, Bounds = new Rectangle(398, y, 102, 36) };
         accept.Click += (_, _) => { Accepted = true; Close(); };
         reject.Click += (_, _) => { Accepted = false; Close(); };
         Controls.AddRange(new Control[] { _countdown, accept, reject });
         CancelButton = reject;
+        Theme.Apply(this);
         ResumeLayout(false);
 
         UpdateCountdown();

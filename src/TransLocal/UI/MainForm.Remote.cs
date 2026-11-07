@@ -6,21 +6,21 @@ namespace TransLocal.UI;
 /// <summary>Aba “Acesso remoto” e lista de aparelhos pareados.</summary>
 internal sealed partial class MainForm
 {
-    private readonly TabPage _tabRemote = new("Acesso remoto");
-    private readonly CheckBox _chkRemote = new();
+    private readonly PagePanel _tabRemote = new("Acesso remoto");
+    private readonly CheckBox _chkRemote = new ToggleCheck();
     private readonly Label _remoteStatus = new();
     private readonly Label _tailscale = new();
     private readonly PictureBox _qr = new();
     private readonly Label _qrInfo = new();
-    private readonly Button _btnShowQr = new();
-    private readonly Button _btnNewSecret = new();
+    private readonly Button _btnShowQr = new PillButton();
+    private readonly Button _btnNewSecret = new PillButton();
     private readonly ComboBox _cmbRemotePc = new();
     private readonly TextBox _txtRemoteAddress = new();
     private readonly TextBox _txtRemoteCode = new();
-    private readonly Button _btnRequest = new();
+    private readonly Button _btnRequest = new PillButton();
     private readonly Label _requestStatus = new();
     private readonly ListView _lvPaired = new();
-    private readonly Button _btnUnpair = new();
+    private readonly Button _btnUnpair = new PillButton();
     private readonly Label _myId = new();
     private string _pairedKey = "";
 
@@ -96,7 +96,7 @@ internal sealed partial class MainForm
         _tailscale.Font = new Font("Consolas", 9.75F);
         _tailscale.Margin = new Padding(12, 0, 0, 6);
         Add(t, _tailscale);
-        var btnTs = new Button();
+        var btnTs = new PillButton();
         SetupButton(btnTs, "Abrir o site do Tailscale");
         btnTs.Click += (_, _) => SystemIntegration.OpenUrl("https://tailscale.com/download");
         Add(t, Row(btnTs));
@@ -105,7 +105,7 @@ internal sealed partial class MainForm
         Add(t, Note("Baixe o TransLocal-Android.apk na página de versões e instale no celular (permita “instalar apps desconhecidos” " +
                     "quando o Android pedir). Com o celular na mesma rede do PC (ou no Tailscale), abra o app, toque em “Parear com um computador”, " +
                     "escolha este PC e confirme o mesmo código nas duas telas. O app avisa os pedidos de acesso e mostra o código de autorização."));
-        var btnApk = new Button();
+        var btnApk = new PillButton();
         SetupButton(btnApk, "Abrir página de versões");
         btnApk.Click += (_, _) => SystemIntegration.OpenUrl(Updater.ReleasesPage);
         Add(t, Row(btnApk));
@@ -241,7 +241,7 @@ internal sealed partial class MainForm
         catch (Exception ex)
         {
             _requestStatus.Text = ex.Message;
-            _requestStatus.ForeColor = Color.FromArgb(168, 0, 0);
+            _requestStatus.ForeColor = Bad;
         }
         finally
         {

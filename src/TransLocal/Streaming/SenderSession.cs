@@ -478,8 +478,9 @@ internal sealed class SenderSession : IDisposable
                 bool acquired = false;
                 if (viaUdp)
                 {
-                    // Por UDP nada fica preso na fila: só segura se o receptor estiver muitos quadros atrás.
-                    if (Volatile.Read(ref _frameId) - Volatile.Read(ref _lastAckedId) > 8)
+                    // Por UDP nada fica preso na fila: só segura se o receptor estiver muito atrás (~0,4 s a 60 q/s).
+                    // Com 8 quadros, um atraso curto nas confirmações (Wi-Fi do notebook) congelava a imagem à toa.
+                    if (Volatile.Read(ref _frameId) - Volatile.Read(ref _lastAckedId) > 24)
                     {
                         Interlocked.Increment(ref _statBlocked);
                         Thread.Sleep(2);

@@ -81,7 +81,7 @@ internal sealed class ControllerSetupForm : Form
         _prompt.Font = new Font("Segoe UI", 15F);
         _prompt.TextAlign = ContentAlignment.MiddleCenter;
         _status.SetBounds(20, 176, 520, 44);
-        _status.ForeColor = Color.FromArgb(96, 96, 96);
+        _status.ForeColor = Theme.Muted;
         _status.TextAlign = ContentAlignment.MiddleCenter;
 
         _btnSkip.Text = "Pular";
@@ -93,6 +93,7 @@ internal sealed class ControllerSetupForm : Form
         CancelButton = _btnCancel;
 
         Controls.AddRange(new Control[] { _title, _prompt, _status, _btnSkip, _btnCancel });
+        Theme.Apply(this);
         ResumeLayout(false);
 
         _timer.Tick += (_, _) => Tick();

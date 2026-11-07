@@ -8,8 +8,8 @@
     <RootNamespace>TransLocal.Mobile</RootNamespace>
     <AssemblyName>TransLocal.Mobile</AssemblyName>
     <ApplicationId>com.jefzinw.translocal</ApplicationId>
-    <ApplicationVersion>190</ApplicationVersion>
-    <ApplicationDisplayVersion>1.9.0</ApplicationDisplayVersion>
+    <ApplicationVersion>200</ApplicationVersion>
+    <ApplicationDisplayVersion>2.0.0</ApplicationDisplayVersion>
     <AndroidPackageFormat>apk</AndroidPackageFormat>
     <RuntimeIdentifiers>android-arm64;android-arm</RuntimeIdentifiers>
     <!-- As mensagens do protocolo usam System.Text.Json por reflexÃ£o: nÃ£o podar o cÃ³digo do app. -->

@@ -119,7 +119,7 @@ internal sealed class TrayApp : ApplicationContext
             try { Settings.Save(); } catch (Exception ex) { Log.Warn("Falha ao salvar a saída de som", ex); }
         };
 
-        var menu = new ContextMenuStrip();
+        var menu = new ContextMenuStrip { Renderer = new Theme.MenuRenderer() };
         var miOpen = new ToolStripMenuItem("Abrir TransLocal", null, (_, _) => ShowMain()) { Font = new Font(SystemFonts.MenuFont ?? Control.DefaultFont, FontStyle.Bold) };
         _miSend = new ToolStripMenuItem("Transmitir", null, async (_, _) => await ToggleSendFromShortcutAsync());
         _miHdmi = new ToolStripMenuItem("Abrir visualização HDMI", null, async (_, _) => await ToggleHdmiFromShortcutAsync());

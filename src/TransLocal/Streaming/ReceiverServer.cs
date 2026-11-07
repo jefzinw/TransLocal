@@ -498,6 +498,7 @@ internal sealed class ReceiverSession
     private long _udpBytes, _framesSkipped;
     private int _lastVideoId = int.MinValue;
     private volatile int _videoW, _videoH;
+    private long _lastSlowLog;
     private bool _waitKey;
 
     /// <summary>O transmissor ofereceu vídeo por UDP: abre o socket e se apresenta (o vídeo passa a vir por ele).</summary>
@@ -617,7 +618,15 @@ internal sealed class ReceiverSession
                     produced = _decoder.Decode(annexB, vw, vh, Surface, sink, out error);
                 onGpu = produced && _decoder!.LastOnGpu;
             }
-            Interlocked.Add(ref _statDecodeTicks, Stopwatch.GetTimestamp() - t1);
+            long spent = Stopwatch.GetTimestamp() - t1;
+            Interlocked.Add(ref _statDecodeTicks, spent);
+            double ms = spent * 1000.0 / Stopwatch.Frequency;
+            if (ms > 40 && Environment.TickCount64 - _lastSlowLog > 5000)
+            {
+                // Vai para o registro dos dois computadores: mostra se o atraso nasce aqui (decodificar/mostrar).
+                _lastSlowLog = Environment.TickCount64;
+                Log.Warn($"Quadro lento neste computador: decodificar + mostrar levou {ms:0} ms ({_codecLabel}{(viaUdp ? ", UDP" : ", TCP")}, {vw}×{vh})");
+            }
         }
         if (produced)
         {

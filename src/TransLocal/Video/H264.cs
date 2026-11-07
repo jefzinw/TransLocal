@@ -239,7 +239,7 @@ internal sealed unsafe class H264Encoder : IDisposable
         Set(MF.BPictureCount, 0u);
         // Quadros-chave só quando o receptor pede (começo, perda de sequência): sem pico periódico.
         Set(MF.GopSize, (uint)(fps * (conservative ? 4 : 120)));
-        Set(MF.QualityVsSpeed, 33u);
+        Set(MF.QualityVsSpeed, uint.TryParse(Environment.GetEnvironmentVariable("TRANSLOCAL_ENC_QVS"), out var qvs) ? qvs : 33u);
 
         var output = MediaFactory.MFCreateMediaType();
         output.Set(MF.MajorType, MF.Video);
@@ -324,9 +324,12 @@ internal sealed unsafe class H264Encoder : IDisposable
     /// <summary>Taxa de bits recomendada: ~0,07–0,12 bit por pixel por quadro conforme a qualidade escolhida.</summary>
     public static int BitrateFor(int w, int h, int fps, int quality)
     {
-        // Referência dos apps de jogos na nuvem: ~10 Mbit/s para 1366×768/720p a 60 q/s, ~20 Mbit/s para 1080p60.
-        double bpp = quality >= 90 ? 0.16 : quality >= 70 ? 0.12 : 0.09;
-        return (int)Math.Clamp(w * (double)h * fps * bpp, 3_000_000, 40_000_000);
+        // Em rede de casa, como o Moonlight: o custo cresce menos que proporcional aos quadros/s (a 30 q/s cada quadro
+        // muda mais que a 60 e precisa de mais bits). Qualidade 85, 1366×768: ~9 Mbit/s a 30 q/s, ~15 Mbit/s a 60 q/s;
+        // máxima, 1080p60: ~35 Mbit/s. Antes, a 30 q/s ficava em ~4 Mbit/s — jogos detalhados pixelavam.
+        double k = quality >= 90 ? 0.95 : quality >= 70 ? 0.80 : 0.55;
+        double bps = w * (double)h * Math.Pow(Math.Max(1, fps), 0.7) * k;
+        return (int)Math.Clamp(bps, 4_000_000, 40_000_000);
     }
 
     /// <summary>Ajustes da 1.6 (sem buffer de 1 quadro nem limite de pico): reserva se a placa não entregar quadros.</summary>

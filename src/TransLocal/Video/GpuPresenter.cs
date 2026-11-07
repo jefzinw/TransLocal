@@ -203,8 +203,8 @@ internal sealed unsafe class GpuPresenter : IGpuFrameSink, IDisposable
         _rt.TextAntialiasMode = TextAntialiasMode.Grayscale;
         _white = _rt.CreateSolidColorBrush(new Color4(1f, 1f, 1f, 1f));
         _gray = _rt.CreateSolidColorBrush(new Color4(0.55f, 0.55f, 0.55f, 1f));
-        _statsBg = _rt.CreateSolidColorBrush(new Color4(20 / 255f, 20 / 255f, 20 / 255f, 200 / 255f));
-        _noticeBg = _rt.CreateSolidColorBrush(new Color4(120 / 255f, 72 / 255f, 0f, 225 / 255f));
+        _statsBg = _rt.CreateSolidColorBrush(new Color4(18 / 255f, 18 / 255f, 21 / 255f, 215 / 255f));
+        _noticeBg = _rt.CreateSolidColorBrush(new Color4(255 / 255f, 106 / 255f, 26 / 255f, 225 / 255f));
         _outView?.Dispose();
         _outView = null;
     }
@@ -246,7 +246,7 @@ internal sealed unsafe class GpuPresenter : IGpuFrameSink, IDisposable
             OutputHeight = (uint)Math.Max(h, _height),
             InputFrameRate = new Rational(60, 1),
             OutputFrameRate = new Rational(60, 1),
-            Usage = VideoUsage.OptimalSpeed,
+            Usage = VideoUsage.OptimalQuality,
         };
         _gpu.VideoDevice.CreateVideoProcessorEnumerator(ref desc, out _vpEnum).CheckError();
         _gpu.VideoDevice.CreateVideoProcessor(_vpEnum!, 0, out _vp).CheckError();
@@ -512,7 +512,7 @@ internal sealed unsafe class GpuPresenter : IGpuFrameSink, IDisposable
         float pad = _fontPx * 0.6f;
         float h = m.Height + pad, w = m.Width + pad * 2;
         float x = 8, y = _height - h - 16;
-        _rt!.FillRectangle(new Rect(x, y, w, h), _statsBg!);
+        _rt!.FillRoundedRectangle(new RoundedRectangle(new RectangleF(x, y, w, h), 12, 12), _statsBg!);
         _rt.DrawTextLayout(new Vector2(x + pad, y + pad / 2), layout, _white!);
     }
 
@@ -525,7 +525,7 @@ internal sealed unsafe class GpuPresenter : IGpuFrameSink, IDisposable
         var m = layout.Metrics;
         float w = m.Width + 24, h = m.Height + 14;
         float x = (_width - w) / 2, y = 12;
-        _rt!.FillRectangle(new Rect(x, y, w, h), _noticeBg!);
+        _rt!.FillRoundedRectangle(new RoundedRectangle(new RectangleF(x, y, w, h), 14, 14), _noticeBg!);
         // O layout centraliza dentro de maxW: desloca para a caixa.
         _rt.DrawTextLayout(new Vector2(x + 12 - m.Left, y + 7), layout, _white!);
     }
