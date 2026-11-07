@@ -75,6 +75,15 @@ internal sealed class SenderSession : IDisposable
     private int _ended;
     private int _frameId;
 
+    // Diagnóstico e avisos ao receptor
+    private DiagRelay? _diag;
+    private volatile string _captureState = "";
+    private volatile bool _captureBlocked;
+    private bool _blockedNoticeSent;
+    private int _elevatedNoticePid;
+    private long _lastSnapshotTick;
+    private string? _lastSnapshot;
+
     // Estatísticas (janela de ~1 s)
     private int _statFrames;
     private long _statEncodeTicks;
@@ -242,6 +251,15 @@ internal sealed class SenderSession : IDisposable
                  $"{_limits.Fps} fps, qualidade {_limits.Quality}{(_limits.Light ? " (modo leve pedido pelo receptor)" : "")}, " +
                  $"áudio={_audio is not null}, controle={_opt.AllowControl}, controles de jogo={GamepadStatus}");
 
+        _diag = new DiagRelay(ReceiverName, "transmitindo", DiagRelay.ShareEnabled ? SendDiag : null);
+        if (_opt.AllowControl)
+        {
+            var bridge = ElevatedInputBridge.Current;
+            Log.Info(bridge is null
+                ? "Controle de programas de administrador: desligado (Gerenciador de Tarefas e jogos “como administrador” não recebem mouse/teclado)"
+                : $"Controle de programas de administrador: {(bridge.IsConnected ? "conectado" : "aguardando o auxiliar")}");
+        }
+
         new Thread(VideoLoop) { IsBackground = true, Name = "TransLocal vídeo", Priority = ThreadPriority.AboveNormal }.Start();
         new Thread(ReadLoop) { IsBackground = true, Name = "TransLocal leitura" }.Start();
 
@@ -302,6 +320,7 @@ internal sealed class SenderSession : IDisposable
                     _sendSize = size;
                     needFrame = true;
                     _injector?.SetMonitor(capturer.Bounds);
+                    ElevatedInputBridge.Current?.SetMonitor(capturer.Bounds);
                     Log.Info($"Captura {capturer.Method} de {screen.DeviceName} {capturer.Width}×{capturer.Height}" +
                              (scaler is null ? "" : $", enviada em {size.Width}×{size.Height}"));
                 }
@@ -325,7 +344,14 @@ internal sealed class SenderSession : IDisposable
                 try
                 {
                     // Sem mudança na tela (nem no cursor): não precisa reduzir nem comparar a imagem.
-                    if (capturer.Capture(drawCursor: true) && (capturer.LastCaptureChanged || needFrame))
+                    bool got = capturer.Capture(drawCursor: true);
+                    if (capturer is DxgiCapturer dx)
+                    {
+                        _captureState = dx.State;
+                        _captureBlocked = dx.Blocked;
+                    }
+                    else _captureState = capturer.Method;
+                    if (got && (capturer.LastCaptureChanged || needFrame))
                     {
                         needFrame = false;
                         long t0 = Stopwatch.GetTimestamp();
@@ -390,7 +416,10 @@ internal sealed class SenderSession : IDisposable
                         try { _inflight.Release(); } catch (SemaphoreFullException) { }
                         break;
                     case MsgType.Input:
-                        if (_opt.AllowControl) _injector?.Apply(m.Span);
+                        if (_opt.AllowControl) ApplyInput(m.Span);
+                        break;
+                    case MsgType.Diag:
+                        _diag?.Received(m.Span);
                         break;
                     case MsgType.Info when m.Length > 0:
                         Log.Info($"[{ReceiverName}] {System.Text.Encoding.UTF8.GetString(m.Span[..Math.Min(m.Length, 2000)])}");
@@ -447,6 +476,76 @@ internal sealed class SenderSession : IDisposable
         string rtt = double.IsNaN(_rttMs) ? "–" : $"{_rttMs:0.#} ms";
         string size = _sendSize.IsEmpty ? "" : $"{_sendSize.Width}×{_sendSize.Height}{(_limits.Light ? " (leve)" : "")} • ";
         StatsUpdated?.Invoke($"{size}{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s • codificação {encMs:0} ms • ida e volta {rtt}");
+
+        try { CheckCompatibility(frames / secs, mbps, rtt); }
+        catch (Exception ex) { Log.Warn("Falha no diagnóstico", ex); }
+    }
+
+    /// <summary>
+    /// Uma vez por segundo: avisa o receptor sobre o que impede o controle ou a imagem (programa de
+    /// administrador em primeiro plano, tela cheia exclusiva) e registra um estado resumido para o diagnóstico.
+    /// </summary>
+    private void CheckCompatibility(double fps, double mbps, string rtt)
+    {
+        var fg = ProcessInfo.Foreground();
+        var bridge = ElevatedInputBridge.Current;
+        bool elevatedOk = bridge?.IsConnected == true;
+
+        if (_opt.AllowControl && fg.Elevated && !elevatedOk)
+        {
+            if (fg.Pid != _elevatedNoticePid)
+            {
+                _elevatedNoticePid = fg.Pid;
+                string how = bridge is null
+                    ? "No PC, aba Transmitir, ative “Controlar programas abertos como administrador”."
+                    : "O controle de administrador está ativado, mas o auxiliar não respondeu; reinicie o TransLocal no PC.";
+                SendNotice($"{fg.Name} está aberto como administrador no PC: o Windows bloqueia mouse e teclado vindos de outros programas. {how}");
+            }
+        }
+        else if (!fg.Elevated)
+        {
+            _elevatedNoticePid = 0;
+        }
+
+        if (_captureBlocked && !_blockedNoticeSent)
+        {
+            _blockedNoticeSent = true;
+            SendNotice($"{(fg.Pid != 0 ? fg.Name : "O programa em tela cheia")} não deixa capturar a tela (tela cheia exclusiva). " +
+                       "No jogo, troque o modo de tela para “Janela sem bordas” (Borderless) — o controle continua funcionando.");
+        }
+        else if (!_captureBlocked) _blockedNoticeSent = false;
+
+        // Estado resumido: só quando muda (ou a cada 30 s), para o arquivo de diagnóstico ser leve.
+        string control = !_opt.AllowControl ? "desligado" : bridge is null ? "comum" : elevatedOk ? "comum + administrador" : "comum (auxiliar ausente)";
+        string snapshot = $"captura: {_captureState} • primeiro plano: {fg} • cursor {(_cursorCaptured ? "preso (relativo)" : "livre")} • controle: {control}";
+        long now = Environment.TickCount64;
+        if (snapshot != _lastSnapshot || now - _lastSnapshotTick > 30_000)
+        {
+            _lastSnapshot = snapshot;
+            _lastSnapshotTick = now;
+            _diag?.Snapshot($"{snapshot} • {fps:0} q/s • {mbps:0.0} Mbit/s • ida e volta {rtt}");
+        }
+    }
+
+    internal void SendNotice(string text)
+    {
+        Log.Warn("Aviso ao receptor: " + text);
+        if (!IsRunning) return;
+        try { _conn.Send(MsgType.Notice, System.Text.Encoding.UTF8.GetBytes(text)); } catch { }
+    }
+
+    private void SendDiag(byte[] payload)
+    {
+        if (!IsRunning) return;
+        try { _conn.Send(MsgType.Diag, payload); } catch { }
+    }
+
+    /// <summary>Aplica mouse/teclado: pelo auxiliar elevado quando ligado (alcança janelas de administrador).</summary>
+    private void ApplyInput(ReadOnlySpan<byte> payload)
+    {
+        var bridge = ElevatedInputBridge.Current;
+        if (bridge is not null && bridge.TrySendInput(payload)) return;
+        _injector?.Apply(payload);
     }
 
     private void End(string? reason)
@@ -458,8 +557,10 @@ internal sealed class SenderSession : IDisposable
         _conn.Dispose();
         _audio?.Dispose();
         _injector?.ReleaseAll();
+        ElevatedInputBridge.Current?.TrySendInput(InputCodec.EncodeReleaseAll());
         _gamepads?.Dispose();
         Log.Info($"Transmissão encerrada: {reason ?? "parada pelo usuário"}");
+        _diag?.Dispose();
         try { Ended?.Invoke(this, reason); } catch (Exception ex) { Log.Error("Erro no evento de fim", ex); }
     }
 

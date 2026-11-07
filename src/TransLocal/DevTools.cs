@@ -226,6 +226,22 @@ internal static class DevTools
         Check(frames >= 1, $"vídeo pela conexão criptografada: {frames} quadro(s) (tela parada só envia o que muda)");
         session.Surface.SavePng(Path.Combine(outDir, "selftest-recebido.png"));
 
+        // --- Diagnóstico ao vivo e avisos
+        var diagLines = session.Diag?.Recent(60) ?? Array.Empty<string>();
+        Check(diagLines.Any(l => l.StartsWith("[Notebook-Teste]") && l.Contains("[ESTADO]") && l.Contains("captura:")),
+            "diagnóstico ao vivo: o estado do transmissor chega ao receptor");
+        Check(session.Diag?.FilePath is { } diagFile && File.Exists(diagFile) && new FileInfo(diagFile).Length > 0,
+            $"diagnóstico salvo por sessão ({Path.GetFileName(session.Diag?.FilePath)})");
+        var noticeTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        session.Notice += t => noticeTcs.TrySetResult(t);
+        sender.SendNotice("Aviso de teste");
+        string? noticeText = null;
+        try { noticeText = await noticeTcs.Task.WaitAsync(TimeSpan.FromSeconds(5)); } catch (TimeoutException) { }
+        Check(noticeText == "Aviso de teste", "aviso do transmissor aparece no receptor");
+        Check(DiagFiles.Sanitize("de 192.168.1.43 em " + Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)) == "de x.x.x.x em %USERPROFILE%",
+            "relatório para o GitHub remove IP e pasta do usuário");
+        Check(ConversionSelfTest(out var convDetail), "conversão de quadros 10 bits / HDR / RGBA para a transmissão" + convDetail);
+
         var senderEnded = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         sender.Ended += (_, reason) => senderEnded.TrySetResult(reason);
         session.Close();
@@ -374,6 +390,35 @@ internal static class DevTools
         Input.ControllerService.Shutdown();
         Log.Info(failures == 0 ? "SELFTEST concluído: tudo certo" : $"SELFTEST concluído com {failures} falha(s)");
         return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Converte pixels conhecidos de cada formato que o DuplicateOutput1 pode entregar.
+    /// </summary>
+    private static unsafe bool ConversionSelfTest(out string detail)
+    {
+        var results = new List<string>();
+        bool ok = true;
+        void One(string name, Vortice.DXGI.Format fmt, ReadOnlySpan<byte> src, int pitch, uint expected)
+        {
+            uint got = 0;
+            fixed (byte* s = src) DxgiCapturer.Convert(s, pitch, fmt, (byte*)&got, 1, 1);
+            if (got != expected) { ok = false; results.Add($"{name}: {got:X8} ≠ {expected:X8}"); }
+        }
+        // R10G10B10A2: R=1023 G=512 B=0 → BGRA FF FF80 00
+        uint r10 = 1023u | (512u << 10) | (0u << 20) | (3u << 30);
+        One("R10G10B10A2", Vortice.DXGI.Format.R10G10B10A2_UNorm, BitConverter.GetBytes(r10), 4, 0xFFFF8000);
+        // R8G8B8A8: R=FF G=10 B=20 → BGRA (A FF, R FF, G 10, B 20)
+        One("R8G8B8A8", Vortice.DXGI.Format.R8G8B8A8_UNorm, new byte[] { 0xFF, 0x10, 0x20, 0xFF }, 4, 0xFFFF1020);
+        // FP16 linear: R=1.0 G=0.5 B=0 → sRGB 255, 188, 0
+        var half = new byte[8];
+        BitConverter.TryWriteBytes(half.AsSpan(0), (ushort)0x3C00);
+        BitConverter.TryWriteBytes(half.AsSpan(2), (ushort)0x3800);
+        BitConverter.TryWriteBytes(half.AsSpan(4), (ushort)0x0000);
+        BitConverter.TryWriteBytes(half.AsSpan(6), (ushort)0x3C00);
+        One("R16G16B16A16F", Vortice.DXGI.Format.R16G16B16A16_Float, half, 8, 0xFFFFBC00);
+        detail = ok ? "" : " — " + string.Join("; ", results);
+        return ok;
     }
 
     /// <summary>
@@ -594,6 +639,13 @@ internal static class DevTools
         viewer.Location = new Point(-30000, -30000);
         viewer.Show();
         viewer.SetStats("NOTEBOOK-TESTE • 1920×1080 • 30 quadros/s • 41,2 Mbit/s • decodificação 4 ms");
+        var demo = new[]
+        {
+            "[NOTEBOOK-TESTE] 00:00:13.183 [ESTADO] captura: DXGI DuplicateOutput1 R10G10B10A2_UNorm • primeiro plano: Cyberpunk2077.exe (administrador) (tela cheia) • cursor preso (relativo) • controle: comum (auxiliar ausente)",
+            "[NOTEBOOK-TESTE] 00:00:13.190 [AVISO] Aviso ao receptor: Cyberpunk2077.exe está aberto como administrador no PC…",
+        };
+        viewer.AttachDiagnostics(() => demo, () => 1);
+        viewer.ShowNotice("Cyberpunk2077.exe está aberto como administrador no PC: o Windows bloqueia mouse e teclado vindos de outros programas. No PC, aba Transmitir, ative “Controlar programas abertos como administrador”.");
         for (int i = 0; i < 30; i++)
         {
             Application.DoEvents();
@@ -610,6 +662,196 @@ internal static class DevTools
         app.Exit();
         return 0;
     }
+
+#if DEBUG
+    /// <summary>
+    /// Testa o pipe do controle de administrador sem privilégios (TRANSLOCAL_PIPE_TEST=1, só em Debug):
+    /// recusa de programa estranho, conexão do auxiliar, envio de comandos, recusa de servidor falso e saída.
+    /// </summary>
+    public static int PipeTest()
+    {
+        Environment.SetEnvironmentVariable("TRANSLOCAL_PIPE_TEST", "1"); // herdado pelos processos filhos
+        int failures = 0;
+        void Check(bool ok, string what)
+        {
+            Log.Info($"PIPETEST {(ok ? "OK  " : "FALHOU")} {what}");
+            if (!ok) failures++;
+        }
+        string pipe = Input.ElevatedInput.PipeName;
+        Process Ps(string script) => Process.Start(new ProcessStartInfo("powershell.exe",
+            $"-NoProfile -NonInteractive -Command \"{script}\"") { UseShellExecute = false, CreateNoWindow = true })!;
+
+        // 1) Programa estranho conecta no pipe do TransLocal: é desconectado sem receber nada.
+        Input.ElevatedInputBridge.Enable();
+        var bridge = Input.ElevatedInputBridge.Current!;
+        using (var foreign = Ps($"$p = New-Object System.IO.Pipes.NamedPipeClientStream('.', '{pipe}', 'In'); $p.Connect(5000); $b = $p.ReadByte(); exit ($b + 10)"))
+        {
+            foreign.WaitForExit(15_000);
+            Check(foreign.HasExited && foreign.ExitCode == 9 && !bridge.IsConnected,
+                $"programa estranho que conecta ao pipe é recusado e não recebe nada (saída {(foreign.HasExited ? foreign.ExitCode : -1)})");
+        }
+
+        // 2) O auxiliar (mesmo executável) conecta e recebe comandos.
+        using var helper = Process.Start(new ProcessStartInfo(Input.ElevatedInput.ExePath, "--elevated-input") { UseShellExecute = false, CreateNoWindow = true })!;
+        var sw = Stopwatch.StartNew();
+        while (!bridge.IsConnected && sw.Elapsed < TimeSpan.FromSeconds(15)) Thread.Sleep(100);
+        Check(bridge.IsConnected, $"auxiliar conectado em {sw.Elapsed.TotalSeconds:0.0} s");
+        bool sent = bridge.TrySendInput(Input.InputCodec.EncodeRelativeMove(0, 0)) && bridge.TrySendInput(Input.InputCodec.EncodeReleaseAll());
+        bridge.SetMonitor(Screen.PrimaryScreen!.Bounds);
+        Check(sent, "comandos de entrada enviados ao auxiliar (movimento nulo e soltar tudo)");
+
+        // 3) Desligar a opção fecha o auxiliar.
+        Input.ElevatedInputBridge.Disable(stopHelper: true);
+        helper.WaitForExit(5000);
+        Check(helper.HasExited && helper.ExitCode == 0, "auxiliar encerra quando a opção é desligada");
+
+        // 4) Servidor falso com o nome do pipe tenta mandar "encerrar": o auxiliar não obedece.
+        using (var fake = Ps($"$s = New-Object System.IO.Pipes.NamedPipeServerStream('{pipe}', 'Out'); $s.WaitForConnection(); try {{ $s.Write([byte[]](1,4), 0, 2); $s.Flush() }} catch {{}}; Start-Sleep 4; exit 0"))
+        {
+            Thread.Sleep(1500);
+            using var helper2 = Process.Start(new ProcessStartInfo(Input.ElevatedInput.ExePath, "--elevated-input") { UseShellExecute = false, CreateNoWindow = true })!;
+            Thread.Sleep(3500);
+            Check(!helper2.HasExited, "auxiliar ignora comandos de um pipe criado por outro programa");
+            try { helper2.Kill(); } catch { }
+            fake.WaitForExit(10_000);
+        }
+
+        Log.Info(failures == 0 ? "PIPETEST concluído: tudo certo" : $"PIPETEST concluído com {failures} falha(s)");
+        return failures == 0 ? 0 : 1;
+    }
+
+    private static Rectangle TargetRect(Rectangle s) => new(s.X + s.Width / 2 - 230, s.Y + s.Height / 2 - 100, 460, 200);
+
+    /// <summary>Janela de teste aberta como administrador: grava se recebeu clique e o texto digitado.</summary>
+    public static int ElevatedTarget(string resultFile)
+    {
+        bool elevated = ProcessInfo.CurrentIsElevated();
+        var screen = Screen.PrimaryScreen!.Bounds;
+        using var form = new Form
+        {
+            Text = "TransLocal — teste de controle de administrador",
+            TopMost = true,
+            StartPosition = FormStartPosition.Manual,
+            FormBorderStyle = FormBorderStyle.FixedToolWindow,
+            ShowInTaskbar = false,
+            Bounds = TargetRect(screen),
+        };
+        var box = new TextBox { Dock = DockStyle.Fill, Multiline = true, Font = new Font("Segoe UI", 16) };
+        form.Controls.Add(box);
+        bool clicked = false;
+        box.MouseDown += (_, _) => clicked = true;
+        var sw = Stopwatch.StartNew();
+        var timer = new System.Windows.Forms.Timer { Interval = 150 };
+        timer.Tick += (_, _) =>
+        {
+            try { File.WriteAllText(resultFile, $"{elevated}|{clicked}|{box.Text}"); } catch { }
+            if (box.Text.Contains("fim", StringComparison.OrdinalIgnoreCase) || sw.Elapsed > TimeSpan.FromSeconds(90)) form.Close();
+        };
+        form.Shown += (_, _) => timer.Start();
+        Application.Run(form);
+        try { File.WriteAllText(resultFile, $"{elevated}|{clicked}|{box.Text}|fechada"); } catch { }
+        return 0;
+    }
+
+    [DllImport("user32.dll")] private static extern short VkKeyScanW(char ch);
+    [DllImport("user32.dll")] private static extern uint MapVirtualKeyW(uint code, uint mapType);
+
+    /// <summary>
+    /// Teste real do controle de programas de administrador (pede UMA confirmação do UAC):
+    /// cria a tarefa, abre uma janela de administrador, confirma que a injeção comum é bloqueada e que
+    /// o auxiliar (iniciado pela tarefa, sem novo UAC) consegue clicar e digitar nela. Depois remove tudo.
+    /// </summary>
+    public static int ElevatedTest()
+    {
+        int failures = 0;
+        void Check(bool ok, string what)
+        {
+            Log.Info($"ELEVTEST {(ok ? "OK  " : "FALHOU")} {what}");
+            if (!ok) failures++;
+        }
+        string file = Path.Combine(Path.GetTempPath(), $"translocal-elevtest-{Guid.NewGuid():N}.txt");
+        string sid = System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value;
+        var screen = Screen.PrimaryScreen!.Bounds;
+        var rect = TargetRect(screen);
+        string Read() { try { return File.ReadAllText(file); } catch { return ""; } }
+
+        Process? reg;
+        try
+        {
+            reg = Process.Start(new ProcessStartInfo(Input.ElevatedInput.ExePath,
+                $"--register-elevated-input {sid} --with-test-target \"{file}\"") { UseShellExecute = true, Verb = "runas" });
+        }
+        catch (System.ComponentModel.Win32Exception ex)
+        {
+            Log.Info($"ELEVTEST FALHOU confirmação do Windows recusada ({ex.Message})");
+            return 1;
+        }
+        var sw = Stopwatch.StartNew();
+        while (!Read().StartsWith("True|") && sw.Elapsed < TimeSpan.FromSeconds(90)) Thread.Sleep(200);
+        Check(Read().StartsWith("True|"), "janela de teste aberta como administrador");
+        Check(Input.ElevatedInput.TaskInstalled(), "tarefa “TransLocal Controle Elevado” registrada");
+
+        byte[] Click(MouseButtons b, bool down)
+        {
+            var c = new Point(rect.X + rect.Width / 2, rect.Y + rect.Height / 2 + 15);
+            ushort nx = (ushort)((c.X - screen.X) * 65535L / Math.Max(1, screen.Width - 1));
+            ushort ny = (ushort)((c.Y - screen.Y) * 65535L / Math.Max(1, screen.Height - 1));
+            return Input.InputCodec.EncodeButton(b, down, nx, ny);
+        }
+
+        // 1) Sem o auxiliar: o Windows descarta o clique (UIPI).
+        var local = new Input.InputInjector(screen);
+        local.Apply(Click(MouseButtons.Left, true));
+        local.Apply(Click(MouseButtons.Left, false));
+        Thread.Sleep(800);
+        Check(Read().StartsWith("True|False|"), "sem o auxiliar, o clique numa janela de administrador é bloqueado (comportamento do Windows)");
+
+        // 2) Com o auxiliar, iniciado pela tarefa sem novo UAC.
+        Input.ElevatedInputBridge.Enable();
+        var bridge = Input.ElevatedInputBridge.Current!;
+        sw.Restart();
+        while (!bridge.IsConnected && sw.Elapsed < TimeSpan.FromSeconds(20)) Thread.Sleep(200);
+        Check(bridge.IsConnected, $"auxiliar iniciado pela tarefa (sem novo UAC) e conectado em {sw.Elapsed.TotalSeconds:0.0} s");
+        if (bridge.IsConnected)
+        {
+            bridge.SetMonitor(screen);
+            bridge.TrySendInput(Click(MouseButtons.Left, true));
+            bridge.TrySendInput(Click(MouseButtons.Left, false));
+            Thread.Sleep(600);
+            var fg = ProcessInfo.Foreground();
+            Check(Read().StartsWith("True|True|"), $"com o auxiliar, o clique chega à janela de administrador (primeiro plano: {fg})");
+            if (fg.Elevated && Read().StartsWith("True|True|"))
+            {
+                void Type(string text)
+                {
+                    foreach (char ch in text)
+                    {
+                        ushort vk = (ushort)(VkKeyScanW(ch) & 0xFF);
+                        ushort scan = (ushort)MapVirtualKeyW(vk, 0);
+                        bridge.TrySendInput(Input.InputCodec.EncodeKey(vk, scan, false, false));
+                        bridge.TrySendInput(Input.InputCodec.EncodeKey(vk, scan, false, true));
+                    }
+                }
+                Type("tl14");
+                Thread.Sleep(800);
+                Check(Read().Contains("tl14", StringComparison.OrdinalIgnoreCase), $"teclado chega à janela de administrador (“{Read().Split('|').Last()}”)");
+                Type("fim");
+            }
+            else
+            {
+                Log.Info("ELEVTEST (a janela de teste não ficou em primeiro plano; digitação não testada para não escrever em outra janela)");
+            }
+        }
+        Input.ElevatedInputBridge.Disable(stopHelper: true);
+
+        reg?.WaitForExit(120_000);
+        Thread.Sleep(500);
+        Check(!Input.ElevatedInput.TaskInstalled(), "tarefa de teste removida no fim");
+        try { File.Delete(file); } catch { }
+        Log.Info(failures == 0 ? "ELEVTEST concluído: tudo certo" : $"ELEVTEST concluído com {failures} falha(s)");
+        return failures == 0 ? 0 : 1;
+    }
+#endif
 
     private static double Ms(long start) => (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
 

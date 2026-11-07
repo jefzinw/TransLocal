@@ -89,6 +89,9 @@ internal sealed class TrayApp : ApplicationContext
         _receiver = CreateServer();
         Log.Info($"Identidade deste aparelho: {Identity.ShortId}");
 
+        Streaming.DiagRelay.ShareEnabled = Settings.ShareDiagnostics;
+        if (Settings.ElevatedControl) EnableElevatedBridge();
+
         Audio.AudioOutput.Initialize(Settings.ReceiverAudioDevice);
         Audio.AudioOutput.PreferredChanged += id =>
         {
@@ -549,6 +552,16 @@ internal sealed class TrayApp : ApplicationContext
         s.FrameReady += viewer.NotifyFrame;
         s.StatsUpdated += viewer.SetStats;
         s.CursorModeChanged += viewer.SetRemoteCursorCaptured;
+        s.Notice += text =>
+        {
+            viewer.ShowNotice(text);
+            Ui(() => Balloon("Aviso do outro computador", text, ToolTipIcon.Warning));
+        };
+        if (s.Diag is { } diag)
+        {
+            viewer.AttachDiagnostics(() => diag.Recent(12), () => Volatile.Read(ref diag.ProblemCount));
+            diag.Updated += viewer.DiagnosticsUpdated;
+        }
         _viewViewer = viewer;
         s.Surface.FastScaling = s.Light;
         if (s.ControlAllowed) StartGamepads(s, viewer);
@@ -796,6 +809,54 @@ internal sealed class TrayApp : ApplicationContext
         }
     }
 
+    // ================= Controle de programas de administrador =================
+
+    private void EnableElevatedBridge()
+    {
+        Input.ElevatedInputBridge.Enable();
+        if (Input.ElevatedInputBridge.Current is { } b)
+            b.ConnectionChanged += _ => Ui(Changed);
+    }
+
+    /// <summary>
+    /// Liga/desliga o controle de janelas de administrador. Ligar cria (com UAC) a tarefa que abre o
+    /// auxiliar elevado; desligar fecha o auxiliar e remove a tarefa (também com UAC).
+    /// </summary>
+    public async Task<(bool Ok, string? Message)> SetElevatedControlAsync(bool enable)
+    {
+        if (enable)
+        {
+            if (!Input.ElevatedInput.TrustedLocation)
+                return (false, "Esta opção só funciona no TransLocal instalado (pelo instalador, em Arquivos de Programas). " +
+                               "Assim nenhum outro programa consegue trocar o executável que roda como administrador.");
+            string sid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value ?? "";
+            var (ok, error) = await Task.Run(() =>
+            {
+                bool r = Input.ElevatedInput.RunElevated($"--register-elevated-input {sid}", out var e);
+                return (r, e);
+            });
+            if (!ok) return (false, $"Não foi possível ativar: {error}.");
+            Settings.ElevatedControl = true;
+            Settings.Save();
+            EnableElevatedBridge();
+            Log.Info("Controle de programas de administrador ativado");
+            Changed();
+            return (true, null);
+        }
+        else
+        {
+            Input.ElevatedInputBridge.Disable(stopHelper: true);
+            Settings.ElevatedControl = false;
+            Settings.Save();
+            Changed();
+            // Remove a tarefa para nada ficar rodando como administrador; se o UAC for recusado,
+            // o auxiliar só volta no próximo logon e fica esperando sem fazer nada.
+            await Task.Run(() => Input.ElevatedInput.RunElevated("--unregister-elevated-input", out _));
+            Log.Info("Controle de programas de administrador desativado");
+            return (true, null);
+        }
+    }
+
     // ================= Saída =================
 
     public void Exit()
@@ -816,6 +877,8 @@ internal sealed class TrayApp : ApplicationContext
             try { Task.Run(async () => await hdmi.DisposeAsync()).Wait(3000); } catch { }
         }
         StopReceiver();
+        // O auxiliar elevado continua aberto (aguardando a próxima vez que o TransLocal abrir).
+        Input.ElevatedInputBridge.Disable(stopHelper: false);
         try { ControllerService.Shutdown(); } catch { }
         _hotkeys.Dispose();
         _updateTimer?.Dispose();

@@ -197,7 +197,21 @@ internal sealed class SurfaceView : Control
             e.Graphics.FillRectangle(bg, box);
             TextRenderer.DrawText(e.Graphics, text, Font, new Point(box.X + 8, box.Y + 4), Color.White);
         }
+        if (Notice is { Length: > 0 } notice)
+        {
+            int maxW = Math.Max(200, Width - 80);
+            var flags = TextFormatFlags.WordBreak | TextFormatFlags.HorizontalCenter;
+            var size = TextRenderer.MeasureText(e.Graphics, notice, Font, new Size(maxW, 0), flags);
+            var box = new Rectangle((Width - size.Width) / 2 - 12, 12, size.Width + 24, size.Height + 14);
+            using var bg = new SolidBrush(Color.FromArgb(225, 120, 72, 0));
+            e.Graphics.FillRectangle(bg, box);
+            TextRenderer.DrawText(e.Graphics, notice, Font, new Rectangle(box.X + 12, box.Y + 7, size.Width, size.Height), Color.White, flags);
+        }
     }
+
+    /// <summary>Aviso em destaque no topo da imagem (null esconde).</summary>
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public string? Notice { get; set; }
 
     // ---------------- Mouse ----------------
 
@@ -315,6 +329,7 @@ internal sealed class SurfaceView : Control
                 Keys.S => "stats",
                 Keys.M => "mouse-mode",
                 Keys.A => "audio-next",
+                Keys.D => "diag",
                 _ => null,
             };
         }
@@ -439,7 +454,9 @@ internal sealed class ViewerForm : Form
             AudioOutput.Changed += OnAudioOutputsChanged;
             HandleCreated += (_, _) => UpdateAudioButton();
         }
-        flow.Controls.AddRange(new Control[] { _btnControl, _btnStats, _btnFull, btnClose });
+        _btnDiag = BarButton("Diagnóstico", (_, _) => ToggleDiag());
+        _btnDiag.Visible = false;
+        flow.Controls.AddRange(new Control[] { _btnControl, _btnStats, _btnDiag, _btnFull, btnClose });
         _bar.Controls.Add(_barTitle);
         _bar.Controls.Add(flow);
 
@@ -524,8 +541,7 @@ internal sealed class ViewerForm : Form
         {
             BeginInvoke(() =>
             {
-                _view.Overlay = _showStats ? _lastStats : null;
-                if (_showStats) _view.Invalidate();
+                if (_showStats || _showDiag) RefreshOverlay();
             });
         }
         catch (InvalidOperationException) { }
@@ -553,6 +569,7 @@ internal sealed class ViewerForm : Form
         _barTimer.Stop();
         _barTimer.Dispose();
         AudioOutput.Changed -= OnAudioOutputsChanged;
+        _noticeTimer?.Dispose();
         base.OnFormClosed(e);
         if (!_closingFromCode) UserClosed?.Invoke();
     }
@@ -568,7 +585,95 @@ internal sealed class ViewerForm : Form
             case "stats": ToggleStats(); break;
             case "mouse-mode": _view.ToggleForceAbsolute(); break;
             case "audio-next": if (_btnAudio is not null) NextAudioOutput(); break;
+            case "diag": ToggleDiag(); break;
         }
+    }
+
+    // ---------- Avisos e diagnóstico ----------
+
+    private System.Windows.Forms.Timer? _noticeTimer;
+    private Button? _btnDiag;
+    private bool _showDiag;
+    private Func<string[]>? _diagLines;
+    private Func<int>? _diagProblems;
+
+    /// <summary>Liga o painel de diagnóstico da sessão (linhas dos dois computadores).</summary>
+    public void AttachDiagnostics(Func<string[]> lines, Func<int> problems)
+    {
+        _diagLines = lines;
+        _diagProblems = problems;
+        if (_btnDiag is not null) _btnDiag.Visible = true;
+        UpdateDiagButton();
+    }
+
+    /// <summary>Linhas novas chegaram (qualquer thread).</summary>
+    public void DiagnosticsUpdated()
+    {
+        if (!IsHandleCreated || IsDisposed) return;
+        try
+        {
+            BeginInvoke(() =>
+            {
+                UpdateDiagButton();
+                if (_showDiag) RefreshOverlay();
+            });
+        }
+        catch (InvalidOperationException) { }
+    }
+
+    private void UpdateDiagButton()
+    {
+        if (_btnDiag is null || _diagProblems is null) return;
+        int n = _diagProblems();
+        string text = n > 0 ? $"Diagnóstico ⚠ {n}" : "Diagnóstico";
+        if (_btnDiag.Text != text) _btnDiag.Text = text;
+        _btnDiag.ForeColor = n > 0 ? Color.FromArgb(255, 200, 120) : Color.White;
+    }
+
+    private void ToggleDiag()
+    {
+        if (_diagLines is null) return;
+        _showDiag = !_showDiag;
+        RefreshOverlay();
+    }
+
+    private void RefreshOverlay()
+    {
+        var parts = new List<string>();
+        if (_showStats && _lastStats is not null) parts.Add(_lastStats);
+        if (_showDiag && _diagLines is not null)
+        {
+            var lines = _diagLines();
+            parts.Add("Diagnóstico desta transmissão (Ctrl+Alt+Shift+D fecha) — salvo em %LOCALAPPDATA%\\TransLocal\\diagnostico");
+            if (lines.Length == 0) parts.Add("  nada registrado ainda");
+            foreach (var l in lines) parts.Add("  " + (l.Length > 160 ? l[..160] + "…" : l));
+        }
+        _view.Overlay = parts.Count == 0 ? null : string.Join(Environment.NewLine, parts);
+        _view.Invalidate();
+    }
+
+    /// <summary>Mostra um aviso do outro computador no topo da imagem por 15 s (qualquer thread).</summary>
+    public void ShowNotice(string text)
+    {
+        if (!IsHandleCreated || IsDisposed) return;
+        try
+        {
+            BeginInvoke(() =>
+            {
+                _view.Notice = text;
+                _view.Invalidate();
+                _noticeTimer?.Dispose();
+                _noticeTimer = new System.Windows.Forms.Timer { Interval = 15_000 };
+                _noticeTimer.Tick += (_, _) =>
+                {
+                    _noticeTimer?.Stop();
+                    _view.Notice = null;
+                    _view.Invalidate();
+                };
+                _noticeTimer.Start();
+            });
+        }
+        catch (InvalidOperationException) { }
     }
 
     // ---------- Saída de som ----------
@@ -661,9 +766,8 @@ internal sealed class ViewerForm : Form
     private void ToggleStats()
     {
         _showStats = !_showStats;
-        _view.Overlay = _showStats ? _lastStats : null;
         UpdateStatsButton();
-        _view.Invalidate();
+        RefreshOverlay();
     }
 
     private void UpdateStatsButton() => _btnStats.Text = _showStats ? "Estatísticas: sim" : "Estatísticas: não";

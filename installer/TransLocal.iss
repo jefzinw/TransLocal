@@ -66,6 +66,8 @@ Filename: "{app}\{#AppExe}"; Parameters: "--updated --minimized"; Flags: nowait 
 [UninstallRun]
 Filename: "{app}\{#AppExe}"; Parameters: "--cleanup"; Flags: runhidden; RunOnceId: "RemoverInicio"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; RunOnceId: "RemoverFirewall"
+; Tarefa do controle de programas de administrador (se o usuário ativou). O auxiliar é fechado junto com o app.
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""TransLocal Controle Elevado"" /F"; Flags: runhidden; RunOnceId: "RemoverControleElevado"
 
 [Code]
 function SupportsQuit(const FileName: String): Boolean;

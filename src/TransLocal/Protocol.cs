@@ -56,6 +56,8 @@ internal enum MsgType : byte
     GamepadFeedback = 0x32,
     CursorMode = 0x33,      // transmissor → receptor: [1 = cursor preso por um jogo (mouse relativo)]
     Info = 0x34,            // receptor → transmissor: texto para o registro (ex.: controles conectados)
+    Notice = 0x35,          // transmissor → receptor: aviso para mostrar na tela (UTF-8)
+    Diag = 0x36,            // os dois sentidos: linhas do registro do outro lado (UTF-8, separadas por \n)
     Ping = 0x40,
     Pong = 0x41,
     Bye = 0x50,

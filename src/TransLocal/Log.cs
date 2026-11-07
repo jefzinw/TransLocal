@@ -15,12 +15,18 @@ internal static class Log
     /// <summary>Quando true, também escreve no console (modos --bench/--selftest).</summary>
     public static bool Echo { get; set; }
 
-    public static void Init()
+    /// <summary>
+    /// Cada linha escrita por este computador: (nível, mensagem). Chamado na thread de quem registrou;
+    /// quem assina deve apenas enfileirar. Linhas vindas do outro computador não passam por aqui.
+    /// </summary>
+    public static event Action<string, string>? Written;
+
+    public static void Init(string fileName = "TransLocal.log")
     {
         try
         {
             Directory.CreateDirectory(DataDirectory);
-            _path = Path.Combine(DataDirectory, "TransLocal.log");
+            _path = Path.Combine(DataDirectory, fileName);
             var fi = new FileInfo(_path);
             if (fi.Exists && fi.Length > 2 * 1024 * 1024)
             {
@@ -43,9 +49,21 @@ internal static class Log
     public static void Error(string message, Exception? ex = null) =>
         Write("ERRO", ex is null ? message : $"{message} :: {ex}");
 
+    /// <summary>Linha que veio do outro computador: vai para o arquivo, sem ser reenviada.</summary>
+    public static void Relayed(string line) => WriteLine(line);
+
     private static void Write(string level, string message)
     {
-        var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{level}] {message}";
+        WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{level}] {message}");
+        var h = Written;
+        if (h is not null)
+        {
+            try { h(level, message); } catch { }
+        }
+    }
+
+    private static void WriteLine(string line)
+    {
         if (Echo)
         {
             try { Console.WriteLine(line); } catch { }

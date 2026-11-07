@@ -56,6 +56,29 @@ internal static class Program
             return 0;
         }
 
+        // ---- Controle de programas de administrador ----
+        if (Has("--elevated-input"))
+        {
+            // Auxiliar elevado: registro próprio (dois processos no mesmo arquivo se atrapalham).
+            Log.Init("TransLocal-administrador.log");
+            return Input.ElevatedInput.RunHelper();
+        }
+        if (Has("--register-elevated-input")) return Input.ElevatedInput.Register(Arg("--register-elevated-input"), Arg("--with-test-target"));
+        if (Has("--unregister-elevated-input")) return Input.ElevatedInput.Unregister();
+#if DEBUG
+        if (Has("--elevated-target")) return DevTools.ElevatedTarget(Arg("--elevated-target")!);
+        if (Has("--pipe-test"))
+        {
+            Log.Echo = Native.AttachConsole(Native.ATTACH_PARENT_PROCESS);
+            return DevTools.PipeTest();
+        }
+        if (Has("--elevated-test"))
+        {
+            Log.Echo = Native.AttachConsole(Native.ATTACH_PARENT_PROCESS);
+            return DevTools.ElevatedTest();
+        }
+#endif
+
         // ---- Diagnóstico ----
         if (Has("--bench") || Has("--selftest") || Has("--ui-screenshot") || Has("--gamepad-test") || Has("--update-test") || Has("--audio-test"))
         {

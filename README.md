@@ -73,6 +73,7 @@ Exemplo: o notebook exibe a tela do PC e você quer jogar ou usar o PC pelo note
 - Os controles só são enviados enquanto a janela de exibição está em primeiro plano. **Ctrl+Alt+Shift+C** solta/retoma o controle.
 - **Mouse em jogos:** quando um jogo prende ou esconde o cursor (câmera em 1ª/3ª pessoa), o TransLocal passa sozinho a enviar **movimento relativo** (como um mouse ligado direto no PC) e prende o cursor na janela de exibição. **Ctrl+Alt+Shift+M** força o modo normal se precisar. O teclado é enviado pelo código físico das teclas (o que os jogos leem), e todas as teclas são soltas quando a janela perde o foco.
 - **Som:** o som recebido toca na saída padrão do Windows e **acompanha a troca** — ligou um fone Bluetooth ou USB durante a transmissão, o som passa para ele sozinho. Para escolher outra saída, use o botão **Som** na barra da janela de exibição (leve o mouse ao topo) ou **Ctrl+Alt+Shift+A**; a escolha fica salva e, se aquele dispositivo estiver desligado, o som volta ao padrão.
+- **Programas de administrador (Gerenciador de Tarefas, jogos com “Executar como administrador”):** o Windows não deixa um programa comum enviar mouse e teclado para eles. No PC, aba **Transmitir**, marque *Controlar também programas abertos como administrador* — o Windows pede permissão uma vez e o TransLocal cria a tarefa “TransLocal Controle Elevado”, que abre um auxiliar mínimo com privilégio de administrador no logon. O auxiliar só aplica os comandos de mouse/teclado que o TransLocal desta sessão manda por um canal local (confere que é o mesmo executável instalado); a parte de rede continua sem privilégios. Só funciona na versão instalada. Desmarcar remove a tarefa. Sem essa opção, quando um programa de administrador fica em primeiro plano, a janela de exibição mostra um aviso explicando o bloqueio.
 - Sem a Xbox Game Bar instalada, o Windows mostraria a janela “Obter um aplicativo para abrir este link ‘ms-gamebar’” a cada controle conectado; o TransLocal registra um manipulador silencioso para o seu usuário (desfeito na desinstalação, ou com `TransLocal.exe --restore-gamebar-prompt`).
 
 ### Atalhos
@@ -86,6 +87,7 @@ Exemplo: o notebook exibe a tela do PC e você quer jogar ou usar o PC pelo note
 | Ctrl+Alt+Shift+C | janela de exibição | liga/desliga o controle do outro computador |
 | Ctrl+Alt+Shift+M | janela de exibição | força o mouse normal (desliga o modo relativo de jogos) |
 | Ctrl+Alt+Shift+A | janela de exibição | troca a saída de som (padrão do Windows → cada saída ligada) |
+| Ctrl+Alt+Shift+D | janela de exibição | mostra/esconde o diagnóstico ao vivo da transmissão |
 | Ctrl+Alt+Shift+Q | janela de exibição | fecha |
 
 ### Acesso remoto (de fora de casa) com aprovação pelo celular
@@ -109,6 +111,7 @@ Exemplo: você está fora com o notebook e quer usar o PC de casa, que ficou lig
 - **Acesso remoto** é desligado por padrão, só aceita aparelhos pareados (não permite parear de fora) e cada acesso precisa ser aprovado (celular, tela do PC ou código de autorização). Códigos não podem ser reutilizados; 5 códigos errados bloqueiam por 10 minutos; endereços com 5 conexões inválidas são bloqueados por 5 minutos.
 - O controle do PC (mouse, teclado, controles) continua exigindo *Permitir que o outro computador use…* no PC.
 - Aparelhos pareados podem ser removidos em *Configurações e ajuda › Aparelhos pareados*.
+- O controle de programas de administrador é opcional e desligado por padrão. Quando ligado, só o executável instalado em *Arquivos de Programas* (que programas comuns não conseguem alterar) roda elevado, e ele só aceita comandos de entrada do próprio TransLocal na mesma sessão do Windows. Ressalva: como em qualquer ferramenta de acesso remoto com esse recurso, um programa malicioso que já esteja rodando na sua conta poderia tentar usá-lo; desligue a opção se não precisar.
 
 ### Usar como segundo monitor (área estendida)
 
@@ -122,11 +125,13 @@ O TransLocal transmite um monitor existente. Para estender a área de trabalho, 
 - **Imagem preta em parte da tela:** vídeos protegidos (DRM) não podem ser capturados pelo Windows.
 - **Controle de jogo não funciona:** na barra da janela de exibição (leve o mouse ao topo) aparece o estado dos controles. “Falta o driver no outro PC” → instale o suporte a controles no PC. Na aba *Receber* aparece a lista de controles detectados neste computador; se o seu não aparecer, confira o pareamento Bluetooth; se aparecer como “não reconhecido”, use **Configurar botões**.
 - **Imagem lenta ou travando no computador que exibe:** marque *Pedir transmissão leve* nele e, no transmissor, deixe *Resolução enviada: Automática*.
-- **Controle não funciona em janelas de administrador:** o Windows bloqueia entrada simulada em programas elevados, a não ser que o TransLocal também seja executado como administrador. A tela de UAC e a tela de bloqueio não podem ser transmitidas.
+- **Perco o controle quando abro o Gerenciador de Tarefas, ou um jogo não responde ao teclado/mouse:** o programa está rodando como administrador (o Gerenciador de Tarefas sempre roda; jogos com “Executar como administrador” marcado nas propriedades também). Ative *Controlar também programas abertos como administrador* na aba **Transmitir** do PC, ou desmarque “Executar como administrador” nas propriedades do jogo (*Compatibilidade*). A tela de UAC e a tela de bloqueio não podem ser transmitidas nem controladas.
+- **Jogo em tela cheia aparece congelado ou preto no notebook:** a partir da 1.4 a captura aceita jogos em 10 bits/HDR. Se mesmo assim o jogo bloquear a captura (tela cheia exclusiva), a janela de exibição avisa; no jogo, troque o modo de tela para **Janela sem bordas** (Borderless).
 - **Mouse “preso” para um lado em jogos:** o modo relativo entra quando o jogo esconde/prende o cursor; se o jogo não fizer isso, use **Ctrl+Alt+Shift+M**. Jogos com anti-cheat que bloqueiam entrada simulada podem ignorar o controle remoto.
 - **“Não está pareado” ao pedir acesso de fora:** o pareamento precisa ser feito antes, em casa, na mesma rede.
 - **Celular não recebe os pedidos:** confira no app se aparece “Conectado a …”; o celular precisa alcançar o PC (mesma rede ou Tailscale) e ter permissão de funcionar em segundo plano. Sem isso, use o código de autorização.
 - **Registros:** aba *Configurações e ajuda › Abrir pasta de registros* (`%LOCALAPPDATA%\TransLocal`).
+- **Diagnóstico ao vivo:** durante a transmissão, os dois computadores trocam (pela mesma conexão criptografada, uma vez por segundo e em mensagens pequenas) os avisos e erros do registro e um resumo do estado — método de captura, programa em primeiro plano, se ele roda como administrador ou em tela cheia, modo do mouse. **Ctrl+Alt+Shift+D** mostra isso na janela de exibição, e cada sessão fica salva nos dois computadores em `%LOCALAPPDATA%\TransLocal\diagnostico`. Para relatar um problema: *Configurações e ajuda › Relatar um problema no GitHub…* abre a página do GitHub com o resumo da última sessão (sem endereços IP nem o nome do usuário) para você revisar e enviar. Dá para desligar o compartilhamento na mesma aba.
 
 ## Como funciona
 

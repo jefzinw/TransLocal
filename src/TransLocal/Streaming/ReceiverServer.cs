@@ -244,6 +244,7 @@ internal sealed class ReceiverServer : IDisposable
                 Light = prefs.Light,
             });
             Log.Info($"Recebendo de {hello.Name} ({conn.RemoteEndPoint}) {hello.Width}×{hello.Height}, áudio={hello.Audio}, controle={hello.Control}, controles de jogo={hello.Gamepads ?? "?"}");
+            session.StartDiagnostics();
             try { SessionStarted?.Invoke(session); } catch (Exception ex) { Log.Error("Erro ao abrir exibição", ex); }
 
             string? reason = session.Run();
@@ -304,6 +305,12 @@ internal sealed class ReceiverSession
     /// <summary>Vibração pedida pelo jogo no outro computador: (slot, motor grande, motor pequeno).</summary>
     public event Action<int, byte, byte>? GamepadFeedback;
 
+    /// <summary>Aviso do transmissor para mostrar na tela (programa de administrador, tela cheia exclusiva…).</summary>
+    public event Action<string>? Notice;
+
+    /// <summary>Diagnóstico da sessão (linhas dos dois lados), enquanto ela durar.</summary>
+    public DiagRelay? Diag { get; private set; }
+
     /// <summary>O transmissor avisou que um jogo prendeu (true) ou soltou (false) o cursor.</summary>
     public event Action<bool>? CursorModeChanged;
     public bool RemoteCursorCaptured { get; private set; }
@@ -359,6 +366,13 @@ internal sealed class ReceiverSession
                         RemoteCursorCaptured = m.Span[0] != 0;
                         CursorModeChanged?.Invoke(RemoteCursorCaptured);
                         break;
+                    case MsgType.Notice when m.Length > 0:
+                        string notice = System.Text.Encoding.UTF8.GetString(m.Span[..Math.Min(m.Length, 1000)]);
+                        Notice?.Invoke(notice);
+                        break;
+                    case MsgType.Diag:
+                        Diag?.Received(m.Span);
+                        break;
                     case MsgType.GamepadFeedback when m.Length >= 3:
                         GamepadFeedback?.Invoke(m.Span[0], m.Span[1], m.Span[2]);
                         break;
@@ -381,7 +395,18 @@ internal sealed class ReceiverSession
         finally
         {
             audio?.Dispose();
+            Diag?.Dispose();
         }
+    }
+
+    /// <summary>Começa o diagnóstico compartilhado (chamado quando a exibição é aceita).</summary>
+    public void StartDiagnostics() =>
+        Diag ??= new DiagRelay(_hello.Name, "exibindo", DiagRelay.ShareEnabled ? SendDiag : null);
+
+    private void SendDiag(byte[] payload)
+    {
+        if (_closing) return;
+        try { _conn.Send(MsgType.Diag, payload); } catch { }
     }
 
     public void SendInput(byte[] payload)

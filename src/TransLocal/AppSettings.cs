@@ -50,6 +50,12 @@ internal sealed class AppSettings
     public bool SenderAudio { get; set; } = true;
     public bool SenderAllowControl { get; set; }
 
+    /// <summary>Usa o auxiliar elevado para controlar programas abertos como administrador.</summary>
+    public bool ElevatedControl { get; set; }
+
+    /// <summary>Compartilha o registro de erros entre os dois computadores durante a transmissão.</summary>
+    public bool ShareDiagnostics { get; set; } = true;
+
     /// <summary>"auto" (tela do receptor), "original" ou limite como "1280x720".</summary>
     public string SenderResolution { get; set; } = "auto";
     public string? LastReceiverAddress { get; set; }

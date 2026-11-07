@@ -59,6 +59,10 @@ internal sealed partial class MainForm : Form
     private readonly ComboBox _cmbQuality = new();
     private readonly CheckBox _chkSendAudio = new();
     private readonly CheckBox _chkAllowControl = new();
+    private readonly CheckBox _chkElevated = new();
+    private readonly Label _elevatedStatus = new();
+    private readonly CheckBox _chkShareDiag = new();
+    private bool _elevatedBusy;
     private readonly Label _gpStatus = new();
     private readonly Button _btnGpInstall = new();
     private readonly Button _btnSend = new();
@@ -501,6 +505,31 @@ internal sealed partial class MainForm : Form
         _chkAllowControl.CheckedChanged += (_, _) => SaveSetting(s => s.SenderAllowControl = _chkAllowControl.Checked);
         Add(t, _chkAllowControl);
 
+        SetupCheck(_chkElevated, "Controlar também programas abertos como administrador (Gerenciador de Tarefas, alguns jogos)");
+        _chkElevated.Margin = new Padding(20, 0, 0, 0);
+        _chkElevated.CheckedChanged += async (_, _) =>
+        {
+            if (_loading || _elevatedBusy) return;
+            _elevatedBusy = true;
+            _chkElevated.Enabled = false;
+            bool want = _chkElevated.Checked;
+            _elevatedStatus.Text = want ? "Aceite o pedido de permissão do Windows…" : "Desativando…";
+            var (ok, message) = await _app.SetElevatedControlAsync(want);
+            _loading = true;
+            _chkElevated.Checked = _app.Settings.ElevatedControl;
+            _loading = false;
+            _chkElevated.Enabled = true;
+            _elevatedBusy = false;
+            UpdateElevatedStatus();
+            if (!ok && message is not null)
+                MessageBox.Show(this, message, "Controle de programas de administrador", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        };
+        Add(t, _chkElevated);
+        SetupStatus(_elevatedStatus);
+        _elevatedStatus.ForeColor = Muted;
+        _elevatedStatus.Margin = new Padding(40, 0, 0, 6);
+        Add(t, _elevatedStatus);
+
         _gpStatus.AutoSize = true;
         _gpStatus.Margin = new Padding(20, 8, 10, 0);
         _gpStatus.Text = "Controles de jogo: verificando…";
@@ -641,6 +670,36 @@ internal sealed partial class MainForm : Form
                     "instale no computador que transmite um driver de monitor virtual (Indirect Display Driver, ex.: “Virtual Display Driver”), " +
                     "ajuste-o em Configurações > Sistema > Tela e escolha esse monitor na aba “Transmitir”. Com a placa de captura HDMI isso já acontece naturalmente."));
 
+        Add(t, Heading("Diagnóstico"));
+        SetupCheck(_chkShareDiag, "Compartilhar o registro de erros entre os dois computadores durante a transmissão");
+        _chkShareDiag.CheckedChanged += (_, _) =>
+        {
+            SaveSetting(s => s.ShareDiagnostics = _chkShareDiag.Checked);
+            if (!_loading) Streaming.DiagRelay.ShareEnabled = _chkShareDiag.Checked;
+        };
+        Add(t, _chkShareDiag);
+        var btnDiag = new Button();
+        SetupButton(btnDiag, "Abrir relatórios de diagnóstico");
+        btnDiag.Click += (_, _) =>
+        {
+            System.IO.Directory.CreateDirectory(Streaming.DiagFiles.Directory);
+            SystemIntegration.OpenFolder(Streaming.DiagFiles.Directory);
+        };
+        var btnIssue = new Button();
+        SetupButton(btnIssue, "Relatar um problema no GitHub…");
+        btnIssue.Click += (_, _) =>
+        {
+            if (MessageBox.Show(this,
+                    "Vai abrir uma página do GitHub com um resumo da última transmissão (avisos e erros dos dois computadores; " +
+                    "endereços IP e o nome do usuário são removidos). Nada é enviado até você revisar e clicar em “Submit” no site.\n\nContinuar?",
+                    "Relatar um problema", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) == DialogResult.OK)
+                SystemIntegration.OpenUrl(Streaming.DiagFiles.IssueUrl(Updater.Repository));
+        };
+        Add(t, Row(btnDiag, btnIssue));
+        Add(t, Note("Durante a transmissão, cada computador envia ao outro (pela mesma conexão criptografada, uma vez por segundo) os avisos e erros " +
+                    "do registro e um resumo do estado (captura, programa em primeiro plano, controle). Fica salvo nos dois, um arquivo por sessão. " +
+                    "Na janela de exibição, Ctrl+Alt+Shift+D mostra o diagnóstico ao vivo. Nada sai dos seus computadores sem você mandar."));
+
         var btnLogs = new Button();
         SetupButton(btnLogs, "Abrir pasta de registros");
         btnLogs.Click += (_, _) => SystemIntegration.OpenFolder(Log.DataDirectory);
@@ -669,6 +728,8 @@ internal sealed partial class MainForm : Form
             _chkStats.Checked = s.ShowStats;
             _chkSendAudio.Checked = s.SenderAudio;
             _chkAllowControl.Checked = s.SenderAllowControl;
+            _chkElevated.Checked = s.ElevatedControl;
+            _chkShareDiag.Checked = s.ShareDiagnostics;
             _chkHdmiFullscreen.Checked = s.HdmiFullscreen;
             _txtName.Text = s.DeviceName;
             _chkAutoUpdate.Checked = s.AutoUpdate;
@@ -955,9 +1016,24 @@ internal sealed partial class MainForm : Form
 
     // ================= Estado =================
 
+    private void UpdateElevatedStatus()
+    {
+        if (_elevatedBusy) return;
+        var bridge = Input.ElevatedInputBridge.Current;
+        _elevatedStatus.Text =
+            !Input.ElevatedInput.TrustedLocation && !_app.Settings.ElevatedControl
+                ? "Disponível na versão instalada (instalador). O Windows pede permissão uma vez."
+            : !_app.Settings.ElevatedControl
+                ? "Desligado: o Windows bloqueia mouse e teclado vindos do outro computador em janelas de administrador."
+            : bridge?.IsConnected == true
+                ? "Ativo: o auxiliar de administrador está ligado."
+                : "Ativado — aguardando o auxiliar de administrador iniciar…";
+    }
+
     private void RefreshState()
     {
         if (IsDisposed) return;
+        UpdateElevatedStatus();
         _updateStatus.Text = _app.UpdateStatus;
         RefreshRemoteState();
 
