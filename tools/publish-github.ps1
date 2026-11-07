@@ -12,8 +12,14 @@ param(
     [string]$Name = 'TransLocal',
     [string]$Version = '1.0.0',
     [string]$Changes = '',
+    [string]$ChangesFile = '',
     [switch]$SkipRelease
 )
+
+if ($ChangesFile -and -not $Changes) {
+    if (-not (Test-Path $ChangesFile)) { Write-Host "Arquivo de novidades não encontrado: $ChangesFile" -ForegroundColor Red; exit 1 }
+    $Changes = [IO.File]::ReadAllText((Resolve-Path $ChangesFile))
+}
 
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
