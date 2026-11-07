@@ -7,7 +7,7 @@ O executável do TransLocal inclui os componentes abaixo, distribuídos sob as l
 | .NET Runtime e Windows Forms | 10.0 | MIT | https://github.com/dotnet/runtime · https://github.com/dotnet/winforms |
 | NAudio (Core, Wasapi, WinMM, Midi) | 3.3.0 | MIT | https://github.com/naudio/NAudio |
 | FlashCap (FlashCap, FlashCap.Core) | 1.12.0 | Apache-2.0 | https://github.com/kekyo/FlashCap |
-| Vortice.Windows (Direct3D11, DXGI, DirectX, MediaFoundation) | 3.8.3 | MIT | https://github.com/amerkoleci/Vortice.Windows |
+| Vortice.Windows (Direct3D11, DXGI, DirectX, MediaFoundation, Direct2D1/DirectWrite) | 3.8.3 | MIT | https://github.com/amerkoleci/Vortice.Windows |
 | Vortice.Mathematics | 2.1.0 | MIT | https://github.com/amerkoleci/Vortice.Mathematics |
 | SharpGen.Runtime / SharpGen.Runtime.COM | 2.4.2-beta | MIT | https://github.com/SharpGenTools/SharpGenTools |
 | Nefarius.ViGEm.Client | 1.21.256 | MIT | https://github.com/ViGEm/ViGEm.NET |

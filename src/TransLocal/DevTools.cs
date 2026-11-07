@@ -461,6 +461,296 @@ internal static class DevTools
     /// --codec-test: 180 quadros 1366×768 com movimento (tela atual + faixa e quadro andando, como num jogo),
     /// codificados em H.264 e decodificados de volta. Mede tempo, taxa a 60 q/s, fidelidade e compara com JPEG.
     /// </summary>
+    /// <summary>
+    /// Caminho da placa de vídeo de ponta a ponta: codifica, decodifica (DXVA) e mostra numa janela de verdade pela
+    /// cadeia de troca, sem a imagem passar pelo processador; depois fotografa a tela (composição do Windows) e
+    /// compara com o original. Também confere os textos por cima, o caminho BGRA e o redimensionamento.
+    /// </summary>
+    public static unsafe int GpuTest()
+    {
+        int failures = 0;
+        void Check(bool ok, string what)
+        {
+            Log.Info($"GPUTEST {(ok ? "OK  " : "FALHOU")} {what}");
+            if (!ok) failures++;
+        }
+        const int w = 960, h = 540, fps = 60, frames = 120;
+        // Janela fora da área visível: o teste não aparece por cima de nada (pode haver um jogo transmitindo).
+        var hidden = SystemInformation.VirtualScreen;
+        var baseFrame = new uint[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                baseFrame[y * w + x] = 0xFF000000u | (uint)((x * 255 / w) << 16) | (uint)((y * 255 / h) << 8) | (uint)(((x ^ y) >> 2) & 0xFF);
+
+        using var gpu = GpuDevice.TryCreate();
+        Check(gpu is not null, $"dispositivo de vídeo: {gpu?.AdapterName}");
+        if (gpu is null) return 1;
+        {
+            var h264Vld = new Guid("1b81be68-a0c7-11d3-b984-00c04f2e73c5");
+            uint count = gpu.VideoDevice.VideoDecoderProfileCount;
+            bool has = false;
+            for (uint i = 0; i < count; i++)
+                if (gpu.VideoDevice.GetVideoDecoderProfile(i) == h264Vld) has = true;
+            bool nv12 = false;
+            try { nv12 = gpu.VideoDevice.CheckVideoDecoderFormat(h264Vld, Vortice.DXGI.Format.NV12); } catch { }
+            Log.Info($"GPUTEST decodificação pela placa: {count} perfis, H.264 VLD={has}, saída NV12={nv12}");
+            foreach (uint fl in new[] { MF.ENUM_HARDWARE | MF.ENUM_ASYNC | MF.ENUM_SORT, MF.ENUM_HARDWARE | MF.ENUM_SYNC | MF.ENUM_ASYNC | MF.ENUM_SORT, MF.ENUM_SYNC | MF.ENUM_SORT })
+            {
+                var list = MF.Enum(Vortice.MediaFoundation.TransformCategoryGuids.VideoDecoder, fl, MF.H264, MF.NV12);
+                Log.Info($"GPUTEST decodificadores H.264 (flags 0x{fl:X}): {string.Join(", ", list.Select(MF.NameOf))}");
+                foreach (var a in list) a.Dispose();
+            }
+        }
+        using var form = new Form
+        {
+            FormBorderStyle = FormBorderStyle.None, StartPosition = FormStartPosition.Manual, ShowInTaskbar = false,
+            Bounds = new Rectangle(hidden.Right + 200, hidden.Bottom + 200, w, h), BackColor = Color.Black, Text = "TransLocal teste de vídeo",
+        };
+        _ = form.Handle; // só cria a janela: nunca aparece nem tira o foco de outro programa
+        Application.DoEvents();
+        using var presenter = GpuPresenter.TryCreate(gpu, form.Handle, form.ClientSize.Width, form.ClientSize.Height);
+        Check(presenter is not null, "cadeia de troca DXGI (modelo flip) na janela");
+        if (presenter is null) return 1;
+        presenter.SetFont("Segoe UI", 15);
+        string? stats = null, notice = null;
+        presenter.Overlay = () => new OverlayText(stats, notice, "Aguardando imagem…");
+        presenter.Redraw();
+
+        int bitrate = H264Encoder.BitrateFor(w, h, fps, 75);
+        using var enc = H264Encoder.TryCreate(w, h, fps, bitrate);
+        using var dec = H264Decoder.TryCreate(hardware: true, gpu, w, h);
+        Check(enc is not null && dec is not null, $"codificador {enc?.Name} • decodificador {dec?.Name} ({(dec?.Hardware == true ? "placa de vídeo" : "processador")}) no mesmo dispositivo");
+        if (enc is null || dec is null) return 1;
+        Native.timeBeginPeriod(1);
+        using var surface = new FrameSurface();
+        var frame = new uint[w * h];
+        var stream = new List<byte[]>();
+        int decoded = 0, onGpu = 0, encoded = 0;
+        long decTicks = 0, maxTicks = 0;
+        var sw = new Stopwatch();
+        fixed (uint* f = frame)
+        {
+            void Feed(byte[]? data)
+            {
+                if (data is null) return;
+                encoded++;
+                stream.Add(data);
+                sw.Restart();
+                bool ok = dec.Decode(data, w, h, surface, presenter, out bool err);
+                long t = sw.ElapsedTicks;
+                decTicks += t;
+                maxTicks = Math.Max(maxTicks, t);
+                if (ok) decoded++;
+                if (ok && dec.LastOnGpu) onGpu++;
+                if (err) Log.Info("GPUTEST erro de decodificação");
+            }
+            for (int i = 0; i < frames; i++)
+            {
+                int shift = (i * 7) % w;
+                for (int y = 0; y < h; y++)
+                    fixed (uint* src = &baseFrame[y * w])
+                    {
+                        Buffer.MemoryCopy(src + shift, f + (long)y * w, (w - shift) * 4L, (w - shift) * 4L);
+                        Buffer.MemoryCopy(src, f + (long)y * w + (w - shift), shift * 4L, shift * 4L);
+                    }
+                Feed(enc.Encode((IntPtr)f, w * 4, i == 0, out _));
+                if (enc.Pending) { Thread.Sleep(1); Feed(enc.Poll(out _)); }
+                if (i % 10 == 0) Application.DoEvents();
+            }
+            for (int k = 0; k < 50 && enc.Pending; k++) { Thread.Sleep(2); Feed(enc.Poll(out _)); }
+        }
+        double decMs = decTicks * 1000.0 / Stopwatch.Frequency / Math.Max(1, encoded);
+        double maxMs = maxTicks * 1000.0 / Stopwatch.Frequency;
+        Check(decoded >= encoded * 0.9 && encoded >= frames * 0.9, $"{decoded}/{encoded} quadros decodificados e exibidos");
+        Check(onGpu >= decoded * 0.9, $"{onGpu}/{decoded} quadros exibidos pela placa de vídeo (decodificação: {(dec.Hardware ? "placa de vídeo" : "processador — o Windows não liberou a placa")})");
+        Log.Info($"GPUTEST decodificação + exibição: {decMs:0.00} ms por quadro em média, pico {maxMs:0.0} ms");
+
+        // Comparação com o caminho antigo: conversão de cor no processador + redimensionamento GDI (HALFTONE) para uma
+        // tela de notebook 1366×768 — o que a 1.6 fazia a cada quadro.
+        foreach (bool fast in new[] { false, true })
+        using (var oldDec = H264Decoder.TryCreate(hardware: true, null, w, h))
+        using (var oldSurface = new FrameSurface { FastScaling = fast })
+        using (var target = new Bitmap(1366, 768, System.Drawing.Imaging.PixelFormat.Format32bppRgb))
+        using (var g = Graphics.FromImage(target))
+        {
+            long oldTicks = 0;
+            foreach (var data in stream)
+            {
+                sw.Restart();
+                if (oldDec!.Decode(data, w, h, oldSurface, out _))
+                {
+                    var hdc = g.GetHdc();
+                    try { oldSurface.Paint(hdc, new Rectangle(0, 0, 1366, 768)); }
+                    finally { g.ReleaseHdc(hdc); }
+                }
+                oldTicks += sw.ElapsedTicks;
+            }
+            double oldMs = oldTicks * 1000.0 / Stopwatch.Frequency / Math.Max(1, stream.Count);
+            Log.Info($"GPUTEST caminho antigo{(fast ? " (modo leve)" : "")} (cor no processador + GDI para 1366×768): {oldMs:0.00} ms por quadro × novo {decMs:0.00} ms");
+        }
+
+        // A imagem pronta para a tela é copiada da placa de vídeo logo antes de cada apresentação.
+        uint[]? shown = null;
+        presenter.BeforePresent = back =>
+        {
+            var d = back.Description;
+            var gpuDev = presenter.Device;
+            using var staging = gpuDev.Device.CreateTexture2D(new Vortice.Direct3D11.Texture2DDescription
+            {
+                Width = d.Width, Height = d.Height, MipLevels = 1, ArraySize = 1, Format = d.Format,
+                SampleDescription = new Vortice.DXGI.SampleDescription(1, 0), Usage = Vortice.Direct3D11.ResourceUsage.Staging,
+                CPUAccessFlags = Vortice.Direct3D11.CpuAccessFlags.Read,
+            });
+            gpuDev.Context.CopyResource(staging, back);
+            var map = gpuDev.Context.Map(staging, 0, Vortice.Direct3D11.MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+            try
+            {
+                int bw = (int)d.Width, bh = (int)d.Height;
+                var img = new uint[bw * bh];
+                for (int y = 0; y < bh; y++)
+                    fixed (uint* dst = &img[y * bw])
+                        Buffer.MemoryCopy((byte*)map.DataPointer + (long)y * map.RowPitch, dst, bw * 4L, bw * 4L);
+                shown = img;
+            }
+            finally { gpuDev.Context.Unmap(staging, 0); }
+        };
+
+        double Compare(uint[] reference, string png)
+        {
+            presenter.Redraw();
+            var img = shown ?? new uint[w * h];
+            using var bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+            var wr = bmp.LockBits(new Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.WriteOnly, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+            fixed (uint* src = img) Buffer.MemoryCopy(src, (void*)wr.Scan0, (long)w * h * 4, Math.Min((long)w * h, img.Length) * 4);
+            bmp.UnlockBits(wr);
+            bmp.Save(Path.Combine(Path.GetTempPath(), png));
+            var data = bmp.LockBits(new Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+            double mse = 0;
+            int n = 0;
+            try
+            {
+                for (int y = 0; y < h; y += 3)
+                {
+                    uint* row = (uint*)((byte*)data.Scan0 + (long)y * data.Stride);
+                    for (int x = 0; x < w; x += 3)
+                    {
+                        uint pa = reference[y * w + x], pb = row[x];
+                        for (int c = 8; c < 16; c += 8) // verde ≈ luminância (a cor fica em meia resolução no H.264, como no teste do codec)
+                        {
+                            int d = (int)((pa >> c) & 0xFF) - (int)((pb >> c) & 0xFF);
+                            mse += d * d;
+                        }
+                        n += 1;
+                    }
+                }
+            }
+            finally { bmp.UnlockBits(data); }
+            return mse <= 0 ? 99 : 10 * Math.Log10(255.0 * 255.0 / (mse / n));
+        }
+
+        double psnr = Compare(frame, "translocal-gputest.png");
+        if (shown is { } sh)
+        {
+            // Diagnóstico: diferença média de brilho e melhor deslocamento (atraso de quadro).
+            double sumA = 0, sumB = 0; int cnt = 0;
+            for (int y = 8; y < h - 8; y += 4)
+                for (int x = 8; x < w - 8; x += 4)
+                {
+                    sumA += (frame[y * w + x] >> 8) & 0xFF; sumB += (sh[y * w + x] >> 8) & 0xFF; cnt++;
+                }
+            int best = 0; double bestErr = double.MaxValue;
+            for (int dx = -70; dx <= 70; dx++)
+            {
+                double e = 0;
+                for (int y = 8; y < h - 8; y += 6)
+                    for (int x = 80; x < w - 80; x += 6)
+                    {
+                        int a = (int)((frame[y * w + x + dx] >> 8) & 0xFF), b = (int)((sh[y * w + x] >> 8) & 0xFF);
+                        e += (a - b) * (a - b);
+                    }
+                if (e < bestErr) { bestErr = e; best = dx; }
+            }
+            double mseBest = bestErr / Math.Max(1, ((h - 16 + 5) / 6) * ((w - 160 + 5) / 6));
+            double psnrAligned = mseBest <= 0 ? 99 : 10 * Math.Log10(255.0 * 255.0 / mseBest);
+            Log.Info($"GPUTEST brilho médio original {sumA / cnt:0.0} × na tela {sumB / cnt:0.0}");
+            psnr = Math.Max(psnr, psnrAligned);
+        }
+        Check(psnr > 30, $"imagem na tela igual à original: {psnr:0.0} dB (cores e posição pelo processador de vídeo da placa)");
+
+        // Caminho BGRA (blocos JPEG, decodificação por software, HDMI) pela mesma exibição.
+        surface.EnsureSize(w, h);
+        fixed (uint* b = baseFrame)
+        {
+            var bmp = new Bitmap(w, h, w * 4, System.Drawing.Imaging.PixelFormat.Format32bppRgb, (IntPtr)b);
+            surface.CopyFromBitmap(bmp, 0, 0);
+            bmp.Dispose();
+        }
+        sw.Restart();
+        bool bgraOk = presenter.PresentSurface(surface);
+        double bgraMs = sw.Elapsed.TotalMilliseconds;
+        double psnrBgra = Compare(baseFrame, "translocal-gputest-bgra.png");
+        Check(bgraOk && psnrBgra > 35, $"caminho BGRA: {psnrBgra:0.0} dB, {bgraMs:0.0} ms para enviar e mostrar");
+
+        // Textos por cima (Direct2D) e redimensionamento.
+        stats = "Teste • 60 quadros/s • 5,7 Mbit/s • H.264 → tela direto pela placa de vídeo • atraso da imagem 18 ms";
+        notice = "Aviso de teste: o jogo está como administrador no PC.";
+        presenter.Redraw();
+        Compare(baseFrame, "translocal-gputest-textos.png");
+        form.ClientSize = new Size(w * 3 / 4, h * 3 / 4);
+        presenter.Resize(form.ClientSize.Width, form.ClientSize.Height);
+        presenter.Redraw();
+        Application.DoEvents();
+        Check(!presenter.Failed && presenter.Dest.Width == w * 3 / 4, $"redimensionada para {form.ClientSize.Width}×{form.ClientSize.Height}: imagem em {presenter.Dest}");
+        Check(!presenter.Failed, $"{presenter.Presented} apresentações sem erro");
+
+        // A janela de exibição de verdade (fora da tela, sem tirar o foco): troca para a placa de vídeo, recebe
+        // quadros pela thread de rede, mostra estatísticas e aviso, muda de tamanho e fecha.
+        {
+            IGpuFrameSink? sink = null;
+            var viewer = new ViewerForm("NOTEBOOK-TESTE", surface, _ => { }, Screen.PrimaryScreen!, fullscreen: false, showStats: true,
+                new Size(w, h)) { NoActivate = true, ShowInTaskbar = false, StartPosition = FormStartPosition.Manual };
+            viewer.Location = new Point(hidden.Right + 200, hidden.Bottom + 200);
+            viewer.Show();
+            Application.DoEvents();
+            bool attached = viewer.UseGpu(gpu, s => sink = s);
+            Check(attached && viewer.GpuActive && sink is not null, "janela de exibição usando a placa de vídeo");
+            long before = presenter.Presented;
+            var t = new Thread(() =>
+            {
+                for (int i = 0; i < 30; i++) { viewer.NotifyFrame(); Thread.Sleep(5); } // como a thread de rede faz
+            });
+            t.Start();
+            while (t.IsAlive) { Application.DoEvents(); Thread.Sleep(5); }
+            viewer.SetStats("NOTEBOOK-TESTE • 960×540 • 60 quadros/s • atraso da imagem 18 ms");
+            viewer.ShowNotice("Aviso de teste");
+            viewer.Size = new Size(800, 500);
+            for (int i = 0; i < 20; i++) { Application.DoEvents(); Thread.Sleep(10); }
+            Check(viewer.GpuActive, "janela continua na placa de vídeo depois de quadros, textos e redimensionamento");
+            viewer.Close();
+            viewer.Dispose();
+            Application.DoEvents();
+            Check(sink is null, "ao fechar, a janela solta a placa de vídeo (o decodificador volta ao caminho comum)");
+        }
+        Native.timeEndPeriod(1);
+        Log.Info(failures == 0 ? "GPUTEST concluído: tudo certo" : $"GPUTEST concluído com {failures} falha(s)");
+        return failures == 0 ? 0 : 1;
+    }
+
+    private static string Nals(byte[] d)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i + 3 < d.Length; i++)
+            if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1)
+            {
+                int t = d[i + 3] & 0x1F;
+                // first_mb_in_slice (Exp-Golomb) dos slices: 1 bit "1" no começo = 0
+                string extra = (t == 1 || t == 5) ? ((d[i + 4] & 0x80) != 0 ? "(início)" : "(meio)") : "";
+                sb.Append(t).Append(extra).Append(' ');
+                i += 3;
+            }
+        return sb.ToString();
+    }
+
     public static unsafe int CodecTest()
     {
         int failures = 0;
@@ -528,6 +818,8 @@ internal static class DevTools
                 bytes += data.Length;
                 sw.Restart();
                 if (dec.Decode(data, w, h, surface, out bool err)) decoded++;
+                else if (Environment.GetEnvironmentVariable("TRANSLOCAL_CODEC_TRACE") == "1") Log.Info($"CODECTRACE quadro {i}: {data.Length} bytes, chave={key}, sem saída, NAL {Nals(data)}");
+                if (Environment.GetEnvironmentVariable("TRANSLOCAL_CODEC_TRACE") == "1" && i % 30 == 1) Log.Info($"CODECTRACE quadro {i} (normal): {data.Length} bytes, NAL {Nals(data)}");
                 decTicks += sw.ElapsedTicks;
                 if (err) Log.Info($"CODECTEST erro de decodificação no quadro {i}");
                 if (decSw is not null)
@@ -556,6 +848,14 @@ internal static class DevTools
         Check(decoded >= encodedFrames * 0.9, $"{decoded}/{encodedFrames} quadros decodificados ({(dec.Hardware ? "placa de vídeo" : "processador")}), {decMs:0.0} ms por quadro (inclui conversão para a tela)");
         if (decSw is not null)
             Check(decodedSw >= encodedFrames * 0.9, $"{decodedSw}/{encodedFrames} quadros decodificados (processador, reserva), {decSwTicks * 1000.0 / Stopwatch.Frequency / Math.Max(1, encodedFrames):0.0} ms por quadro");
+        {
+            // Preenchimento (NAL 12) no fim do quadro: removido no envio e, para transmissores antigos, ignorado no receptor.
+            byte[] withFiller = { 0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x41, 0x9A, 0x22, 0, 0, 0, 1, 0x0C, 0xFF, 0xFF, 0x80 };
+            var stripped = AnnexB.StripFiller(withFiller)!;
+            var trimmed = AnnexB.TrimTrailingFiller(withFiller);
+            Check(stripped.Length == 12 && trimmed.Length == 12 && stripped.AsSpan().SequenceEqual(trimmed) && stripped[^1] == 0x22,
+                "preenchimento do codificador removido (sem o quadro ficar preso no decodificador até o próximo)");
+        }
         Check(mbps < jpegMbps, $"rede a 60 quadros/s: H.264 {mbps:0.0} Mbit/s × JPEG por blocos {jpegMbps:0.0} Mbit/s ({jpegMbps / Math.Max(0.1, mbps):0.0}× menos)");
 
         // Fidelidade do último quadro decodificado (PSNR de luminância aproximada).

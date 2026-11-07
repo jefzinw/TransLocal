@@ -60,8 +60,15 @@ internal abstract class ScreenCapturer : IDisposable
 
     /// <summary>Atualiza <see cref="Bits"/> com a imagem atual do monitor. Retorna false se não há
     /// imagem disponível agora (ex.: tela de bloqueio ou UAC na área de trabalho segura).</summary>
-    public bool Capture(bool drawCursor)
+    public bool Capture(bool drawCursor) => Capture(drawCursor, 0);
+
+    /// <summary>
+    /// Como <see cref="Capture(bool)"/>, mas espera até <paramref name="waitMs"/> por um quadro novo da tela (DXGI):
+    /// a captura acompanha o ritmo do jogo em vez de um relógio próprio — menos atraso e sem trancos.
+    /// </summary>
+    public bool Capture(bool drawCursor, int waitMs)
     {
+        WaitMs = Math.Max(0, waitMs);
         if (!AcquireDesktop(out bool desktopChanged)) return false;
         var cursor = drawCursor ? ReadCursor() : default;
         if (!desktopChanged && _composed && cursor == _lastCursor)
@@ -79,7 +86,13 @@ internal abstract class ScreenCapturer : IDisposable
         return true;
     }
 
-    /// <summary>A última chamada a <see cref="Capture"/> produziu uma imagem diferente da anterior.</summary>
+    /// <summary>Espera máxima por um quadro novo na captura atual (ms).</summary>
+    protected int WaitMs { get; private set; }
+
+    /// <summary>A captura espera o próximo quadro da tela sozinha (não precisa de pausa entre capturas).</summary>
+    public virtual bool WaitsForFrames => false;
+
+    /// <summary>A última chamada a Capture produziu uma imagem diferente da anterior.</summary>
     public bool LastCaptureChanged { get; private set; }
 
     private bool _composed;

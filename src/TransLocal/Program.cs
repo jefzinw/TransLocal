@@ -90,7 +90,7 @@ internal static class Program
 #endif
 
         // ---- Diagnóstico ----
-        if (Has("--bench") || Has("--selftest") || Has("--ui-screenshot") || Has("--gamepad-test") || Has("--update-test") || Has("--audio-test") || Has("--codec-test"))
+        if (Has("--bench") || Has("--selftest") || Has("--ui-screenshot") || Has("--gamepad-test") || Has("--update-test") || Has("--audio-test") || Has("--codec-test") || Has("--gpu-test"))
         {
             Log.Echo = Native.AttachConsole(Native.ATTACH_PARENT_PROCESS);
             try
@@ -100,6 +100,7 @@ internal static class Program
                 if (Has("--gamepad-test")) return DevTools.GamepadTest();
                 if (Has("--audio-test")) return DevTools.AudioTest();
                 if (Has("--codec-test")) return DevTools.CodecTest();
+                if (Has("--gpu-test")) return DevTools.GpuTest();
                 if (Has("--selftest")) return DevTools.SelfTest(Arg("--selftest") ?? Log.DataDirectory);
                 return DevTools.UiScreenshots(Arg("--ui-screenshot") ?? Log.DataDirectory);
             }

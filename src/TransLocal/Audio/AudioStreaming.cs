@@ -170,7 +170,11 @@ internal sealed class AudioPlayer : IDisposable
     /// <summary>Nome da saída em uso (ou null).</summary>
     public string? DeviceName { get; private set; }
 
-    public AudioPlayer(WaveFormat format, int maxDelayMs = 200)
+    private readonly int _targetBufferedBytes;
+    private readonly int _blockAlign;
+    private byte[] _discard = Array.Empty<byte>();
+
+    public AudioPlayer(WaveFormat format, int maxDelayMs = 100, int targetDelayMs = 40)
     {
         _buffer = new BufferedWaveProvider(format, TimeSpan.FromSeconds(2))
         {
@@ -178,6 +182,8 @@ internal sealed class AudioPlayer : IDisposable
             ReadFully = true,
         };
         _maxBufferedBytes = format.AverageBytesPerSecond * maxDelayMs / 1000;
+        _targetBufferedBytes = format.AverageBytesPerSecond * targetDelayMs / 1000;
+        _blockAlign = Math.Max(1, format.BlockAlign);
         _reopenTimer = new System.Threading.Timer(_ => Reopen(force: false));
         AudioOutput.EnsureWatching();
         Open();
@@ -187,7 +193,18 @@ internal sealed class AudioPlayer : IDisposable
     public void Add(ReadOnlySpan<byte> data)
     {
         if (_disposed) return;
-        if (_buffer.BufferedBytes > _maxBufferedBytes) _buffer.ClearBuffer();
+        int buffered = _buffer.BufferedBytes;
+        if (buffered > _maxBufferedBytes)
+        {
+            // Atraso acumulado (rede engasgou e depois chegou tudo junto): descarta só o excesso, mantendo ~40 ms
+            // na fila — o som continua em sincronia com a imagem sem o estalo de esvaziar tudo.
+            int excess = (buffered - _targetBufferedBytes) / _blockAlign * _blockAlign;
+            if (excess > 0)
+            {
+                if (_discard.Length < excess) _discard = new byte[excess];
+                _buffer.Read(_discard.AsSpan(0, excess));
+            }
+        }
         _buffer.AddSamples(data);
     }
 

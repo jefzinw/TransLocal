@@ -284,7 +284,34 @@ internal sealed class ReceiverSession
     private Video.H264Decoder? _decoder;
     private bool _decoderFailed;
     private volatile string _codecLabel = "JPEG por blocos";
+    private volatile string? _remoteStats;
     private long _lastKeyRequest;
+    private readonly object _gpuGate = new();
+    private Video.GpuDevice? _gpu;
+    private bool _gpuTried;
+    private int _gpuFrames;
+
+    /// <summary>Placa de vídeo compartilhada pelo decodificador e pela exibição (null = desenhar pelo processador).</summary>
+    public Video.GpuDevice? Gpu
+    {
+        get
+        {
+            lock (_gpuGate)
+            {
+                if (!_gpuTried)
+                {
+                    _gpuTried = true;
+                    if (Environment.GetEnvironmentVariable("TRANSLOCAL_NO_GPU_PRESENT") != "1") _gpu = Video.GpuDevice.TryCreate();
+                    if (_gpu is not null) Log.Info($"Exibição pela placa de vídeo: {_gpu.AdapterName}");
+                }
+                return _gpu;
+            }
+        }
+    }
+
+    /// <summary>Exibição na placa de vídeo, definida pela janela (os quadros H.264 vão direto para ela).</summary>
+    public volatile Video.IGpuFrameSink? GpuSink;
+
 
     private int _statFrames;
     private long _statDecodeTicks;
@@ -353,6 +380,12 @@ internal sealed class ReceiverSession
         }
         using var statsTimer = new System.Threading.Timer(_ => ReportStats(), null, 1000, 1000);
         Span<byte> ack = stackalloc byte[4];
+        // Thread de rede + decodificação + exibição: prioridade de jogo no agendador multimídia do Windows.
+        var mmcss = Streaming.Realtime.BoostThread("Games");
+        var priority = Thread.CurrentThread.Priority;
+        Thread.CurrentThread.Priority = ThreadPriority.Highest;
+        using var wifi = Streaming.Realtime.WifiLowLatency();
+        Native.timeBeginPeriod(1);
         try
         {
             _conn.ReceiveTimeoutMs = 15_000;
@@ -380,20 +413,25 @@ internal sealed class ReceiverSession
                         int vh = BinaryPrimitives.ReadUInt16LittleEndian(span[6..]);
                         if (_decoder is null && !_decoderFailed)
                         {
-                            _decoder = Video.H264Decoder.TryCreate(hardware: true);
+                            _decoder = Video.H264Decoder.TryCreate(hardware: true, Gpu, vw, vh);
                             _decoderFailed = _decoder is null;
-                            _codecLabel = _decoder is null ? "H.264 sem decodificador" : $"H.264 ({(_decoder.Hardware ? "placa de vídeo" : "processador")})";
+                            _codecLabel = _decoder is null ? "H.264 sem decodificador" : $"H.264 decodificado pel{(_decoder.Hardware ? "a placa de vídeo" : "o processador")}";
                             Log.Info(_decoder is null ? "H.264: sem decodificador neste computador" : $"Decodificando H.264: {_decoder.Name} ({(_decoder.Hardware ? "placa de vídeo" : "processador")})");
                         }
                         bool produced = false, error = _decoder is null;
+                        // Se a exibição pela placa de vídeo cair, o decodificador passa sozinho a entregar pelo processador.
+                        var sink = GpuSink;
                         if (_decoder is not null && vw > 0 && vh > 0 && vw <= 8192 && vh <= 8192)
-                            produced = _decoder.Decode(span[9..], vw, vh, Surface, out error);
+                            produced = _decoder.Decode(span[9..], vw, vh, Surface, sink, out error);
+                        bool onGpu = produced && _decoder!.LastOnGpu;
                         Interlocked.Add(ref _statDecodeTicks, Stopwatch.GetTimestamp() - t1);
                         if (produced)
                         {
                             Interlocked.Increment(ref _statFrames);
                             Interlocked.Increment(ref FramesReceived);
+                            if (onGpu) Interlocked.Increment(ref _gpuFrames);
                         }
+                        // Confirmação depois do quadro já estar na tela (o transmissor mede o atraso real com ela).
                         BinaryPrimitives.WriteInt32LittleEndian(ack, vid);
                         _conn.Send(MsgType.FrameAck, ack);
                         if (error && Environment.TickCount64 - _lastKeyRequest > 1000)
@@ -401,7 +439,7 @@ internal sealed class ReceiverSession
                             _lastKeyRequest = Environment.TickCount64;
                             _conn.Send(MsgType.KeyframeRequest, ReadOnlySpan<byte>.Empty);
                         }
-                        if (produced) FrameReady?.Invoke();
+                        if (produced && !onGpu) FrameReady?.Invoke();
                         break;
                     }
                     case MsgType.Audio:
@@ -417,6 +455,9 @@ internal sealed class ReceiverSession
                         break;
                     case MsgType.Diag:
                         Diag?.Received(m.Span);
+                        break;
+                    case MsgType.Stats when m.Length > 0:
+                        _remoteStats = System.Text.Encoding.UTF8.GetString(m.Span[..Math.Min(m.Length, 400)]);
                         break;
                     case MsgType.GamepadFeedback when m.Length >= 3:
                         GamepadFeedback?.Invoke(m.Span[0], m.Span[1], m.Span[2]);
@@ -443,6 +484,15 @@ internal sealed class ReceiverSession
             Diag?.Dispose();
             _decoder?.Dispose();
             _decoder = null;
+            Native.timeEndPeriod(1);
+            Thread.CurrentThread.Priority = priority;
+            Streaming.Realtime.Revert(mmcss);
+            lock (_gpuGate)
+            {
+                // A janela pode continuar usando a placa de vídeo (ela tem a própria referência).
+                _gpu?.Dispose();
+                _gpu = null;
+            }
         }
     }
 
@@ -493,6 +543,10 @@ internal sealed class ReceiverSession
         long bytes = Interlocked.Read(ref _conn.BytesReceived);
         long delta = bytes - Interlocked.Exchange(ref _statBytesAtLast, bytes);
         double decMs = frames > 0 ? dec * 1000.0 / Stopwatch.Frequency / frames : 0;
-        StatsUpdated?.Invoke($"{SenderName} • {Surface.Width}×{Surface.Height} • {frames / secs:0} quadros/s • {delta * 8 / secs / 1_000_000:0.0} Mbit/s • {_codecLabel} • decodificação {decMs:0.0} ms");
+        int gpu = Interlocked.Exchange(ref _gpuFrames, 0);
+        string label = _codecLabel + (gpu > 0 && gpu >= frames / 2 ? " → exibição pela placa de vídeo" : "");
+        string remote = _remoteStats is { Length: > 0 } r ? $" • {r}" : "";
+        string decWord = gpu > 0 ? "decodificação + exibição" : "decodificação";
+        StatsUpdated?.Invoke($"{SenderName} • {Surface.Width}×{Surface.Height} • {frames / secs:0} quadros/s • {delta * 8 / secs / 1_000_000:0.0} Mbit/s • {label} • {decWord} {decMs:0.0} ms{remote}");
     }
 }

@@ -84,6 +84,17 @@ internal sealed unsafe class FrameSurface : IDisposable
         MarkUpdated();
     }
 
+    /// <summary>Dá acesso à imagem (BGRA, top-down, largura×4 por linha) sob a trava. False se ainda não há imagem.</summary>
+    public bool Read(Action<IntPtr, int, int> use)
+    {
+        lock (Sync)
+        {
+            if (_bits == null || _disposed) return false;
+            use((IntPtr)_bits, _width, _height);
+            return true;
+        }
+    }
+
     /// <summary>Um pixel BGRA da imagem exibida (testes).</summary>
     internal uint PixelAt(int x, int y)
     {

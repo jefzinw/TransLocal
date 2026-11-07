@@ -37,6 +37,8 @@ internal static unsafe class MF
     public static readonly Guid BPictureCount = new("8d390aac-dc5c-4200-b57f-814d04babab2");
     public static readonly Guid ForceKeyFrame = new("398c1b98-8353-475a-9ef2-8f265d260345");
     public static readonly Guid QualityVsSpeed = new("98332df8-03cd-476b-89fa-3f9e442dec9f");
+    public static readonly Guid BufferSize = new("0db96574-b6a4-4c8b-8106-3773de0310cd");
+    public static readonly Guid MaxBitRate = new("9651eae4-39b9-4ebf-85ef-d7f444ec7465");
 
     public const int E_NEED_MORE_INPUT = unchecked((int)0xC00D6D72);
     public const int E_STREAM_CHANGE = unchecked((int)0xC00D6D61);
@@ -121,6 +123,28 @@ internal static unsafe class MF
         return list;
     }
 
+    [DllImport("mfplat.dll")]
+    private static extern int MFCreateDXGIDeviceManager(out uint resetToken, out IntPtr manager);
+
+    /// <summary>
+    /// Gerenciador de dispositivo DXGI ligado ao dispositivo Direct3D com o token correto (a versão sem token da
+    /// biblioteca não liga de verdade, e o decodificador cai em silêncio para o processador).
+    /// </summary>
+    public static IMFDXGIDeviceManager CreateDeviceManager(Vortice.Direct3D11.ID3D11Device device)
+    {
+        Startup();
+        int hr = MFCreateDXGIDeviceManager(out uint token, out IntPtr ptr);
+        if (hr < 0 || ptr == IntPtr.Zero) throw new COMException("MFCreateDXGIDeviceManager", hr);
+        // IMFDXGIDeviceManager::ResetDevice é o 8º método (IUnknown 0–2, Close 3, GetVideoService 4, Lock 5, Open 6, Reset 7).
+        hr = ((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, int>)(*(void***)ptr)[7])(ptr, device.NativePointer, token);
+        if (hr < 0)
+        {
+            Marshal.Release(ptr);
+            throw new COMException("ResetDevice", hr);
+        }
+        return new IMFDXGIDeviceManager(ptr);
+    }
+
     public static string NameOf(IMFActivate a)
     {
         try { return a.GetAllocatedString(FriendlyName) ?? "?"; } catch { return "?"; }
@@ -169,7 +193,7 @@ internal sealed unsafe class H264Encoder : IDisposable
     public int Height => _height;
     public int Bitrate { get; }
 
-    private H264Encoder(IMFTransform mft, string name, bool hardware, int w, int h, int fps, int bitrate)
+    private H264Encoder(IMFTransform mft, string name, bool hardware, int w, int h, int fps, int bitrate, bool conservative)
     {
         _mft = mft;
         Name = name;
@@ -179,6 +203,7 @@ internal sealed unsafe class H264Encoder : IDisposable
         _fps = fps;
         Bitrate = bitrate;
         _nv12 = GC.AllocateUninitializedArray<byte>(w * h * 3 / 2, pinned: true);
+        CurrentBitrate = bitrate;
 
         var attrs = mft.Attributes;
         try { _async = attrs.GetUInt32(MF.TransformAsync) != 0; } catch { _async = false; }
@@ -192,9 +217,18 @@ internal sealed unsafe class H264Encoder : IDisposable
         try { _codec = (ICodecAPI)Marshal.GetObjectForIUnknown(mft.NativePointer); } catch { _codec = null; }
         if (!Set(MF.RateControlMode, 4u)) Set(MF.RateControlMode, 0u); // baixa latência VBR; senão CBR
         Set(MF.MeanBitRate, (uint)bitrate);
+        Conservative = conservative;
+        if (!conservative)
+        {
+            Set(MF.MaxBitRate, (uint)(bitrate * 1.5));
+            // Buffer de ~1 quadro (como em jogos na nuvem): nenhum quadro, nem o quadro-chave, fica muito maior que
+            // a média — é isso que evita os "soluços" de rede a cada quadro-chave.
+            Set(MF.BufferSize, (uint)Math.Max(bitrate / Math.Max(fps, 1), 64_000));
+        }
         Set(MF.LowLatency, true);
         Set(MF.BPictureCount, 0u);
-        Set(MF.GopSize, (uint)(fps * 4));
+        // Quadros-chave só quando o receptor pede (começo, perda de sequência): sem pico periódico.
+        Set(MF.GopSize, (uint)(fps * (conservative ? 4 : 120)));
         Set(MF.QualityVsSpeed, 33u);
 
         var output = MediaFactory.MFCreateMediaType();
@@ -205,9 +239,13 @@ internal sealed unsafe class H264Encoder : IDisposable
         output.Set(MF.PixelAspect, MF.Pack(1, 1));
         output.Set(MF.AvgBitrate, (uint)bitrate);
         output.Set(MF.InterlaceMode, 2u);
-        output.Set(MF.Profile, 66u); // Baseline: decodificação mais leve no notebook
-        int hr = MF.SetOutputType(mft, output);
-        if (hr < 0) { output.Set(MF.Profile, 77u); hr = MF.SetOutputType(mft, output); } // Main
+        int hr = -1;
+        foreach (uint profile in ProfileOrder())
+        {
+            output.Set(MF.Profile, profile);
+            hr = MF.SetOutputType(mft, output);
+            if (hr >= 0) { Profile = profile; break; }
+        }
         output.Dispose();
         if (hr < 0) throw new COMException("Tipo de saída H.264 recusado", hr);
 
@@ -235,6 +273,43 @@ internal sealed unsafe class H264Encoder : IDisposable
         try { return _codec.SetValue(ref api, ref value) >= 0; } catch { return false; }
     }
 
+    /// <summary>Perfil H.264 em uso (100 High, 77 Main, 66 Baseline).</summary>
+    public uint Profile { get; private set; }
+
+    // Baseline primeiro: sem CABAC, a decodificação pelo processador do notebook (quando o Windows não libera a
+    // placa de vídeo) fica bem mais leve; o custo em rede é pequeno. TRANSLOCAL_H264_PROFILE=100 testa o High.
+    private static uint[] ProfileOrder() => Environment.GetEnvironmentVariable("TRANSLOCAL_H264_PROFILE") switch
+    {
+        "100" => new[] { 100u, 77u, 66u },
+        "77" => new[] { 77u, 66u },
+        _ => new[] { 66u, 77u },
+    };
+
+    /// <summary>Taxa de bits atual (muda com <see cref="SetBitrate"/>).</summary>
+    public int CurrentBitrate { get; private set; }
+
+    /// <summary>
+    /// Muda a taxa de bits sem reiniciar o codificador (controle adaptativo, como no Xbox Cloud/Parsec).
+    /// False se este codificador não aceita mudança durante a transmissão.
+    /// </summary>
+    public bool SetBitrate(int bitrate)
+    {
+        if (bitrate == CurrentBitrate) return true;
+        bool ok = Set(MF.MeanBitRate, (uint)bitrate);
+        if (ok)
+        {
+            Set(MF.MaxBitRate, (uint)(bitrate * 1.5));
+            CurrentBitrate = bitrate;
+        }
+        return ok;
+    }
+
+    // Horário de captura de cada quadro enviado ao codificador, para saber o atraso de cada saída.
+    private readonly Queue<long> _inputTimes = new();
+
+    /// <summary>Horário (Stopwatch) da captura do último quadro devolvido por Encode/Poll.</summary>
+    public long LastOutputCaptureTime { get; private set; }
+
     /// <summary>Taxa de bits recomendada: ~0,07–0,12 bit por pixel por quadro conforme a qualidade escolhida.</summary>
     public static int BitrateFor(int w, int h, int fps, int quality)
     {
@@ -242,11 +317,24 @@ internal sealed unsafe class H264Encoder : IDisposable
         return (int)Math.Clamp(w * (double)h * fps * bpp, 2_000_000, 30_000_000);
     }
 
-    /// <summary>Cria o melhor codificador disponível (placa de vídeo, depois software). Null se nenhum servir.</summary>
-    public static H264Encoder? TryCreate(int w, int h, int fps, int bitrate)
+    /// <summary>Ajustes da 1.6 (sem buffer de 1 quadro nem limite de pico): reserva se a placa não entregar quadros.</summary>
+    public bool Conservative { get; }
+
+    private static readonly bool StallTest = Environment.GetEnvironmentVariable("TRANSLOCAL_ENC_STALL_TEST") == "1";
+
+    /// <summary>Chamadas a Encode seguidas sem nenhuma saída (codificador travado ou recusando os ajustes).</summary>
+    public int FramesWithoutOutput { get; private set; }
+
+    /// <summary>
+    /// Cria o melhor codificador disponível (placa de vídeo, depois software). Null se nenhum servir.
+    /// <paramref name="level"/>: 0 = ajustes de baixa latência; 1 = ajustes conservadores; 2 = só software.
+    /// </summary>
+    public static H264Encoder? TryCreate(int w, int h, int fps, int bitrate, int level = 0)
     {
         if (w % 2 != 0 || h % 2 != 0 || w < 64 || h < 64) return null;
-        foreach (uint flags in new[] { MF.ENUM_HARDWARE | MF.ENUM_ASYNC | MF.ENUM_SORT, MF.ENUM_SYNC | MF.ENUM_SORT })
+        if (int.TryParse(Environment.GetEnvironmentVariable("TRANSLOCAL_ENC_LEVEL"), out int forced)) level = Math.Max(level, forced); // testes
+        bool softwareOnly = level >= 2 || Environment.GetEnvironmentVariable("TRANSLOCAL_ENC_SOFTWARE") == "1"; // testes com a placa ocupada
+        foreach (uint flags in softwareOnly ? new[] { MF.ENUM_SYNC | MF.ENUM_SORT } : new[] { MF.ENUM_HARDWARE | MF.ENUM_ASYNC | MF.ENUM_SORT, MF.ENUM_SYNC | MF.ENUM_SORT })
         {
             List<IMFActivate> list;
             try { list = MF.Enum(TransformCategoryGuids.VideoEncoder, flags, MF.NV12, MF.H264); }
@@ -258,7 +346,7 @@ internal sealed unsafe class H264Encoder : IDisposable
                 try
                 {
                     t = MF.Activate(a);
-                    var enc = new H264Encoder(t, name, (flags & MF.ENUM_HARDWARE) != 0, w, h, fps, bitrate);
+                    var enc = new H264Encoder(t, name, (flags & MF.ENUM_HARDWARE) != 0, w, h, fps, bitrate, level == 1);
                     foreach (var other in list) other.Dispose();
                     return enc;
                 }
@@ -277,9 +365,12 @@ internal sealed unsafe class H264Encoder : IDisposable
     /// Codifica um quadro BGRA (top-down). Devolve o fluxo Annex B do quadro (ou null se o codificador ainda não
     /// entregou nada — codificadores de placa de vídeo podem atrasar um quadro).
     /// </summary>
-    public byte[]? Encode(IntPtr bgra, int stride, bool forceKeyFrame, out bool keyFrame)
+    public byte[]? Encode(IntPtr bgra, int stride, bool forceKeyFrame, out bool keyFrame, long captureTime = 0)
     {
         keyFrame = false;
+        FramesWithoutOutput++;
+        // Teste da rede de segurança: simula um codificador que aceita quadros e nunca devolve imagem.
+        if (StallTest && !Conservative) return null;
         if (forceKeyFrame) Set(MF.ForceKeyFrame, 1u);
 
         // Converte direto no buffer do codificador (sem cópia intermediária).
@@ -309,6 +400,8 @@ internal sealed unsafe class H264Encoder : IDisposable
                 _needInput--;
                 int hr = MF.ProcessInput(_mft, sample);
                 if (hr < 0) throw new COMException("ProcessInput", hr);
+                _inputTimes.Enqueue(captureTime);
+                if (_inputTimes.Count > 32) _inputTimes.Dequeue();
                 _outstanding++;
                 // Espera curta (até ~8 ms) pela saída deste quadro; se demorar, Poll() recolhe na próxima volta do laço.
                 for (int i = 0; i < 12 && _outstanding > 0; i++)
@@ -322,6 +415,8 @@ internal sealed unsafe class H264Encoder : IDisposable
                 int hr = MF.ProcessInput(_mft, sample);
                 if (hr == MF.E_NOTACCEPTING) { Drain(ref result, ref keyFrame); hr = MF.ProcessInput(_mft, sample); }
                 if (hr < 0) throw new COMException("ProcessInput", hr);
+                _inputTimes.Enqueue(captureTime);
+                if (_inputTimes.Count > 32) _inputTimes.Dequeue();
                 Drain(ref result, ref keyFrame);
             }
         }
@@ -330,7 +425,7 @@ internal sealed unsafe class H264Encoder : IDisposable
             sample.Dispose();
             buffer.Dispose();
         }
-        return result;
+        return AnnexB.StripFiller(result);
     }
 
     private int _outstanding;
@@ -345,7 +440,7 @@ internal sealed unsafe class H264Encoder : IDisposable
         if (!Pending) return null;
         byte[]? result = null;
         PumpEvents(ref result, ref keyFrame);
-        return result;
+        return AnnexB.StripFiller(result);
     }
 
     private void PumpEvents(ref byte[]? result, ref bool key)
@@ -395,6 +490,8 @@ internal sealed unsafe class H264Encoder : IDisposable
             try
             {
                 try { key |= outSample.GetUInt32(MF.CleanPoint) != 0; } catch { }
+                if (_inputTimes.Count > 0) LastOutputCaptureTime = _inputTimes.Dequeue();
+                FramesWithoutOutput = 0;
                 using var contiguous = outSample.ConvertToContiguousBuffer();
                 contiguous.Lock(out IntPtr p, out _, out int len);
                 try
@@ -436,23 +533,40 @@ internal sealed unsafe class H264Decoder : IDisposable
     private int _outSize;
     private int _codedWidth, _codedHeight, _stride;
     private Vortice.Direct3D11.ID3D11Device? _device;
+    private bool _ownsDevice;
     private IMFDXGIDeviceManager? _manager;
+    private IGpuFrameSink? _sink;
+    private static readonly Guid IID_Texture2D = typeof(Vortice.Direct3D11.ID3D11Texture2D).GUID;
+
+    /// <summary>O último quadro foi entregue direto à placa de vídeo (sem passar pela memória do processador).</summary>
+    public bool LastOnGpu { get; private set; }
 
     public string Name { get; }
 
-    /// <summary>Decodificando pela placa de vídeo (DXVA) — quase sem processador.</summary>
-    public bool Hardware { get; private set; }
+    private bool _linked;
 
-    private H264Decoder(IMFTransform mft, string name, bool hardware)
+    /// <summary>
+    /// Decodificando de fato pela placa de vídeo (DXVA): o decodificador do Windows aceitou a placa E entrega as
+    /// próprias texturas. Em alguns PCs ele aceita a placa mas continua no processador sem avisar — aí é false.
+    /// </summary>
+    public bool Hardware => _linked && _providesSamples;
+
+    private H264Decoder(IMFTransform mft, string name, bool hardware, GpuDevice? gpu, int width, int height)
     {
         _mft = mft;
         Name = name;
         try { mft.Attributes.Set(MF.LowLatency, 1u); } catch { }
-        if (hardware) Hardware = TryEnableDxva();
+        if (hardware) _linked = TryEnableDxva(gpu);
 
         var input = MediaFactory.MFCreateMediaType();
         input.Set(MF.MajorType, MF.Video);
         input.Set(MF.Subtype, MF.H264);
+        if (width > 0 && height > 0)
+        {
+            input.Set(MF.FrameSize, MF.Pack(width, height));
+            input.Set(MF.FrameRate, MF.Pack(60, 1));
+            input.Set(MF.InterlaceMode, 2u);
+        }
         int hr = MF.SetInputType(mft, input);
         input.Dispose();
         if (hr < 0) throw new COMException("Tipo de entrada H.264 recusado", hr);
@@ -462,17 +576,28 @@ internal sealed unsafe class H264Decoder : IDisposable
     }
 
     /// <summary>Liga a decodificação pela placa de vídeo (antes de definir os formatos). False = segue no processador.</summary>
-    private bool TryEnableDxva()
+    private bool TryEnableDxva(GpuDevice? gpu)
     {
         try
         {
+            if (gpu is not null)
+            {
+                // Mesmo dispositivo da exibição: a textura decodificada vai direto para a tela.
+                _device = gpu.Device;
+                _ownsDevice = false;
+                _manager = MF.CreateDeviceManager(_device!);
+                try { _mft.Attributes.Set(new Guid("f7db8a2f-4f48-4ee8-ae31-8b6ebe558ae2"), 1u); } catch { } // CODECAPI_AVDecVideoAcceleration_H264
+                int hr0 = MF.ProcessMessage(_mft, 1 /* MFT_MESSAGE_SET_D3D_MANAGER */, (nuint)(ulong)_manager.NativePointer);
+                if (hr0 < 0) throw new COMException("SET_D3D_MANAGER", hr0);
+                return true;
+            }
+            _ownsDevice = true;
             var levels = new[] { Vortice.Direct3D.FeatureLevel.Level_11_1, Vortice.Direct3D.FeatureLevel.Level_11_0, Vortice.Direct3D.FeatureLevel.Level_10_1, Vortice.Direct3D.FeatureLevel.Level_10_0, Vortice.Direct3D.FeatureLevel.Level_9_3 };
             Vortice.Direct3D11.D3D11.D3D11CreateDevice(null, Vortice.Direct3D.DriverType.Hardware,
                 Vortice.Direct3D11.DeviceCreationFlags.VideoSupport | Vortice.Direct3D11.DeviceCreationFlags.BgraSupport,
                 levels, out _device).CheckError();
             using (var mt = _device!.QueryInterface<Vortice.Direct3D11.ID3D11Multithread>()) mt.SetMultithreadProtected(true);
-            _manager = MediaFactory.MFCreateDXGIDeviceManager();
-            _manager.ResetDevice(_device);
+            _manager = MF.CreateDeviceManager(_device!);
             int hr = MF.ProcessMessage(_mft, 1 /* MFT_MESSAGE_SET_D3D_MANAGER */, (nuint)(ulong)_manager.NativePointer);
             if (hr < 0) throw new COMException("SET_D3D_MANAGER", hr);
             return true;
@@ -482,13 +607,25 @@ internal sealed unsafe class H264Decoder : IDisposable
             Log.Info($"H.264: decodificação pela placa de vídeo indisponível ({ex.Message}); usando o processador");
             try { MF.ProcessMessage(_mft, 1, 0); } catch { }
             _manager?.Dispose(); _manager = null;
-            _device?.Dispose(); _device = null;
+            if (_ownsDevice) _device?.Dispose();
+            _device = null;
             return false;
         }
     }
 
     private bool NegotiateOutput()
     {
+        if (_linked)
+        {
+            // Texturas de saída que a exibição pode ler (como o Firefox faz com este mesmo decodificador).
+            try
+            {
+                using var oa = _mft.GetOutputStreamAttributes(0);
+                oa.Set(new Guid("eacf97ad-065c-4408-bee3-fdcbfd128be2"), (uint)(Vortice.Direct3D11.BindFlags.Decoder | Vortice.Direct3D11.BindFlags.ShaderResource));
+                oa.Set(new Guid("39dbd44d-2e44-4931-a4c8-352d3dc42115"), 1u);
+            }
+            catch (Exception ex) { Log.Info($"H.264: atributos de saída D3D11 indisponíveis ({ex.Message})"); }
+        }
         for (int i = 0; i < 32; i++)
         {
             using var t = MF.GetOutputAvailableType(_mft, i);
@@ -541,7 +678,7 @@ internal sealed unsafe class H264Decoder : IDisposable
         }
     }
 
-    public static H264Decoder? TryCreate(bool hardware = true)
+    public static H264Decoder? TryCreate(bool hardware = true, GpuDevice? gpu = null, int width = 0, int height = 0)
     {
         List<IMFActivate> list;
         try { list = MF.Enum(TransformCategoryGuids.VideoDecoder, MF.ENUM_SYNC | MF.ENUM_SORT, MF.H264, MF.NV12); }
@@ -555,7 +692,7 @@ internal sealed unsafe class H264Decoder : IDisposable
                 try
                 {
                     t = MF.Activate(a);
-                    return new H264Decoder(t, name, hardware);
+                    return new H264Decoder(t, name, hardware, gpu, width, height);
                 }
                 catch (Exception ex)
                 {
@@ -575,9 +712,20 @@ internal sealed unsafe class H264Decoder : IDisposable
     /// Decodifica um quadro e escreve em <paramref name="surface"/> (tamanho visível width×height).
     /// False se não saiu imagem (o decodificador ainda precisa de mais dados, ou erro — peça um quadro-chave).
     /// </summary>
-    public bool Decode(ReadOnlySpan<byte> annexB, int width, int height, FrameSurface surface, out bool error)
+    public bool Decode(ReadOnlySpan<byte> annexB, int width, int height, FrameSurface surface, out bool error) =>
+        Decode(annexB, width, height, surface, null, out error);
+
+    /// <summary>
+    /// Como o outro Decode, mas entrega o quadro a <paramref name="gpu"/> quando ele está na placa de vídeo
+    /// (<see cref="LastOnGpu"/>); senão, escreve na superfície.
+    /// </summary>
+    public bool Decode(ReadOnlySpan<byte> annexB, int width, int height, FrameSurface surface, IGpuFrameSink? gpu, out bool error)
     {
         error = false;
+        LastOnGpu = false;
+        _sink = gpu is { Failed: false } ? gpu : null;
+        // Transmissores 1.6 mandam unidades de preenchimento: o decodificador seguraria o quadro até o próximo.
+        annexB = AnnexB.TrimTrailingFiller(annexB);
         var buffer = MediaFactory.MFCreateMemoryBuffer(annexB.Length);
         buffer.Lock(out IntPtr p, out _, out _);
         annexB.CopyTo(new Span<byte>((void*)p, annexB.Length));
@@ -617,6 +765,7 @@ internal sealed unsafe class H264Decoder : IDisposable
             if (!_providesSamples)
             {
                 own = MediaFactory.MFCreateSample();
+                // Indo para a exibição pela placa de vídeo: a saída é escrita direto numa textura dela.
                 ownBuffer = MediaFactory.MFCreateMemoryBuffer(_outSize);
                 own.AddBuffer(ownBuffer);
                 data.Sample = own.NativePointer;
@@ -636,6 +785,13 @@ internal sealed unsafe class H264Decoder : IDisposable
                 if (outSample is null) return produced;
                 try
                 {
+                    if (_sink is not null && TryPresentGpu(outSample, width, height))
+                    {
+                        produced = true;
+                        LastOnGpu = true;
+                        if (data.Events != IntPtr.Zero) Marshal.Release(data.Events);
+                        continue;
+                    }
                     using var contiguous = outSample.ConvertToContiguousBuffer();
                     contiguous.Lock(out IntPtr p, out _, out int len);
                     try
@@ -645,7 +801,16 @@ internal sealed unsafe class H264Decoder : IDisposable
                         // Alguns decodificadores alinham a altura do plano Y a 16 linhas.
                         if ((long)stride * planeHeight * 3 / 2 > len) planeHeight = (int)(len * 2L / 3 / stride);
                         int w = Math.Min(width, stride), h = Math.Min(height, planeHeight);
-                        surface.WriteNv12((byte*)p, stride, (byte*)p + (long)stride * planeHeight, stride, w, h);
+                        byte* yp = (byte*)p, uvp = (byte*)p + (long)stride * planeHeight;
+                        // Exibição pela placa de vídeo: envia o NV12 como está (cor e tamanho ficam com a placa).
+                        if (_sink is not null && _sink.PresentNv12Memory(yp, stride, uvp, stride, w, h))
+                        {
+                            LastOnGpu = true;
+                        }
+                        else
+                        {
+                            surface.WriteNv12(yp, stride, uvp, stride, w, h);
+                        }
                         produced = true;
                     }
                     finally { contiguous.Unlock(); }
@@ -665,16 +830,106 @@ internal sealed unsafe class H264Decoder : IDisposable
         return produced;
     }
 
+    /// <summary>Entrega a textura de saída (DXVA) à exibição. False = não é textura ou a exibição recusou.</summary>
+    private bool TryPresentGpu(IMFSample sample, int width, int height)
+    {
+        try
+        {
+            using var buffer = sample.GetBufferByIndex(0);
+            using var dxgi = buffer.QueryInterfaceOrNull<IMFDXGIBuffer>();
+            if (dxgi is null) return false;
+            IntPtr ptr = dxgi.GetResource(IID_Texture2D);
+            if (ptr == IntPtr.Zero) return false;
+            using var tex = new Vortice.Direct3D11.ID3D11Texture2D(ptr);
+            int slice = (int)dxgi.SubresourceIndex;
+            var d = tex.Description;
+            int w = Math.Min(width, (int)d.Width), h = Math.Min(height, (int)d.Height);
+            return _sink!.PresentNv12(tex, slice, w, h);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("H.264: saída na placa de vídeo indisponível; usando o processador", ex);
+            _sink = null;
+            return false;
+        }
+    }
+
     public void Dispose()
     {
         try { MF.ProcessMessage(_mft, MF.MSG_FLUSH); } catch { }
         _mft.Dispose();
         _manager?.Dispose();
-        _device?.Dispose();
+        if (_ownsDevice) _device?.Dispose();
     }
 }
 
 /// <summary>Conversões BGRA ↔ NV12 (BT.601, faixa limitada) em paralelo por faixas de linhas.</summary>
+/// <summary>Ajustes no fluxo H.264 (Annex B).</summary>
+internal static class AnnexB
+{
+    /// <summary>
+    /// Remove as unidades de preenchimento (NAL tipo 12) que codificadores como o da AMD acrescentam para manter a
+    /// taxa constante. Elas não têm imagem — só gastam rede — e, no fim de um quadro, fazem o decodificador do Windows
+    /// esperar o quadro seguinte para soltar este (um "tranco" de ~16 ms a cada poucos quadros).
+    /// </summary>
+    public static byte[]? StripFiller(byte[]? data)
+    {
+        if (data is null || data.Length < 5) return data;
+        int idx = FindStart(data, 0, out int sc);
+        if (idx < 0) return data;
+        bool any = false;
+        for (int i = idx; i >= 0;)
+        {
+            int next = FindStart(data, i + 3, out _);
+            if ((data[i + StartLen(data, i)] & 0x1F) == 12) { any = true; break; }
+            i = next;
+        }
+        if (!any) return data;
+        var output = new List<byte>(data.Length);
+        output.AddRange(data.AsSpan(0, idx).ToArray());
+        for (int i = idx; i >= 0;)
+        {
+            int next = FindStart(data, i + 3, out _);
+            int end = next < 0 ? data.Length : next;
+            if ((data[i + StartLen(data, i)] & 0x1F) != 12) output.AddRange(data.AsSpan(i, end - i).ToArray());
+            i = next;
+        }
+        return output.ToArray();
+    }
+
+    /// <summary>Corta preenchimento no fim do quadro sem copiar (receptor, fluxo de versões antigas).</summary>
+    public static ReadOnlySpan<byte> TrimTrailingFiller(ReadOnlySpan<byte> data)
+    {
+        while (true)
+        {
+            int last = -1;
+            for (int i = data.Length - 4; i >= 0; i--)
+                if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) { last = i; break; }
+            if (last < 0 || (data[last + 3] & 0x1F) != 12) return data;
+            int cut = last > 0 && data[last - 1] == 0 ? last - 1 : last; // código de início de 4 bytes
+            if (cut <= 0) return data;
+            data = data[..cut];
+        }
+    }
+
+    // Posição do próximo código de início (00 00 01 ou 00 00 00 01) a partir de "from"; -1 se não houver.
+    private static int FindStart(byte[] d, int from, out int len)
+    {
+        for (int i = Math.Max(0, from); i + 3 < d.Length; i++)
+        {
+            if (d[i] == 0 && d[i + 1] == 0)
+            {
+                if (d[i + 2] == 1) { len = 3; return i; }
+                if (d[i + 2] == 0 && i + 3 < d.Length && d[i + 3] == 1) { len = 4; return i; }
+            }
+        }
+        len = 0;
+        return -1;
+    }
+
+    private static int StartLen(byte[] d, int i) => d[i + 2] == 1 ? 3 : 4;
+}
+
 internal static unsafe class ColorConvert
 {
     public static void BgraToNv12(byte* bgra, int stride, byte* nv12, int w, int h)

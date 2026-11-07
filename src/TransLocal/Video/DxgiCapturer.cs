@@ -238,6 +238,8 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         if (format != Format.B8G8R8A8_UNorm) Log.Info($"Captura DXGI recebendo {format} (convertido para a transmissão)");
     }
 
+    public override bool WaitsForFrames => _dup is not null;
+
     protected override bool AcquireDesktop(out bool changed)
     {
         if (_dup is null)
@@ -277,7 +279,7 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
             }
         }
 
-        var hr = _dup!.AcquireNextFrame(0, out var info, out var resource);
+        var hr = _dup!.AcquireNextFrame((uint)WaitMs, out var info, out var resource);
         if (hr.Success)
         {
             try

@@ -148,9 +148,58 @@ internal sealed class SurfaceView : Control
         base.OnHandleDestroyed(e);
     }
 
+    // ---------------- Exibição pela placa de vídeo ----------------
+
+    private volatile GpuPresenter? _gpu;
+    private Action<IGpuFrameSink?>? _setSink;
+
+    /// <summary>Exibição pela placa de vídeo ativa (senão, desenho por GDI).</summary>
+    public bool GpuActive => _gpu is { Failed: false };
+
+    /// <summary>
+    /// Passa a exibir pela placa de vídeo (cadeia de troca DXGI nesta janela). <paramref name="setSink"/> recebe a
+    /// exibição para o decodificador entregar quadros direto a ela (e null quando ela deixa de existir).
+    /// </summary>
+    public bool AttachGpu(GpuDevice device, Action<IGpuFrameSink?> setSink)
+    {
+        if (!IsHandleCreated || IsDisposed || _gpu is not null) return false;
+        var p = GpuPresenter.TryCreate(device, Handle, Math.Max(1, ClientSize.Width), Math.Max(1, ClientSize.Height));
+        if (p is null) return false;
+        p.SetFont(Font.Name, Font.SizeInPoints * DeviceDpi / 72f);
+        p.Overlay = () => new OverlayText(Overlay, Notice, _surface.HasImage || p.HasImage ? null : "Aguardando imagem…");
+        p.Lost += () =>
+        {
+            try { BeginInvoke(DetachGpu); } catch { }
+        };
+        _gpu = p;
+        _setSink = setSink;
+        if (_surface.HasImage) p.PresentSurface(_surface); else p.Redraw();
+        setSink(p);
+        return true;
+    }
+
+    /// <summary>Volta ao desenho por GDI (a placa de vídeo falhou ou a janela vai fechar).</summary>
+    private void DetachGpu()
+    {
+        var p = _gpu;
+        if (p is null) return;
+        _setSink?.Invoke(null);
+        _gpu = null;
+        p.Dispose();
+        if (!IsDisposed) Invalidate();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) DetachGpu();
+        base.Dispose(disposing);
+    }
+
     public void NotifyFrame()
     {
         if (!IsHandleCreated || IsDisposed) return;
+        // Pela placa de vídeo: mostra já, nesta thread (sem esperar a vez na fila de mensagens da janela).
+        if (_gpu is { Failed: false } gpu && gpu.PresentSurface(_surface)) return;
         if (Interlocked.Exchange(ref _invalidatePending, 1) != 0) return;
         try
         {
@@ -169,11 +218,20 @@ internal sealed class SurfaceView : Control
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
+        _gpu?.Resize(ClientSize.Width, ClientSize.Height);
         Invalidate();
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
+        if (_gpu is { Failed: false } gpu)
+        {
+            // A imagem e os textos são desenhados pela placa de vídeo; GDI aqui ficaria por baixo da cadeia de troca.
+            gpu.Resize(ClientSize.Width, ClientSize.Height);
+            gpu.Redraw();
+            _dest = gpu.Dest;
+            return;
+        }
         var hdc = e.Graphics.GetHdc();
         try
         {
@@ -218,7 +276,7 @@ internal sealed class SurfaceView : Control
     private bool Map(Point p, out ushort nx, out ushort ny)
     {
         nx = ny = 0;
-        var d = _dest;
+        var d = _gpu is { Failed: false, HasImage: true } gpu ? gpu.Dest : _dest;
         if (d.Width <= 1 || d.Height <= 1) return false;
         double fx = Math.Clamp((p.X - d.X) / (double)(d.Width - 1), 0, 1);
         double fy = Math.Clamp((p.Y - d.Y) / (double)(d.Height - 1), 0, 1);
@@ -532,6 +590,12 @@ internal sealed class ViewerForm : Form
     }
 
     public void NotifyFrame() => _view.NotifyFrame();
+
+    /// <summary>Exibe pela placa de vídeo (quadros H.264 vão direto do decodificador para a tela). False = segue por GDI.</summary>
+    public bool UseGpu(GpuDevice gpu, Action<IGpuFrameSink?> setSink) => _view.AttachGpu(gpu, setSink);
+
+    /// <summary>A imagem está sendo exibida pela placa de vídeo.</summary>
+    public bool GpuActive => _view.GpuActive;
 
     public void SetStats(string text)
     {

@@ -623,6 +623,9 @@ internal sealed class TrayApp : ApplicationContext
         s.Surface.FastScaling = s.Light;
         if (s.ControlAllowed) StartGamepads(s, viewer);
         viewer.Show();
+        // Decodificação e exibição na mesma placa de vídeo: o quadro vai direto para a tela, sem passar pelo processador.
+        if (s.Gpu is { } gpu && !viewer.UseGpu(gpu, sink => s.GpuSink = sink))
+            Log.Info("Exibição pela placa de vídeo indisponível nesta janela; desenhando pelo processador");
         viewer.Activate();
         Balloon($"Exibindo a tela de {s.SenderName}",
             s.ControlAllowed

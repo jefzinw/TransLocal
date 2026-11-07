@@ -99,6 +99,20 @@ internal sealed class SenderSession : IDisposable
     private long _statBytesAtLast;
     private long _statLastTs = Stopwatch.GetTimestamp();
     private double _rttMs = double.NaN;
+    private int _statBlocked;
+
+    // Atraso de cada quadro: da captura até o receptor confirmar que ele já está na tela.
+    private readonly long[] _captureTs = new long[256];
+    private readonly int[] _captureId = new int[256];
+    private readonly object _latGate = new();
+    private double _latSum, _latMax;
+    private int _latCount;
+
+    // Taxa de bits adaptativa (H.264): cai rápido quando a rede engasga e sobe devagar quando volta.
+    private volatile int _targetBitrate;
+    private int _maxBitrate, _goodSeconds;
+    private readonly Queue<double> _latHistory = new();
+    private IDisposable? _wifi;
 
     public string ReceiverName { get; }
     public string RemoteEndPoint => _conn.RemoteEndPoint;
@@ -272,8 +286,9 @@ internal sealed class SenderSession : IDisposable
                 : $"Controle de programas de administrador: {(bridge.IsConnected ? "conectado" : "aguardando o auxiliar")}");
         }
 
-        new Thread(VideoLoop) { IsBackground = true, Name = "TransLocal vídeo", Priority = ThreadPriority.AboveNormal }.Start();
-        new Thread(ReadLoop) { IsBackground = true, Name = "TransLocal leitura" }.Start();
+        _wifi = Realtime.WifiLowLatency();
+        new Thread(VideoLoop) { IsBackground = true, Name = "TransLocal vídeo", Priority = ThreadPriority.Highest }.Start();
+        new Thread(ReadLoop) { IsBackground = true, Name = "TransLocal leitura", Priority = ThreadPriority.AboveNormal }.Start();
 
         if (_audio is not null)
         {
@@ -293,6 +308,7 @@ internal sealed class SenderSession : IDisposable
     {
         Native.timeBeginPeriod(1);
         Native.SetThreadExecutionState(Native.ES_CONTINUOUS | Native.ES_SYSTEM_REQUIRED | Native.ES_DISPLAY_REQUIRED);
+        var mmcss = Realtime.BoostThread("Capture");
         ScreenCapturer? capturer = null;
         TileEncoder? encoder = null;
         H264Encoder? h264 = null;
@@ -303,7 +319,9 @@ internal sealed class SenderSession : IDisposable
         try
         {
             long interval = Stopwatch.Frequency / Math.Clamp(_limits.Fps, 1, 120);
+            int intervalMs = (int)Math.Max(1, interval * 1000 / Stopwatch.Frequency);
             long next = Stopwatch.GetTimestamp();
+            long lastFrame = 0;
             long lastBoundsCheck = Stopwatch.GetTimestamp();
             long lastCursorCheck = 0;
             long lastDxgiRetry = 0;
@@ -360,7 +378,9 @@ internal sealed class SenderSession : IDisposable
                         int bitrate = H264Encoder.BitrateFor(size.Width, size.Height, _limits.Fps, _limits.Quality);
                         try { h264 = H264Encoder.TryCreate(size.Width, size.Height, _limits.Fps, bitrate); }
                         catch (Exception ex) { Log.Warn("H.264: falha ao criar o codificador", ex); }
-                        _codecLabel = h264 is null ? "JPEG por blocos (H.264 indisponível)" : $"H.264 {(h264.Hardware ? "placa de vídeo" : "software")} {bitrate / 1e6:0.#} Mbit/s";
+                        _codecLabel = h264 is null ? "JPEG por blocos (H.264 indisponível)" : $"H.264 {(h264.Hardware ? "placa de vídeo" : "software")}";
+                        _maxBitrate = bitrate;
+                        _targetBitrate = bitrate;
                         Log.Info(h264 is null ? "H.264 indisponível neste PC; usando blocos JPEG" : $"Vídeo H.264: {h264.Name} ({(h264.Hardware ? "placa de vídeo" : "software")}), {size.Width}×{size.Height} a {_limits.Fps} q/s, {bitrate / 1e6:0.0} Mbit/s");
                     }
                     _sendSize = size;
@@ -384,13 +404,31 @@ internal sealed class SenderSession : IDisposable
                     }
                 }
 
-                if (!_inflight.Wait(500, ct)) continue;
+                if (!_inflight.Wait(0))
+                {
+                    // O receptor ainda não mostrou os quadros anteriores: a rede ou ele estão atrasados.
+                    Interlocked.Increment(ref _statBlocked);
+                    if (!_inflight.Wait(500, ct)) continue;
+                }
+
+                // Taxa de bits adaptativa decidida em Tick(): aplicada aqui, na thread do codificador.
+                if (h264 is not null && _targetBitrate > 0 && _targetBitrate != h264.CurrentBitrate && !h264.SetBitrate(_targetBitrate))
+                    _targetBitrate = h264.CurrentBitrate;
 
                 bool sent = false;
                 try
                 {
+                    bool frameSync = capturer.WaitsForFrames;
+                    if (frameSync && lastFrame != 0)
+                    {
+                        // Limite de quadros/s: não captura antes de ~7/8 do intervalo desde o último quadro.
+                        long early = lastFrame + interval - interval / 8 - Stopwatch.GetTimestamp();
+                        if (early > 0) Thread.Sleep((int)Math.Max(1, early * 1000 / Stopwatch.Frequency));
+                    }
+                    // DXGI: espera o próximo quadro da tela (até um intervalo) e captura assim que o jogo apresenta.
+                    int waitMs = !frameSync ? 0 : h264 is { Pending: true } ? 1 : needFrame || _keyRequested ? 0 : intervalMs;
                     // Sem mudança na tela (nem no cursor): não precisa reduzir nem comparar a imagem.
-                    bool got = capturer.Capture(drawCursor: true);
+                    bool got = capturer.Capture(drawCursor: true, waitMs);
                     if (capturer is DxgiCapturer dx)
                     {
                         _captureState = dx.State;
@@ -402,13 +440,14 @@ internal sealed class SenderSession : IDisposable
                     {
                         // Quadro que o codificador da placa de vídeo terminou depois: envia agora.
                         var late = h264.Poll(out bool lateKey);
-                        if (late is { Length: > 0 }) sent = SendH264(late, lateKey);
+                        if (late is { Length: > 0 }) sent = SendH264(late, lateKey, h264.LastOutputCaptureTime);
                     }
                     else if (got && (capturer.LastCaptureChanged || needFrame || (_keyRequested && h264 is not null)))
                     {
                         if (needFrame) needKey = true;
                         needFrame = false;
                         long t0 = Stopwatch.GetTimestamp();
+                        lastFrame = t0;
                         IntPtr bits = capturer.Bits;
                         if (scaler is not null)
                         {
@@ -422,7 +461,7 @@ internal sealed class SenderSession : IDisposable
                             bool force = _keyRequested || needKey;
                             _keyRequested = false;
                             needKey = false;
-                            try { data = h264.Encode(bits, _sendSize.Width * 4, force, out key); }
+                            try { data = h264.Encode(bits, _sendSize.Width * 4, force, out key, t0); }
                             catch (Exception ex)
                             {
                                 // Nunca derruba a transmissão: volta aos blocos JPEG (o receptor entende os dois).
@@ -432,14 +471,34 @@ internal sealed class SenderSession : IDisposable
                                 _codecLabel = "JPEG por blocos (H.264 falhou)";
                             }
                             Interlocked.Add(ref _statEncodeTicks, Stopwatch.GetTimestamp() - t0);
-                            if (data is { Length: > 0 }) sent = SendH264(data, key);
+                            if (data is { Length: > 0 }) sent = SendH264(data, key, h264?.LastOutputCaptureTime ?? t0);
+                            if (h264 is not null && h264.FramesWithoutOutput > Math.Max(60, _limits.Fps * 2))
+                            {
+                                // Rede de segurança: o codificador aceita os quadros mas não devolve imagem (placa que
+                                // recusa algum ajuste em silêncio). Desce um nível em vez de deixar a tela congelada.
+                                int level = h264.Conservative ? 2 : h264.Hardware ? 1 : 3;
+                                Log.Warn($"H.264: {h264.Name} passou {h264.FramesWithoutOutput} quadros sem entregar imagem; " +
+                                         (level switch { 1 => "tentando os ajustes conservadores", 2 => "usando o codificador por software", _ => "voltando aos blocos JPEG" }));
+                                h264.Dispose();
+                                h264 = null;
+                                if (level <= 2)
+                                {
+                                    try { h264 = H264Encoder.TryCreate(_sendSize.Width, _sendSize.Height, _limits.Fps, Math.Max(_targetBitrate, 1_000_000), level); }
+                                    catch (Exception ex) { Log.Warn("H.264: falha ao recriar o codificador", ex); }
+                                }
+                                needKey = true;
+                                _codecLabel = h264 is null ? "JPEG por blocos (H.264 não entregou imagem)" : $"H.264 {(h264.Hardware ? "placa de vídeo" : "software")}{(h264.Conservative ? " (ajustes conservadores)" : "")}";
+                                if (h264 is null) needFrame = true;
+                            }
                         }
                         else
                         {
-                            using var frame = encoder!.Encode(bits, _limits.Quality, Interlocked.Increment(ref _frameId));
+                            int jid = Interlocked.Increment(ref _frameId);
+                            using var frame = encoder!.Encode(bits, _limits.Quality, jid);
                             Interlocked.Add(ref _statEncodeTicks, Stopwatch.GetTimestamp() - t0);
                             if (frame.TileCount > 0)
                             {
+                                RememberCapture(jid, t0);
                                 _conn.Send(MsgType.Frame, frame.Span);
                                 sent = true;
                                 Interlocked.Increment(ref _statFrames);
@@ -452,6 +511,7 @@ internal sealed class SenderSession : IDisposable
                     if (!sent) _inflight.Release();
                 }
 
+                if (capturer?.WaitsForFrames == true) continue; // o ritmo vem da própria tela
                 next += interval;
                 now = Stopwatch.GetTimestamp();
                 if (next < now - interval) next = now;
@@ -474,6 +534,7 @@ internal sealed class SenderSession : IDisposable
         {
             capturer?.Dispose();
             h264?.Dispose();
+            Realtime.Revert(mmcss);
             Native.timeEndPeriod(1);
             Native.SetThreadExecutionState(Native.ES_CONTINUOUS);
         }
@@ -491,6 +552,7 @@ internal sealed class SenderSession : IDisposable
                 {
                     case MsgType.FrameAck:
                         try { _inflight.Release(); } catch (SemaphoreFullException) { }
+                        if (m.Length >= 4) FrameShown(BinaryPrimitives.ReadInt32LittleEndian(m.Span));
                         break;
                     case MsgType.Input:
                         if (_opt.AllowControl) ApplyInput(m.Span);
@@ -555,7 +617,29 @@ internal sealed class SenderSession : IDisposable
         double encMs = frames > 0 ? encTicks * 1000.0 / Stopwatch.Frequency / frames : 0;
         string rtt = double.IsNaN(_rttMs) ? "–" : $"{_rttMs:0.#} ms";
         string size = _sendSize.IsEmpty ? "" : $"{_sendSize.Width}×{_sendSize.Height}{(_limits.Light ? " (leve)" : "")} • ";
-        StatsUpdated?.Invoke($"{size}{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s • {_codecLabel} • codificação {encMs:0} ms • ida e volta {rtt}");
+        int blocked = Interlocked.Exchange(ref _statBlocked, 0);
+        double latAvg = double.NaN, latMax = double.NaN;
+        lock (_latGate)
+        {
+            if (_latCount > 0)
+            {
+                latAvg = _latSum / _latCount;
+                latMax = _latMax;
+            }
+            _latSum = _latMax = 0;
+            _latCount = 0;
+        }
+        // Atraso até a tela do outro lado ≈ captura → confirmação, menos a volta da confirmação (meia ida e volta).
+        double half = double.IsNaN(_rttMs) ? 0 : _rttMs / 2;
+        string lat = double.IsNaN(latAvg) ? "–" : $"{Math.Max(1, latAvg - half):0} ms (pico {Math.Max(1, latMax - half):0})";
+        AdaptBitrate(latAvg, blocked, frames / secs);
+        string rate = _targetBitrate > 0 && _limits.H264 && _maxBitrate > 0
+            ? $" • alvo {_targetBitrate / 1e6:0.0} Mbit/s{(_targetBitrate < _maxBitrate ? " (rede limitada)" : "")}"
+            : "";
+        StatsUpdated?.Invoke($"{size}{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s{rate} • {_codecLabel} • codificação {encMs:0} ms • " +
+                             $"atraso da imagem {lat} • ida e volta {rtt}");
+        try { _conn.Send(MsgType.Stats, System.Text.Encoding.UTF8.GetBytes($"atraso da imagem {lat} • ida e volta {rtt} • enviado {mbps:0.0} Mbit/s{rate}")); }
+        catch { }
 
         try { CheckCompatibility(frames / secs, mbps, rtt); }
         catch (Exception ex) { Log.Warn("Falha no diagnóstico", ex); }
@@ -620,6 +704,41 @@ internal sealed class SenderSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Controle de taxa de bits como nos serviços de jogos na nuvem: se o atraso sobe acima do normal desta ligação
+    /// (fila se formando no Wi-Fi) ou o receptor deixa quadros esperando, reduz 30% na hora; com a rede folgada por
+    /// 3 s seguidos, sobe 10% até o valor escolhido. Mantém a imagem fluida em vez de acumular atraso.
+    /// </summary>
+    private void AdaptBitrate(double latAvg, int blocked, double fps)
+    {
+        if (!_limits.H264 || _maxBitrate <= 0 || _targetBitrate <= 0) return;
+        if (double.IsNaN(latAvg)) return;
+        _latHistory.Enqueue(latAvg);
+        while (_latHistory.Count > 10) _latHistory.Dequeue();
+        double baseline = _latHistory.Min();
+        double frameMs = 1000.0 / Math.Max(1, _limits.Fps);
+        // Quadros esperando só contam junto com atraso subindo (numa ligação longa, como pela internet, esperar é normal).
+        bool congested = latAvg > baseline + Math.Max(15, frameMs * 1.5) ||
+                         (blocked > Math.Max(3, fps * 0.15) && latAvg > baseline + frameMs / 2);
+        int min = Math.Max(1_000_000, _maxBitrate / 4);
+        int target = _targetBitrate;
+        if (congested)
+        {
+            _goodSeconds = 0;
+            target = Math.Max(min, (int)(target * 0.7));
+        }
+        else if (++_goodSeconds >= 3 && target < _maxBitrate)
+        {
+            target = Math.Min(_maxBitrate, (int)(target * 1.1));
+        }
+        if (target != _targetBitrate)
+        {
+            Log.Info($"Taxa de bits {(target < _targetBitrate ? "reduzida" : "aumentada")}: {_targetBitrate / 1e6:0.0} → {target / 1e6:0.0} Mbit/s " +
+                     $"(atraso {latAvg:0} ms, normal {baseline:0} ms, {blocked} quadro(s) esperando)");
+            _targetBitrate = target;
+        }
+    }
+
     internal void SendNotice(string text)
     {
         Log.Warn("Aviso ao receptor: " + text);
@@ -627,10 +746,37 @@ internal sealed class SenderSession : IDisposable
         try { _conn.Send(MsgType.Notice, System.Text.Encoding.UTF8.GetBytes(text)); } catch { }
     }
 
-    private bool SendH264(byte[] data, bool key)
+    private void RememberCapture(int id, long captureTs)
+    {
+        lock (_latGate)
+        {
+            _captureId[id & 255] = id;
+            _captureTs[id & 255] = captureTs;
+        }
+    }
+
+    /// <summary>O receptor confirmou que o quadro já está na tela: registra o atraso desde a captura.</summary>
+    private void FrameShown(int id)
+    {
+        long now = Stopwatch.GetTimestamp();
+        lock (_latGate)
+        {
+            if (_captureId[id & 255] != id || _captureTs[id & 255] == 0) return;
+            double ms = (now - _captureTs[id & 255]) * 1000.0 / Stopwatch.Frequency;
+            _captureTs[id & 255] = 0;
+            if (ms < 0 || ms > 5000) return;
+            _latSum += ms;
+            _latCount++;
+            if (ms > _latMax) _latMax = ms;
+        }
+    }
+
+    private bool SendH264(byte[] data, bool key, long captureTs)
     {
         var msg = new byte[9 + data.Length];
-        BinaryPrimitives.WriteInt32LittleEndian(msg, Interlocked.Increment(ref _frameId));
+        int id = Interlocked.Increment(ref _frameId);
+        if (captureTs != 0) RememberCapture(id, captureTs);
+        BinaryPrimitives.WriteInt32LittleEndian(msg, id);
         BinaryPrimitives.WriteUInt16LittleEndian(msg.AsSpan(4), (ushort)_sendSize.Width);
         BinaryPrimitives.WriteUInt16LittleEndian(msg.AsSpan(6), (ushort)_sendSize.Height);
         msg[8] = (byte)(key ? 1 : 0);
@@ -665,6 +811,7 @@ internal sealed class SenderSession : IDisposable
         _injector?.ReleaseAll();
         ElevatedInputBridge.Current?.TrySendInput(InputCodec.EncodeReleaseAll());
         _gamepads?.Dispose();
+        _wifi?.Dispose();
         Log.Info($"Transmissão encerrada: {reason ?? "parada pelo usuário"}");
         _diag?.Dispose();
         try { Ended?.Invoke(this, reason); } catch (Exception ex) { Log.Error("Erro no evento de fim", ex); }
