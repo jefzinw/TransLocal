@@ -280,9 +280,34 @@ internal sealed class TrayApp : ApplicationContext
         StateChanged?.Invoke();
     }
 
-    private void Balloon(string title, string text, ToolTipIcon icon = ToolTipIcon.Info)
+    private Action? _balloonAction;
+    private bool _balloonHooked;
+
+    private void Balloon(string title, string text, ToolTipIcon icon = ToolTipIcon.Info, Action? onClick = null)
     {
-        try { _tray.ShowBalloonTip(4000, title, text, icon); } catch { }
+        if (!_balloonHooked)
+        {
+            _balloonHooked = true;
+            _tray.BalloonTipClicked += (_, _) => { var a = _balloonAction; _balloonAction = null; a?.Invoke(); };
+            _tray.BalloonTipClosed += (_, _) => _balloonAction = null;
+        }
+        _balloonAction = onClick;
+        try { _tray.ShowBalloonTip(onClick is null ? 4000 : 15000, title, text, icon); } catch { }
+    }
+
+    /// <summary>Aviso no PC: um programa de administrador está bloqueando o controle; clicar ativa a opção.</summary>
+    private void OfferElevatedControl(string program)
+    {
+        if (Settings.ElevatedControl || !Input.ElevatedInput.TrustedLocation) return;
+        Balloon($"{program} está rodando como administrador",
+            "O outro computador não consegue usar mouse e teclado nele. Clique aqui para ativar “Controlar programas abertos como administrador” (o Windows pede confirmação).",
+            ToolTipIcon.Warning,
+            async () =>
+            {
+                var (ok, message) = await SetElevatedControlAsync(true);
+                if (ok) Balloon("Controle de administrador ativado", "Mouse e teclado do outro computador agora chegam a programas de administrador.");
+                else if (message is not null) Balloon("Não foi possível ativar", message, ToolTipIcon.Warning);
+            });
     }
 
     public void NotifyHiddenOnce()
@@ -694,6 +719,7 @@ internal sealed class TrayApp : ApplicationContext
             SenderStats = text;
             Changed();
         });
+        session.ElevatedBlocked += program => Ui(() => OfferElevatedControl(program));
         session.Ended += (ss, reason) => Ui(() =>
         {
             if (_sender == ss) _sender = null;

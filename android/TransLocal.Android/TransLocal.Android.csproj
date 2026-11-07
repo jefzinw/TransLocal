@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0-android</TargetFramework>
     <SupportedOSPlatformVersion>26</SupportedOSPlatformVersion>
@@ -8,14 +8,14 @@
     <RootNamespace>TransLocal.Mobile</RootNamespace>
     <AssemblyName>TransLocal.Mobile</AssemblyName>
     <ApplicationId>com.jefzinw.translocal</ApplicationId>
-    <ApplicationVersion>140</ApplicationVersion>
-    <ApplicationDisplayVersion>1.4.0</ApplicationDisplayVersion>
+    <ApplicationVersion>141</ApplicationVersion>
+    <ApplicationDisplayVersion>1.4.1</ApplicationDisplayVersion>
     <AndroidPackageFormat>apk</AndroidPackageFormat>
     <RuntimeIdentifiers>android-arm64;android-arm</RuntimeIdentifiers>
-    <!-- As mensagens do protocolo usam System.Text.Json por reflexão: não podar o código do app. -->
+    <!-- As mensagens do protocolo usam System.Text.Json por reflexÃ£o: nÃ£o podar o cÃ³digo do app. -->
     <TrimMode>partial</TrimMode>
     <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
-    <!-- Código compartilhado com o Windows referencia APIs só do Windows que o celular não usa. -->
+    <!-- CÃ³digo compartilhado com o Windows referencia APIs sÃ³ do Windows que o celular nÃ£o usa. -->
     <NoWarn>$(NoWarn);CA1416;CA1422</NoWarn>
   </PropertyGroup>
 
@@ -24,7 +24,7 @@
     <JavaSdkDirectory Condition="'$(JavaSdkDirectory)' == '' and Exists('$(LOCALAPPDATA)\Microsoft\jdk-android')">$(LOCALAPPDATA)\Microsoft\jdk-android</JavaSdkDirectory>
   </PropertyGroup>
 
-  <!-- Protocolo e segurança: os MESMOS arquivos do aplicativo Windows. -->
+  <!-- Protocolo e seguranÃ§a: os MESMOS arquivos do aplicativo Windows. -->
   <ItemGroup>
     <Compile Include="..\..\src\TransLocal\Protocol.cs" Link="Shared\Protocol.cs" />
     <Compile Include="..\..\src\TransLocal\Discovery.cs" Link="Shared\Discovery.cs" />

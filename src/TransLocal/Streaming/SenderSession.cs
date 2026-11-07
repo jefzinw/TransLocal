@@ -101,6 +101,9 @@ internal sealed class SenderSession : IDisposable
     /// <summary>Texto de estatísticas a cada segundo (thread de segundo plano).</summary>
     public event Action<string>? StatsUpdated;
 
+    /// <summary>Um programa de administrador está em primeiro plano e o controle não chega a ele (nome do programa).</summary>
+    public event Action<string>? ElevatedBlocked;
+
     /// <summary>Fim da sessão; o texto é o motivo (null quando parada localmente).</summary>
     public event Action<SenderSession, string?>? Ended;
 
@@ -292,6 +295,7 @@ internal sealed class SenderSession : IDisposable
             long next = Stopwatch.GetTimestamp();
             long lastBoundsCheck = Stopwatch.GetTimestamp();
             long lastCursorCheck = 0;
+            long lastDxgiRetry = 0;
             var screen = _screen;
 
             while (!ct.IsCancellationRequested)
@@ -309,9 +313,29 @@ internal sealed class SenderSession : IDisposable
                         capturer = null;
                     }
                 }
+                // Começou na captura GDI porque o DXGI recusou (ex.: confirmação do UAC na tela quando o jogo abriu):
+                // tenta voltar ao DXGI a cada 5 s, mantendo a mesma resolução e o mesmo codificador.
+                if (capturer is GdiCapturer gdi && now - lastDxgiRetry > Stopwatch.Frequency * 5)
+                {
+                    lastDxgiRetry = now;
+                    try
+                    {
+                        var dx = new DxgiCapturer(screen);
+                        if (dx.Width == gdi.Width && dx.Height == gdi.Height)
+                        {
+                            gdi.Dispose();
+                            capturer = dx;
+                            needFrame = true;
+                            Log.Info($"Captura DXGI disponível de novo: saindo da captura GDI ({dx.State})");
+                        }
+                        else dx.Dispose();
+                    }
+                    catch { /* continua no GDI; nova tentativa em 5 s */ }
+                }
                 if (capturer is null)
                 {
                     capturer = ScreenCapturer.Create(screen);
+                    lastDxgiRetry = Stopwatch.GetTimestamp();
                     var size = FrameScaler.Fit(new Size(capturer.Width, capturer.Height), _limits.MaxWidth, _limits.MaxHeight);
                     scaler = size == new Size(capturer.Width, capturer.Height)
                         ? null
@@ -500,6 +524,7 @@ internal sealed class SenderSession : IDisposable
                     ? "No PC, aba Transmitir, ative “Controlar programas abertos como administrador”."
                     : "O controle de administrador está ativado, mas o auxiliar não respondeu; reinicie o TransLocal no PC.";
                 SendNotice($"{fg.Name} está aberto como administrador no PC: o Windows bloqueia mouse e teclado vindos de outros programas. {how}");
+                if (bridge is null) try { ElevatedBlocked?.Invoke(fg.Name); } catch { }
             }
         }
         else if (!fg.Elevated)
