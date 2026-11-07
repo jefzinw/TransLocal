@@ -309,7 +309,8 @@ internal static class DevTools
         using var nbViewer = new ReceiverServer(() => NbChannel(false), () => false, () => new ReceiverPrefs(1366, 768, true));
         var pulledStarted = new TaskCompletionSource<ReceiverSession>(TaskCreationOptions.RunContinuationsAsynchronously);
         nbViewer.SessionStarted += s => pulledStarted.TrySetResult(s);
-        var (pullConn, pullPeer) = await RemotePull.RequestAsync("127.0.0.1", port, NbChannel(false), totp.Current(), _ => { }, CancellationToken.None);
+        string usedCode = totp.Current();
+        var (pullConn, pullPeer) = await RemotePull.RequestAsync("127.0.0.1", port, NbChannel(false), usedCode, _ => { }, CancellationToken.None);
         var pullTask = Task.Run(() => { try { nbViewer.ServeIncomingStream(pullConn, pullPeer, requestedByUs: true); } finally { pullConn.Dispose(); } });
         var pulled = await pulledStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
         await Task.Delay(2000);
@@ -317,7 +318,8 @@ internal static class DevTools
             $"acesso remoto com código: tela do PC recebida no notebook em {pulled.Surface.Width}×{pulled.Surface.Height} (modo leve)");
         try
         {
-            await RemotePull.RequestAsync("127.0.0.1", port, NbChannel(false), totp.Current(), _ => { }, CancellationToken.None);
+            // O mesmo código de novo (pedir o "atual" outra vez poderia trazer o da janela seguinte, que é válido).
+            await RemotePull.RequestAsync("127.0.0.1", port, NbChannel(false), usedCode, _ => { }, CancellationToken.None);
             Check(false, "código já usado deveria ser recusado");
         }
         catch (Security.AuthException)
@@ -467,6 +469,142 @@ internal static class DevTools
     /// --codec-test: 180 quadros 1366×768 com movimento (tela atual + faixa e quadro andando, como num jogo),
     /// codificados em H.264 e decodificados de volta. Mede tempo, taxa a 60 q/s, fidelidade e compara com JPEG.
     /// </summary>
+    /// <summary>
+    /// Transmissão de ponta a ponta como no uso real (--stream-test): transmissor e receptor nesta máquina, imagem
+    /// sintética em movimento (não captura a tela), codificador da placa, UDP com correção, janela de exibição de
+    /// verdade (fora da tela, sem foco) decodificando pela placa. Mede quadros/s exibidos e o atraso.
+    /// </summary>
+    /// <summary>
+    /// Captura real pela placa (--capture-test): o PC transmite a própria tela (DXGI → cursor → redução/conversão →
+    /// codificador, tudo na placa) e o receptor decodifica na memória. A imagem recebida é comparada numericamente com
+    /// uma foto da tela tirada no mesmo instante — nenhuma imagem é salva nem mostrada.
+    /// </summary>
+    public static unsafe int CaptureTest()
+    {
+        int failures = 0;
+        void Check(bool ok, string what)
+        {
+            Log.Info($"CAPTURETEST {(ok ? "OK  " : "FALHOU")} {what}");
+            if (!ok) failures++;
+        }
+        const int port = 52044, discoveryPort = 52045;
+        using var pcId = Security.DeviceIdentity.CreateEphemeral();
+        using var nbId = Security.DeviceIdentity.CreateEphemeral();
+        var prefs = new ReceiverPrefs(0, 0, false);
+        using var server = new ReceiverServer(() => new Security.SecureChannelOptions { Identity = nbId, Trust = new MemoryTrust(), LocalName = "Notebook-Teste", ConfirmPairing = _ => true },
+            () => false, () => prefs, port: port, discoveryPort: discoveryPort);
+        ReceiverSession? session = null;
+        server.SessionStarted += s => session = s;
+        server.Start();
+        var screen = Screen.PrimaryScreen!;
+        var opt = new SenderOptions { Name = "PC-Teste", Fps = 30, Quality = 92, Audio = false, Resolution = "original", MonitorDeviceName = screen.DeviceName };
+        string lastStats = "";
+        using var sender = SenderSession.ConnectAsync("127.0.0.1", port, opt,
+            new Security.SecureChannelOptions { Identity = pcId, Trust = new MemoryTrust(), LocalName = "PC-Teste", ConfirmPairing = _ => true }, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        sender.StatsUpdated += t => { lastStats = t; Log.Info("CAPTURETEST [PC] " + t); };
+        var wait = Stopwatch.StartNew();
+        while (wait.ElapsedMilliseconds < 5000) Thread.Sleep(50);
+        Check(session is not null && Interlocked.Read(ref session.FramesReceived) > 0, $"imagem da tela recebida ({session?.FramesReceived ?? 0} quadro(s))");
+        Check(lastStats.Contains("toda na placa"), "captura → cursor → redução/conversão → codificação toda na placa de vídeo");
+        if (session is not null && session.Surface.Width == screen.Bounds.Width)
+        {
+            // Foto da tela agora (a área de trabalho costuma estar parada) e comparação com o que chegou.
+            using var bmp = new Bitmap(screen.Bounds.Width, screen.Bounds.Height, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+            using (var g = Graphics.FromImage(bmp)) g.CopyFromScreen(screen.Bounds.Location, Point.Empty, bmp.Size);
+            var data = bmp.LockBits(new Rectangle(Point.Empty, bmp.Size), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+            double mse = 0;
+            int n = 0;
+            try
+            {
+                for (int y = 0; y < bmp.Height; y += 3)
+                {
+                    uint* row = (uint*)((byte*)data.Scan0 + (long)y * data.Stride);
+                    for (int x = 0; x < bmp.Width; x += 3)
+                    {
+                        int a = (int)((row[x] >> 8) & 0xFF), b = (int)((session.Surface.PixelAt(x, y) >> 8) & 0xFF);
+                        mse += (a - b) * (a - b);
+                        n++;
+                    }
+                }
+            }
+            finally { bmp.UnlockBits(data); }
+            double psnr = mse <= 0 ? 99 : 10 * Math.Log10(255.0 * 255.0 / (mse / n));
+            Check(psnr > 28, $"imagem recebida igual à tela: {psnr:0.0} dB (cores e posição pela placa; partes que mudaram no instante baixam a nota)");
+        }
+        else Check(false, $"tamanho recebido {session?.Surface.Width}×{session?.Surface.Height} diferente da tela {screen.Bounds.Width}×{screen.Bounds.Height}");
+        sender.Dispose();
+        Thread.Sleep(300);
+        Log.Info(failures == 0 ? "CAPTURETEST concluído: tudo certo" : $"CAPTURETEST concluído com {failures} falha(s)");
+        return failures == 0 ? 0 : 1;
+    }
+
+    public static int StreamTest()
+    {
+        int failures = 0;
+        void Check(bool ok, string what)
+        {
+            Log.Info($"STREAMTEST {(ok ? "OK  " : "FALHOU")} {what}");
+            if (!ok) failures++;
+        }
+        Environment.SetEnvironmentVariable("TRANSLOCAL_TEST_PATTERN", "1");
+        const int port = 52040, discoveryPort = 52041;
+        using var pcId = Security.DeviceIdentity.CreateEphemeral();
+        using var nbId = Security.DeviceIdentity.CreateEphemeral();
+        var pcTrust = new MemoryTrust();
+        var nbTrust = new MemoryTrust();
+        var prefs = new ReceiverPrefs(1366, 768, true); // notebook pedindo transmissão leve, como o do usuário
+        using var server = new ReceiverServer(() => new Security.SecureChannelOptions { Identity = nbId, Trust = nbTrust, LocalName = "Notebook-Teste", ConfirmPairing = _ => true },
+            () => false, () => prefs, port: port, discoveryPort: discoveryPort);
+        ReceiverSession? session = null;
+        server.SessionStarted += s => session = s;
+        server.Start();
+        var opt = new SenderOptions { Name = "PC-Teste", Fps = 60, Quality = 92, Audio = false, Resolution = "auto" };
+        var stats = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var sender = SenderSession.ConnectAsync("127.0.0.1", port, opt,
+            new Security.SecureChannelOptions { Identity = pcId, Trust = pcTrust, LocalName = "PC-Teste", ConfirmPairing = _ => true }, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        sender.StatsUpdated += t => { stats.Enqueue(t); Log.Info("STREAMTEST [PC] " + t); };
+        var wait = Stopwatch.StartNew();
+        while (session is null && wait.ElapsedMilliseconds < 10_000) { Application.DoEvents(); Thread.Sleep(10); }
+        if (session is null) { Check(false, "o receptor não abriu a sessão"); return 1; }
+        string receiverStats = "";
+        session.StatsUpdated += t => { receiverStats = t; Log.Info("STREAMTEST [notebook] " + t); };
+
+        var hidden = SystemInformation.VirtualScreen;
+        var viewer = new ViewerForm("TESTE", session.Surface, null, Screen.PrimaryScreen!, fullscreen: false, showStats: true, new Size(1366, 768))
+        { NoActivate = true, ShowInTaskbar = false, StartPosition = FormStartPosition.Manual };
+        viewer.Location = new Point(hidden.Right + 200, hidden.Bottom + 200);
+        viewer.ClientSize = new Size(1366, 808);
+        session.FrameReady += viewer.NotifyFrame;
+        session.StatsUpdated += viewer.SetStats;
+        viewer.Show();
+        bool gpu = session.Gpu is { } dev && viewer.UseGpu(dev, s => session.GpuSink = s);
+        Check(gpu, "janela exibindo pela placa de vídeo");
+
+        // Aquecimento (quadro-chave, troca para a decodificação pela placa), depois 8 s de medição.
+        var warm = Stopwatch.StartNew();
+        while (warm.ElapsedMilliseconds < 3000) { Application.DoEvents(); Thread.Sleep(5); }
+        long f0 = Interlocked.Read(ref session.FramesReceived);
+        var measure = Stopwatch.StartNew();
+        while (measure.ElapsedMilliseconds < 8000) { Application.DoEvents(); Thread.Sleep(5); }
+        double fps = (Interlocked.Read(ref session.FramesReceived) - f0) / measure.Elapsed.TotalSeconds;
+        Check(session.CodecLabel.Contains("placa de vídeo"), $"decodificação: {session.CodecLabel}");
+        Check(fps >= 55, $"{fps:0.0} quadros/s exibidos no receptor (meta 60)");
+        var last = stats.ToArray().Skip(3).ToArray();
+        string latency = last.Length > 0 ? last[^1] : "";
+        Check(latency.Contains("UDP"), $"transporte: {(latency.Contains("UDP") ? "UDP com correção de erros" : "TCP")}");
+        Log.Info($"STREAMTEST resumo do PC: {latency}");
+        Log.Info($"STREAMTEST resumo do notebook: {receiverStats}");
+        viewer.Close();
+        viewer.Dispose();
+        sender.Dispose();
+        Thread.Sleep(300);
+        Environment.SetEnvironmentVariable("TRANSLOCAL_TEST_PATTERN", null);
+        Log.Info(failures == 0 ? "STREAMTEST concluído: tudo certo" : $"STREAMTEST concluído com {failures} falha(s)");
+        return failures == 0 ? 0 : 1;
+    }
+
     /// <summary>Apaga pedaços ao acaso (até o limite da paridade) e confere que os dados voltam iguais.</summary>
     private static bool ReedSolomonSelfTest(out string detail)
     {
@@ -528,6 +666,92 @@ internal static class DevTools
     /// cadeia de troca, sem a imagem passar pelo processador; depois fotografa a tela (composição do Windows) e
     /// compara com o original. Também confere os textos por cima, o caminho BGRA e o redimensionamento.
     /// </summary>
+    /// <summary>
+    /// Compara, quadro a quadro, a decodificação direta (D3D11VA) com a do Windows no mesmo fluxo (--d3d11va-verify).
+    /// Registra os detalhes do primeiro quadro que diverge.
+    /// </summary>
+    public static unsafe int D3D11VaVerify()
+    {
+        const int w = 960, h = 540;
+        int frames = int.TryParse(Environment.GetEnvironmentVariable("TRANSLOCAL_VERIFY_FRAMES"), out var nf) ? nf : 150;
+        using var gpu = GpuDevice.TryCreate();
+        if (gpu is null) return 1;
+        using var form = new Form { StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000), ClientSize = new Size(w, h), ShowInTaskbar = false };
+        _ = form.Handle;
+        using var presenter = GpuPresenter.TryCreate(gpu, form.Handle, w, h)!;
+        uint[]? shown = null;
+        presenter.BeforePresent = back =>
+        {
+            var d = back.Description;
+            using var staging = gpu.Device.CreateTexture2D(new Vortice.Direct3D11.Texture2DDescription
+            {
+                Width = d.Width, Height = d.Height, MipLevels = 1, ArraySize = 1, Format = d.Format,
+                SampleDescription = new Vortice.DXGI.SampleDescription(1, 0), Usage = Vortice.Direct3D11.ResourceUsage.Staging,
+                CPUAccessFlags = Vortice.Direct3D11.CpuAccessFlags.Read,
+            });
+            gpu.Context.CopyResource(staging, back);
+            var map = gpu.Context.Map(staging, 0, Vortice.Direct3D11.MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+            try
+            {
+                var img = new uint[w * h];
+                for (int y = 0; y < h; y++)
+                    fixed (uint* dst = &img[y * w]) Buffer.MemoryCopy((byte*)map.DataPointer + (long)y * map.RowPitch, dst, w * 4L, w * 4L);
+                shown = img;
+            }
+            finally { gpu.Context.Unmap(staging, 0); }
+        };
+        bool high = Environment.GetEnvironmentVariable("TRANSLOCAL_H264_PROFILE") == "100";
+        using var enc = H264Encoder.TryCreate(w, h, 60, 6_000_000, high: high);
+        using var reference = H264Decoder.TryCreate(hardware: false);
+        using var d3d = D3D11H264Decoder.TryCreate(gpu);
+        using var surface = new FrameSurface();
+        if (enc is null || reference is null || d3d is null) { Log.Info("VERIFY sem codificador/decodificadores"); return 1; }
+        Log.Info($"VERIFY codificador {enc.Name}, perfil {enc.Profile}");
+        var rng = new Random(3);
+        var src = new uint[w * h];
+        int bad = 0, compared = 0;
+        double worst = 99;
+        fixed (uint* f = src)
+        {
+            for (int i = 0; i < frames; i++)
+            {
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
+                    {
+                        int xs = x + i * 7;
+                        f[y * w + x] = 0xFF000000u | (uint)(((xs * 255 / w) & 0xFF) << 16) | (uint)((y * 255 / h) << 8) | (uint)((((xs >> 3) ^ (y >> 3)) * 37) & 0xFF);
+                    }
+                var data = enc.Encode((IntPtr)f, w * 4, i == 0, out _);
+                if (data is null) { Thread.Sleep(2); data = enc.Poll(out _); }
+                if (data is null) continue;
+                bool okRef = reference.Decode(data, w, h, surface, out _);
+                shown = null;
+                bool okHw = d3d.Decode(data, w, h, presenter, out bool err);
+                if (!okRef || !okHw || shown is null) { Log.Info($"VERIFY quadro {i}: ref={okRef} d3d={okHw} erro={err} {d3d.Unsupported} • {d3d.LastInfo}"); continue; }
+                double mse = 0;
+                int n = 0;
+                for (int y = 0; y < h; y += 2)
+                    for (int x = 0; x < w; x += 2)
+                    {
+                        int a = (int)((surface.PixelAt(x, y) >> 8) & 0xFF), b = (int)((shown[y * w + x] >> 8) & 0xFF);
+                        mse += (a - b) * (a - b);
+                        n++;
+                    }
+                double psnr = mse <= 0 ? 99 : 10 * Math.Log10(255.0 * 255.0 / (mse / n));
+                compared++;
+                worst = Math.Min(worst, psnr);
+                if (psnr < 38)
+                {
+                    bad++;
+                    if (bad <= 6) Log.Info($"VERIFY quadro {i}: {psnr:0.0} dB • {d3d.LastInfo}");
+                }
+                else if (i < 4 || i % 40 == 0) Log.Info($"VERIFY quadro {i}: {psnr:0.0} dB (ok) • {d3d.LastInfo}");
+            }
+        }
+        Log.Info($"VERIFY concluído: {compared} comparados, {bad} divergentes, pior {worst:0.0} dB");
+        return bad == 0 ? 0 : 1;
+    }
+
     public static unsafe int GpuTest()
     {
         int failures = 0;
@@ -738,6 +962,56 @@ internal static class DevTools
             psnr = Math.Max(psnr, psnrAligned);
         }
         Check(psnr > 30, $"imagem na tela igual à original: {psnr:0.0} dB (cores e posição pelo processador de vídeo da placa)");
+
+        // Decodificação direta pela placa (D3D11VA, sem a Media Foundation): o mesmo fluxo, quadro a quadro.
+        {
+            double AlignedPsnr()
+            {
+                presenter.Redraw();
+                var sh2 = shown!;
+                double bestErr = double.MaxValue;
+                int samples = 0;
+                for (int dx = -140; dx <= 140; dx++)
+                {
+                    double e = 0;
+                    int cnt2 = 0;
+                    for (int y = 8; y < h - 8; y += 6)
+                        for (int x = 150; x < w - 150; x += 6)
+                        {
+                            int a = (int)((frame[y * w + x + dx] >> 8) & 0xFF), b = (int)((sh2[y * w + x] >> 8) & 0xFF);
+                            e += (a - b) * (a - b);
+                            cnt2++;
+                        }
+                    if (e < bestErr) { bestErr = e; samples = cnt2; }
+                }
+                double mse2 = bestErr / Math.Max(1, samples);
+                return mse2 <= 0 ? 99 : 10 * Math.Log10(255.0 * 255.0 / mse2);
+            }
+            using var d3d = D3D11H264Decoder.TryCreate(gpu);
+            Check(d3d is not null, $"decodificação direta pela placa disponível: {d3d?.Name}");
+            if (d3d is not null)
+            {
+                int ok = 0, errors = 0;
+                long ticks = 0, peak = 0;
+                foreach (var data in stream)
+                {
+                    sw.Restart();
+                    if (d3d.Decode(data, w, h, presenter, out bool err)) ok++;
+                    long t = sw.ElapsedTicks;
+                    ticks += t;
+                    peak = Math.Max(peak, t);
+                    if (err) errors++;
+                    if (d3d.Unsupported is not null) break;
+                }
+                double ms = ticks * 1000.0 / Stopwatch.Frequency / Math.Max(1, stream.Count);
+                Check(d3d.Unsupported is null && ok == stream.Count && errors == 0,
+                    $"D3D11VA: {ok}/{stream.Count} quadros decodificados pela placa e exibidos, {ms:0.00} ms por quadro (pico {peak * 1000.0 / Stopwatch.Frequency:0.0} ms)" +
+                    (d3d.Unsupported is null ? "" : $" — sem suporte: {d3d.Unsupported}"));
+                double p2 = AlignedPsnr();
+                Compare(frame, "translocal-gputest-d3d11va.png");
+                Check(p2 > 30, $"D3D11VA: imagem igual à original: {p2:0.0} dB");
+            }
+        }
 
         // Caminho BGRA (blocos JPEG, decodificação por software, HDMI) pela mesma exibição.
         surface.EnsureSize(w, h);

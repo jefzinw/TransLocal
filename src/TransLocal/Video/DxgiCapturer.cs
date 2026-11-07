@@ -53,6 +53,27 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
     private IDXGIOutputDuplication? _dup;
     private ID3D11Texture2D? _staging;
     private Format _stagingFormat;
+
+    // Modo placa de vídeo: o quadro fica numa textura da própria placa (sem cópia para a memória do processador).
+    private ID3D11Texture2D? _gpuFrame;
+    private bool _gpuValid;
+
+    /// <summary>Entrega os quadros na placa de vídeo (<see cref="GpuFrame"/>) em vez de copiá-los para a memória.</summary>
+    public bool GpuMode { get; set; }
+
+    public override bool GpuComposition => GpuMode;
+
+    /// <summary>Dispositivo da captura (a montagem e o codificador usam o mesmo, sem cópias entre placas).</summary>
+    public ID3D11Device? Device => _device;
+
+    /// <summary>Muda quando o dispositivo é recriado (driver reiniciado, falhas seguidas): quem o usa recria o seu lado.</summary>
+    public int DeviceGeneration { get; private set; }
+
+    /// <summary>Último quadro na placa (BGRA), ou null se o mais recente veio por outro caminho (GDI, tela segura) — aí use <see cref="CleanBits"/>.</summary>
+    public ID3D11Texture2D? GpuFrame => _gpuValid ? _gpuFrame : null;
+
+    /// <summary>Último quadro na memória (BGRA, sem cursor), para quando ele não veio pela placa.</summary>
+    public IntPtr CleanBits => (IntPtr)_cleanPtr;
     private Format _lastFormat;
     private bool _hasFrame;
     private bool _cleanChanged;
@@ -127,6 +148,7 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         bridge.RequestSecureFrames(_secure.Name, Bounds);
         if (_secure.TryRead(_cleanPtr, out _))
         {
+            _gpuValid = false;
             if (!_secureActive) Log.Info("Transmitindo a tela segura do Windows (UAC) pelo agente SYSTEM do serviço");
             _secureActive = true;
             _hasFrame = true;
@@ -159,7 +181,12 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         if (_adapter is null || _output is null) throw new NotSupportedException($"Saída DXGI não encontrada para {_deviceName}");
 
         var levels = new[] { FeatureLevel.Level_11_1, FeatureLevel.Level_11_0, FeatureLevel.Level_10_1, FeatureLevel.Level_10_0 };
-        D3D11.D3D11CreateDevice(_adapter, DriverType.Unknown, DeviceCreationFlags.BgraSupport, levels, out _device, out _context).CheckError();
+        // VideoSupport: o processador de vídeo e o codificador da placa usam este mesmo dispositivo.
+        if (D3D11.D3D11CreateDevice(_adapter, DriverType.Unknown, DeviceCreationFlags.BgraSupport | DeviceCreationFlags.VideoSupport, levels, out _device, out _context).Failure)
+            D3D11.D3D11CreateDevice(_adapter, DriverType.Unknown, DeviceCreationFlags.BgraSupport, levels, out _device, out _context).CheckError();
+        try { using var mt = _device!.QueryInterface<ID3D11Multithread>(); mt.SetMultithreadProtected(true); } catch { }
+        DeviceGeneration++;
+        _gpuValid = false;
 
         CreateDuplication();
         SeedFromGdi();
@@ -183,6 +210,7 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         Buffer.MemoryCopy((void*)Bits, _cleanPtr, bytes, bytes);
         _hasFrame = true;
         _cleanChanged = true;
+        _gpuValid = false;
     }
 
     private void CreateDuplication()
@@ -290,6 +318,26 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
                 {
                     using var texture = resource.QueryInterface<ID3D11Texture2D>();
                     var format = texture.Description.Format;
+                    if (GpuMode && format is Format.B8G8R8A8_UNorm or Format.B8G8R8X8_UNorm)
+                    {
+                        // Fica na placa: cópia de textura para textura (a duplicação reaproveita a dela).
+                        if (_gpuFrame is null || _gpuFrame.Description.Format != format)
+                        {
+                            _gpuFrame?.Dispose();
+                            _gpuFrame = _device!.CreateTexture2D(new Texture2DDescription
+                            {
+                                Width = (uint)Width, Height = (uint)Height, MipLevels = 1, ArraySize = 1, Format = format,
+                                SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Default,
+                                BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget,
+                            });
+                        }
+                        _context!.CopyResource(_gpuFrame, texture);
+                        _lastFormat = format;
+                        _gpuValid = true;
+                        _hasFrame = true;
+                        _cleanChanged = true;
+                        goto acquired;
+                    }
                     EnsureStaging(format);
                     _lastFormat = format;
                     _context!.CopyResource(_staging!, texture);
@@ -304,7 +352,9 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
                     }
                     _hasFrame = true;
                     _cleanChanged = true;
+                    _gpuValid = false;
                 }
+                acquired:
                 if (_failures > 0 && Environment.TickCount64 - _openedAt > 2000)
                 {
                     Log.Info($"Captura DXGI estável de novo após {_failures} falha(s) ({_api}{(_lastFormat == Format.Unknown ? "" : ", " + _lastFormat)})");
@@ -426,6 +476,7 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         Buffer.MemoryCopy((void*)Bits, _cleanPtr, bytes, bytes);
         _hasFrame = true;
         _cleanChanged = true;
+        _gpuValid = false;
     }
 
     private bool LooksBlack(byte* bgra)
@@ -465,6 +516,9 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         _dup = null;
         _staging?.Dispose();
         _staging = null;
+        _gpuFrame?.Dispose();
+        _gpuFrame = null;
+        _gpuValid = false;
         _context?.Dispose();
         _context = null;
         _device?.Dispose();

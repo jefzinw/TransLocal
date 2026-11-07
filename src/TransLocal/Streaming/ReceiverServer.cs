@@ -249,7 +249,7 @@ internal sealed class ReceiverServer : IDisposable
                 ScreenWidth = prefs.ScreenWidth,
                 ScreenHeight = prefs.ScreenHeight,
                 Light = prefs.Light,
-                Codecs = Video.H264Decoder.IsAvailable ? new[] { "h264" } : null,
+                Codecs = session.CodecList(),
                 Transports = Environment.GetEnvironmentVariable("TRANSLOCAL_NO_UDP") == "1" ? null : new[] { "udp1" },
             });
             Log.Info($"Recebendo de {hello.Name} ({conn.RemoteEndPoint}) {hello.Width}×{hello.Height}, áudio={hello.Audio}, controle={hello.Control}, controles de jogo={hello.Gamepads ?? "?"}");
@@ -460,6 +460,8 @@ internal sealed class ReceiverSession
             {
                 _decoder?.Dispose();
                 _decoder = null;
+                _hw?.Dispose();
+                _hw = null;
             }
             Native.timeEndPeriod(1);
             Thread.CurrentThread.Priority = priority;
@@ -474,10 +476,28 @@ internal sealed class ReceiverSession
     }
 
     private readonly object _videoGate = new();
+    private Video.D3D11H264Decoder? _hw;
+    private bool _hwFailed, _hwActive;
+
+    /// <summary>Como os quadros H.264 estão sendo decodificados (estatística e testes).</summary>
+    public string CodecLabel => _codecLabel;
+
+    /// <summary>Quadros decodificados pela placa de vídeo direto (D3D11VA) desde o começo.</summary>
+    public bool HardwareDecodeActive => _hwActive;
+
+    /// <summary>Formatos anunciados ao transmissor: "h264-hw" = decodifica pela placa de vídeo (ele pode usar o perfil High).</summary>
+    public string[]? CodecList()
+    {
+        if (!Video.H264Decoder.IsAvailable) return null;
+        var gpu = Gpu;
+        bool hw = gpu is not null && Video.D3D11H264Decoder.IsSupported(gpu);
+        return hw ? new[] { "h264", "h264-hw" } : new[] { "h264" };
+    }
     private Streaming.UdpVideoReceiver? _udp;
     private string _udpLabel = "";
     private long _udpBytes, _framesSkipped;
     private int _lastVideoId = int.MinValue;
+    private volatile int _videoW, _videoH;
     private bool _waitKey;
 
     /// <summary>O transmissor ofereceu vídeo por UDP: abre o socket e se apresenta (o vídeo passa a vir por ele).</summary>
@@ -508,9 +528,9 @@ internal sealed class ReceiverSession
         }
     }
 
-    private void RequestKey(bool fast)
+    private void RequestKey(bool fast, bool skip = true)
     {
-        _waitKey = true;
+        if (skip) _waitKey = true;
         long now = Environment.TickCount64;
         if (now - Interlocked.Read(ref _lastKeyRequest) < (fast ? 150 : 1000)) return;
         Interlocked.Exchange(ref _lastKeyRequest, now);
@@ -522,6 +542,8 @@ internal sealed class ReceiverSession
     {
         Span<byte> ack = stackalloc byte[4];
         bool produced = false, error = false, onGpu = false;
+        _videoW = vw;
+        _videoH = vh;
         lock (_videoGate)
         {
             long t1 = Stopwatch.GetTimestamp();
@@ -530,9 +552,54 @@ internal sealed class ReceiverSession
             if (viaUdp && _lastVideoId != int.MinValue && vid != _lastVideoId + 1 && vid > _lastVideoId && !key) RequestKey(fast: true);
             if (vid > _lastVideoId || _lastVideoId == int.MinValue) _lastVideoId = vid;
             if (key) _waitKey = false;
+            var hwSink = GpuSink;
+            if (_decoder is null && !_decoderFailed && vw > 0 && vh > 0)
+            {
+                _decoder = Video.H264Decoder.TryCreate(hardware: true, Gpu, vw, vh);
+                _decoderFailed = _decoder is null;
+                _codecLabel = _decoder is null ? "H.264 sem decodificador" : $"H.264 decodificado pel{(_decoder.Hardware ? "a placa de vídeo" : "o processador")}";
+                Log.Info(_decoder is null ? "H.264: sem decodificador neste computador" : $"Decodificando H.264: {_decoder.Name} ({(_decoder.Hardware ? "placa de vídeo" : "processador")})");
+            }
+            // Ordem: o decodificador do Windows pela placa (testado pela Microsoft em todas as placas); se ele não usar a
+            // placa, a decodificação direta do TransLocal (D3D11VA); por último, o processador.
+            bool preferDirect = Environment.GetEnvironmentVariable("TRANSLOCAL_PREFER_D3D11VA") == "1";
+            if ((_decoder is not { Hardware: true } || preferDirect) &&
+                hwSink is { Failed: false } && _hw is null && !_hwFailed && Gpu is { } gpuDev)
+            {
+                // Decodificação direta pela placa (D3D11VA): começa no próximo quadro-chave.
+                _hw = Video.D3D11H264Decoder.TryCreate(gpuDev);
+                _hwFailed = _hw is null;
+                if (_hw is not null && !key) RequestKey(fast: true, skip: false);
+            }
+            if (_hwActive && hwSink is not { Failed: false })
+            {
+                // A janela deixou de usar a placa: volta ao decodificador do Windows a partir de um quadro-chave.
+                _hwActive = false;
+                _hwFailed = true;
+                RequestKey(fast: true, skip: false);
+            }
             if (_waitKey && viaUdp)
             {
                 Interlocked.Increment(ref _framesSkipped);
+            }
+            else if (_hw is not null && !_hwFailed && hwSink is { Failed: false } && (_hwActive || key))
+            {
+                produced = _hw.Decode(annexB, vw, vh, hwSink, out error);
+                onGpu = produced;
+                if (produced && !_hwActive)
+                {
+                    _hwActive = true;
+                    _codecLabel = "H.264 decodificado pela placa de vídeo (D3D11VA)";
+                    Log.Info($"Decodificando H.264 pela placa de vídeo: {_hw.Name}");
+                }
+                if (_hw.Unsupported is { } why)
+                {
+                    Log.Info($"H.264: a decodificação direta não cobre este fluxo ({why}); usando o decodificador do Windows");
+                    _hwActive = false;
+                    _hwFailed = true;
+                    produced = false;
+                    error = true;
+                }
             }
             else
             {
@@ -632,6 +699,7 @@ internal sealed class ReceiverSession
         }
         string decWord = gpu > 0 ? "decodificação + exibição" : "decodificação";
         long udpBytes = _udp is null ? 0 : Interlocked.Exchange(ref _udpBytes, 0);
-        StatsUpdated?.Invoke($"{SenderName} • {Surface.Width}×{Surface.Height} • {frames / secs:0} quadros/s • {(delta + udpBytes) * 8 / secs / 1_000_000:0.0} Mbit/s • {label} • {decWord} {decMs:0.0} ms{_udpLabel}{remote}");
+        int shownW = _videoW > 0 ? _videoW : Surface.Width, shownH = _videoH > 0 ? _videoH : Surface.Height;
+        StatsUpdated?.Invoke($"{SenderName} • {shownW}×{shownH} • {frames / secs:0} quadros/s • {(delta + udpBytes) * 8 / secs / 1_000_000:0.0} Mbit/s • {label} • {decWord} {decMs:0.0} ms{_udpLabel}{remote}");
     }
 }

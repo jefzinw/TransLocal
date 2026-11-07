@@ -26,7 +26,8 @@ internal sealed class SenderOptions
 }
 
 /// <summary>Limites efetivos da transmissão, combinando a configuração local e o pedido do receptor.</summary>
-internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fps, int Quality, bool Light, bool H264 = false, bool Udp = false)
+internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fps, int Quality, bool Light, bool H264 = false, bool Udp = false,
+    bool HardwareDecode = false)
 {
     public static StreamLimits Compute(SenderOptions opt, WelcomeMessage welcome)
     {
@@ -62,7 +63,8 @@ internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fp
         }
         bool udp = h264 && welcome.Transports?.Contains("udp1", StringComparer.OrdinalIgnoreCase) == true &&
                    Environment.GetEnvironmentVariable("TRANSLOCAL_NO_UDP") != "1";
-        return new StreamLimits(mw, mh, fps, quality, welcome.Light, h264, udp);
+        bool hw = h264 && welcome.Codecs?.Contains("h264-hw", StringComparer.OrdinalIgnoreCase) == true;
+        return new StreamLimits(mw, mh, fps, quality, welcome.Light, h264, udp, hw);
     }
 }
 
@@ -107,7 +109,7 @@ internal sealed class SenderSession : IDisposable
 
     // Estatísticas (janela de ~1 s)
     private int _statFrames;
-    private long _statEncodeTicks;
+    private long _statEncodeTicks, _statCaptureTicks, _statScaleTicks;
     private long _statBytesAtLast;
     private long _statLastTs = Stopwatch.GetTimestamp();
     private double _rttMs = double.NaN;
@@ -340,7 +342,33 @@ internal sealed class SenderSession : IDisposable
         ScreenCapturer? capturer = null;
         TileEncoder? encoder = null;
         H264Encoder? h264 = null;
+        GpuEncodePipeline? gpuPipe = null;
         FrameScaler? scaler = null;
+
+        // Caminho todo na placa (captura → cursor → redução/conversão → codificador). Devolve false se não deu.
+        bool StartGpuPipeline(ScreenCapturer cap, Size size, int bitrate)
+        {
+            gpuPipe?.Dispose();
+            gpuPipe = null;
+            if (cap is DxgiCapturer dxc0) dxc0.GpuMode = false;
+            if (!_limits.H264) return false;
+            gpuPipe = GpuEncodePipeline.TryCreate(cap, size.Width, size.Height, _limits.Fps, bitrate, _limits.HardwareDecode);
+            if (gpuPipe is null) return false;
+            if (cap is DxgiCapturer dxc) dxc.GpuMode = true;
+            h264?.Dispose();
+            h264 = gpuPipe.Encoder;
+            return true;
+        }
+
+        void StopGpuPipeline(ScreenCapturer? cap, string why)
+        {
+            if (gpuPipe is null) return;
+            Log.Warn($"Caminho na placa de vídeo desligado ({why}); reduzindo e convertendo pelo processador");
+            if (ReferenceEquals(h264, gpuPipe.Encoder)) h264 = null;
+            gpuPipe.Dispose();
+            gpuPipe = null;
+            if (cap is DxgiCapturer dxc) dxc.GpuMode = false;
+        }
         bool needFrame = true;
         bool needKey = true;
         var ct = _cts.Token;
@@ -380,6 +408,12 @@ internal sealed class SenderSession : IDisposable
                         var dx = new DxgiCapturer(screen);
                         if (dx.Width == gdi.Width && dx.Height == gdi.Height)
                         {
+                            if (gpuPipe is not null)
+                            {
+                                // O caminho na placa estava lendo a captura GDI: passa a usar a placa da captura DXGI.
+                                StopGpuPipeline(gdi, "troca de captura");
+                                StartGpuPipeline(dx, _sendSize, _targetBitrate);
+                            }
                             gdi.Dispose();
                             capturer = dx;
                             needFrame = true;
@@ -399,14 +433,21 @@ internal sealed class SenderSession : IDisposable
                         ? null
                         : new FrameScaler(capturer.Width, capturer.Height, size.Width, size.Height);
                     encoder = new TileEncoder(size.Width, size.Height);
+                    if (gpuPipe is not null) StopGpuPipeline(null, "captura recriada");
                     h264?.Dispose();
                     h264 = null;
                     if (_limits.H264)
                     {
                         int bitrate = H264Encoder.BitrateFor(size.Width, size.Height, _limits.Fps, _limits.Quality);
-                        try { h264 = H264Encoder.TryCreate(size.Width, size.Height, _limits.Fps, bitrate); }
-                        catch (Exception ex) { Log.Warn("H.264: falha ao criar o codificador", ex); }
-                        _codecLabel = h264 is null ? "JPEG por blocos (H.264 indisponível)" : $"H.264 {(h264.Hardware ? "placa de vídeo" : "software")}";
+                        if (!StartGpuPipeline(capturer, size, bitrate))
+                        {
+                            try { h264 = H264Encoder.TryCreate(size.Width, size.Height, _limits.Fps, bitrate, high: _limits.HardwareDecode); }
+                            catch (Exception ex) { Log.Warn("H.264: falha ao criar o codificador", ex); }
+                        }
+                        _codecLabel = h264 is null ? "JPEG por blocos (H.264 indisponível)"
+                            : gpuPipe is not null ? "H.264 placa de vídeo (captura→codificação toda na placa)"
+                            : $"H.264 {(h264.Hardware ? "placa de vídeo" : "software")}";
+                        if (gpuPipe is not null) Log.Info($"Captura, cursor, redução e conversão na placa de vídeo; codificador {h264!.Name} lendo a textura direto ({(h264.Profile == 100 ? "perfil High" : h264.Profile == 77 ? "perfil Main" : "perfil Baseline")})");
                         _maxBitrate = bitrate;
                         _targetBitrate = bitrate;
                         Log.Info(h264 is null ? "H.264 indisponível neste PC; usando blocos JPEG" : $"Vídeo H.264: {h264.Name} ({(h264.Hardware ? "placa de vídeo" : "software")}), {size.Width}×{size.Height} a {_limits.Fps} q/s, {bitrate / 1e6:0.0} Mbit/s");
@@ -473,7 +514,9 @@ internal sealed class SenderSession : IDisposable
                     // DXGI: espera o próximo quadro da tela (até um intervalo) e captura assim que o jogo apresenta.
                     int waitMs = !frameSync ? 0 : h264 is { Pending: true } ? 1 : needFrame || _keyRequested ? 0 : intervalMs;
                     // Sem mudança na tela (nem no cursor): não precisa reduzir nem comparar a imagem.
+                    long tc = Stopwatch.GetTimestamp();
                     bool got = capturer.Capture(drawCursor: true, waitMs);
+                    if (got && capturer.LastCaptureChanged) Interlocked.Add(ref _statCaptureTicks, Stopwatch.GetTimestamp() - tc);
                     if (capturer is DxgiCapturer dx)
                     {
                         _captureState = dx.State;
@@ -494,9 +537,22 @@ internal sealed class SenderSession : IDisposable
                         long t0 = Stopwatch.GetTimestamp();
                         lastFrame = t0;
                         IntPtr bits = capturer.Bits;
-                        if (scaler is not null)
+                        if (gpuPipe is not null && gpuPipe.IsStale(capturer))
                         {
+                            // Dispositivo da captura recriado (driver, perda seguida): monta o caminho de novo.
+                            StopGpuPipeline(capturer, "dispositivo da captura recriado");
+                            if (!StartGpuPipeline(capturer, _sendSize, _targetBitrate))
+                            {
+                                try { h264 = H264Encoder.TryCreate(_sendSize.Width, _sendSize.Height, _limits.Fps, _targetBitrate, high: _limits.HardwareDecode); }
+                                catch (Exception ex) { Log.Warn("H.264: falha ao recriar o codificador", ex); }
+                            }
+                            needKey = true;
+                        }
+                        if (scaler is not null && gpuPipe is null)
+                        {
+                            long ts = Stopwatch.GetTimestamp();
                             scaler.Scale(capturer);
+                            Interlocked.Add(ref _statScaleTicks, Stopwatch.GetTimestamp() - ts);
                             bits = scaler.Bits;
                         }
                         if (h264 is not null)
@@ -506,7 +562,22 @@ internal sealed class SenderSession : IDisposable
                             bool force = _keyRequested || needKey;
                             _keyRequested = false;
                             needKey = false;
-                            try { data = h264.Encode(bits, _sendSize.Width * 4, force, out key, t0); }
+                            try
+                            {
+                                data = gpuPipe is not null
+                                    ? gpuPipe.Encode(capturer, force, out key, t0)
+                                    : h264.Encode(bits, _sendSize.Width * 4, force, out key, t0);
+                            }
+                            catch (Exception ex) when (gpuPipe is not null)
+                            {
+                                // Falhou na placa: segue pelo processador com o codificador comum (sem derrubar o vídeo).
+                                StopGpuPipeline(capturer, ex.Message);
+                                try { h264 = H264Encoder.TryCreate(_sendSize.Width, _sendSize.Height, _limits.Fps, _targetBitrate, high: _limits.HardwareDecode); }
+                                catch (Exception ex2) { Log.Warn("H.264: falha ao recriar o codificador", ex2); }
+                                _codecLabel = h264 is null ? "JPEG por blocos (H.264 falhou)" : $"H.264 {(h264.Hardware ? "placa de vídeo" : "software")}";
+                                needKey = true;
+                                if (h264 is null) needFrame = true;
+                            }
                             catch (Exception ex)
                             {
                                 // Nunca derruba a transmissão: volta aos blocos JPEG (o receptor entende os dois).
@@ -522,13 +593,23 @@ internal sealed class SenderSession : IDisposable
                                 // Rede de segurança: o codificador aceita os quadros mas não devolve imagem (placa que
                                 // recusa algum ajuste em silêncio). Desce um nível em vez de deixar a tela congelada.
                                 int level = h264.Conservative ? 2 : h264.Hardware ? 1 : 3;
-                                Log.Warn($"H.264: {h264.Name} passou {h264.FramesWithoutOutput} quadros sem entregar imagem; " +
-                                         (level switch { 1 => "tentando os ajustes conservadores", 2 => "usando o codificador por software", _ => "voltando aos blocos JPEG" }));
-                                h264.Dispose();
-                                h264 = null;
+                                if (gpuPipe is not null)
+                                {
+                                    // Na placa não entregou imagem: tenta o caminho comum com os ajustes normais primeiro.
+                                    StopGpuPipeline(capturer, "o codificador não entregou imagem");
+                                    level = 0;
+                                    h264 = null;
+                                }
+                                if (h264 is not null)
+                                {
+                                    Log.Warn($"H.264: {h264.Name} passou {h264.FramesWithoutOutput} quadros sem entregar imagem; " +
+                                             (level switch { 1 => "tentando os ajustes conservadores", 2 => "usando o codificador por software", _ => "voltando aos blocos JPEG" }));
+                                    h264.Dispose();
+                                    h264 = null;
+                                }
                                 if (level <= 2)
                                 {
-                                    try { h264 = H264Encoder.TryCreate(_sendSize.Width, _sendSize.Height, _limits.Fps, Math.Max(_targetBitrate, 1_000_000), level); }
+                                    try { h264 = H264Encoder.TryCreate(_sendSize.Width, _sendSize.Height, _limits.Fps, Math.Max(_targetBitrate, 1_000_000), level, _limits.HardwareDecode); }
                                     catch (Exception ex) { Log.Warn("H.264: falha ao recriar o codificador", ex); }
                                 }
                                 needKey = true;
@@ -577,6 +658,8 @@ internal sealed class SenderSession : IDisposable
         }
         finally
         {
+            if (gpuPipe is not null && ReferenceEquals(h264, gpuPipe.Encoder)) h264 = null;
+            gpuPipe?.Dispose();
             capturer?.Dispose();
             h264?.Dispose();
             Realtime.Revert(mmcss);
@@ -665,6 +748,8 @@ internal sealed class SenderSession : IDisposable
         double secs = Math.Max(0.001, (now - Interlocked.Exchange(ref _statLastTs, now)) / (double)Stopwatch.Frequency);
         int frames = Interlocked.Exchange(ref _statFrames, 0);
         long encTicks = Interlocked.Exchange(ref _statEncodeTicks, 0);
+        long capTicks = Interlocked.Exchange(ref _statCaptureTicks, 0), scaleTicks = Interlocked.Exchange(ref _statScaleTicks, 0);
+        string Per(long t) => frames > 0 ? $"{t * 1000.0 / Stopwatch.Frequency / frames:0.0}" : "0";
         long bytes = Interlocked.Read(ref _conn.BytesSent);
         long deltaBytes = bytes - Interlocked.Exchange(ref _statBytesAtLast, bytes);
         double mbps = deltaBytes * 8 / secs / 1_000_000;
@@ -700,7 +785,7 @@ internal sealed class SenderSession : IDisposable
             ? $" • alvo {_targetBitrate / 1e6:0.0} Mbit/s{(_targetBitrate < _maxBitrate ? " (rede limitada)" : "")}"
             : "";
         string transport = _udpWasActive ? $"UDP (perda {_lossRate:P1}, paridade {_udp?.Fec ?? 0:P0})" : _transportLabel;
-        StatsUpdated?.Invoke($"{size}{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s{rate} • {_codecLabel} • {transport} • codificação {encMs:0} ms • " +
+        StatsUpdated?.Invoke($"{size}{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s{rate} • {_codecLabel} • {transport} • codificação {encMs:0} ms (captura {Per(capTicks)} • redução {Per(scaleTicks)}) • " +
                              $"atraso da imagem {lat} • ida e volta {rtt}");
         try { _conn.Send(MsgType.Stats, System.Text.Encoding.UTF8.GetBytes($"atraso da imagem {lat} • ida e volta {rtt} • enviado {mbps:0.0} Mbit/s{rate} • {transport}")); }
         catch { }

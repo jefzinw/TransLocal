@@ -77,13 +77,30 @@ internal abstract class ScreenCapturer : IDisposable
             LastCaptureChanged = false;
             return true;
         }
-        ComposeDesktop();
-        if (cursor.Handle != IntPtr.Zero) DrawCursor(cursor);
         _lastCursor = cursor;
         _composed = true;
         LastCaptureChanged = true;
+        // Montagem na placa de vídeo: a imagem e o cursor são juntados lá (nada de cópia nem desenho aqui).
+        if (GpuComposition) return true;
+        ComposeDesktop();
+        if (cursor.Handle != IntPtr.Zero) DrawCursor(cursor);
         Native.GdiFlush();
         return true;
+    }
+
+    /// <summary>A imagem e o cursor são montados na placa de vídeo por quem usa a captura (ver <see cref="CursorTopLeft"/>).</summary>
+    public virtual bool GpuComposition => false;
+
+    /// <summary>Cursor visível na última captura: identificador e canto superior esquerdo (relativo ao monitor).</summary>
+    public bool CursorTopLeft(out IntPtr handle, out int x, out int y)
+    {
+        handle = _lastCursor.Handle;
+        x = y = 0;
+        if (handle == IntPtr.Zero) return false;
+        var hs = Hotspot(handle);
+        x = _lastCursor.X - Bounds.X - hs.X;
+        y = _lastCursor.Y - Bounds.Y - hs.Y;
+        return x < Width && y < Height && x > -256 && y > -256;
     }
 
     /// <summary>Espera máxima por um quadro novo na captura atual (ms).</summary>
@@ -114,20 +131,26 @@ internal abstract class ScreenCapturer : IDisposable
         return new CursorState(ci.hCursor, ci.ptScreenPos.X, ci.ptScreenPos.Y);
     }
 
-    private void DrawCursor(CursorState ci)
+    private (int X, int Y) Hotspot(IntPtr handle)
     {
-        if (!_hotspots.TryGetValue(ci.Handle, out var hs))
+        if (!_hotspots.TryGetValue(handle, out var hs))
         {
             hs = (0, 0);
-            if (Native.GetIconInfo(ci.Handle, out var ii))
+            if (Native.GetIconInfo(handle, out var ii))
             {
                 hs = (ii.xHotspot, ii.yHotspot);
                 if (ii.hbmMask != IntPtr.Zero) Native.DeleteObject(ii.hbmMask);
                 if (ii.hbmColor != IntPtr.Zero) Native.DeleteObject(ii.hbmColor);
             }
             if (_hotspots.Count > 128) _hotspots.Clear();
-            _hotspots[ci.Handle] = hs;
+            _hotspots[handle] = hs;
         }
+        return hs;
+    }
+
+    private void DrawCursor(CursorState ci)
+    {
+        var hs = Hotspot(ci.Handle);
 
         int x = ci.X - Bounds.X - hs.X;
         int y = ci.Y - Bounds.Y - hs.Y;
@@ -151,6 +174,8 @@ internal abstract class ScreenCapturer : IDisposable
     /// <summary>Cria o melhor capturador disponível: DXGI Desktop Duplication, ou GDI como reserva.</summary>
     public static ScreenCapturer Create(Screen screen)
     {
+        // Teste de transmissão: imagem sintética em movimento no lugar da tela (não captura nada do usuário).
+        if (Environment.GetEnvironmentVariable("TRANSLOCAL_TEST_PATTERN") == "1") return new SyntheticCapturer(screen.Bounds);
         try
         {
             return new DxgiCapturer(screen);
@@ -175,6 +200,40 @@ internal sealed class GdiCapturer : ScreenCapturer
     {
         changed = true;
         return Native.BitBlt(MemDc, 0, 0, Width, Height, ScreenDc, Bounds.X, Bounds.Y, Native.SRCCOPY);
+    }
+}
+
+/// <summary>Imagem de teste em movimento (só com TRANSLOCAL_TEST_PATTERN=1): exercita a transmissão sem capturar a tela.</summary>
+internal sealed unsafe class SyntheticCapturer : ScreenCapturer
+{
+    private int _frame;
+
+    public SyntheticCapturer(Rectangle bounds) : base(bounds) { }
+
+    public override string Method => "teste";
+
+    protected override bool AcquireDesktop(out bool changed)
+    {
+        changed = true;
+        int f = _frame++;
+        uint* p = (uint*)Bits;
+        int w = Width, h = Height;
+        Parallel.For(0, h, y =>
+        {
+            uint* row = p + (long)y * w;
+            int gy = (y * 255 / h) << 8;
+            for (int x = 0; x < w; x++)
+            {
+                int xs = x + f * 9;
+                row[x] = 0xFF000000u | (uint)(((xs * 255 / w) & 0xFF) << 16) | (uint)gy | (uint)(((xs >> 3) ^ (y >> 3)) * 37 & 0xFF);
+            }
+        });
+        int bx = (f * 13) % Math.Max(1, w - 300), by = (f * 7) % Math.Max(1, h - 300);
+        for (int y = by; y < by + 300; y++)
+            for (int x = bx; x < bx + 300; x++)
+                p[(long)y * w + x] = ((x / 20 + y / 20 + f / 4) & 1) != 0 ? 0xFFFFFFFFu : 0xFF202020u;
+        Thread.Sleep(1);
+        return true;
     }
 }
 

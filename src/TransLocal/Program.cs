@@ -90,7 +90,7 @@ internal static class Program
 #endif
 
         // ---- Diagnóstico ----
-        if (Has("--bench") || Has("--selftest") || Has("--ui-screenshot") || Has("--gamepad-test") || Has("--update-test") || Has("--audio-test") || Has("--codec-test") || Has("--gpu-test"))
+        if (Has("--bench") || Has("--selftest") || Has("--ui-screenshot") || Has("--gamepad-test") || Has("--update-test") || Has("--audio-test") || Has("--codec-test") || Has("--gpu-test") || Has("--dxva-probe") || Has("--stream-test") || Has("--d3d11va-verify") || Has("--capture-test"))
         {
             Log.Echo = Native.AttachConsole(Native.ATTACH_PARENT_PROCESS);
             try
@@ -101,6 +101,10 @@ internal static class Program
                 if (Has("--audio-test")) return DevTools.AudioTest();
                 if (Has("--codec-test")) return DevTools.CodecTest();
                 if (Has("--gpu-test")) return DevTools.GpuTest();
+                if (Has("--dxva-probe")) return DxvaProbe.Run();
+                if (Has("--stream-test")) return DevTools.StreamTest();
+                if (Has("--d3d11va-verify")) return DevTools.D3D11VaVerify();
+                if (Has("--capture-test")) return DevTools.CaptureTest();
                 if (Has("--selftest")) return DevTools.SelfTest(Arg("--selftest") ?? Log.DataDirectory);
                 return DevTools.UiScreenshots(Arg("--ui-screenshot") ?? Log.DataDirectory);
             }
