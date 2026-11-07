@@ -72,6 +72,28 @@ internal sealed unsafe class FrameSurface : IDisposable
         }
     }
 
+    /// <summary>Converte um quadro NV12 (saída do decodificador H.264) direto para a imagem exibida.</summary>
+    public void WriteNv12(byte* y, int yStride, byte* uv, int uvStride, int width, int height)
+    {
+        EnsureSize(width, height);
+        lock (Sync)
+        {
+            if (_bits == null) return;
+            Video.ColorConvert.Nv12ToBgra(y, yStride, uv, uvStride, _bits, _width * 4, Math.Min(width, _width), Math.Min(height, _height));
+        }
+        MarkUpdated();
+    }
+
+    /// <summary>Um pixel BGRA da imagem exibida (testes).</summary>
+    internal uint PixelAt(int x, int y)
+    {
+        lock (Sync)
+        {
+            if (_bits == null || x < 0 || y < 0 || x >= _width || y >= _height) return 0;
+            return ((uint*)_bits)[(long)y * _width + x];
+        }
+    }
+
     public void CopyFromBitmap(Bitmap bmp, int x, int y)
     {
         var data = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);

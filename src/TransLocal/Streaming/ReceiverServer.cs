@@ -154,8 +154,15 @@ internal sealed class ReceiverServer : IDisposable
         try
         {
             // Pareamento só pode ser feito para transmitir/aprovar (com alguém confirmando o código nas duas
-            // telas); pedido de acesso remoto exige aparelho já pareado.
-            (conn, peer, purpose) = SecureChannel.Accept(client, _channel(), p => p != ChannelPurpose.Pull);
+            // telas) e só por quem está na mesma rede local (em casa). De outra rede — internet, Tailscale —
+            // só entram aparelhos já pareados; um estranho que baixe o TransLocal nem chega a pedir o código.
+            bool localNetwork = NetInfo.IsSameLocalNetwork(ip);
+            (conn, peer, purpose) = SecureChannel.Accept(client, _channel(), p =>
+            {
+                if (p == ChannelPurpose.Pull) return false;
+                if (!localNetwork) Log.Warn($"Pedido de pareamento de fora da rede local recusado ({ip})");
+                return localNetwork;
+            });
         }
         catch (Exception ex)
         {
@@ -242,6 +249,7 @@ internal sealed class ReceiverServer : IDisposable
                 ScreenWidth = prefs.ScreenWidth,
                 ScreenHeight = prefs.ScreenHeight,
                 Light = prefs.Light,
+                Codecs = Video.H264Decoder.IsAvailable ? new[] { "h264" } : null,
             });
             Log.Info($"Recebendo de {hello.Name} ({conn.RemoteEndPoint}) {hello.Width}×{hello.Height}, áudio={hello.Audio}, controle={hello.Control}, controles de jogo={hello.Gamepads ?? "?"}");
             session.StartDiagnostics();
@@ -273,6 +281,10 @@ internal sealed class ReceiverSession
     private readonly HelloMessage _hello;
     private readonly bool _playAudio;
     private volatile bool _closing;
+    private Video.H264Decoder? _decoder;
+    private bool _decoderFailed;
+    private volatile string _codecLabel = "JPEG por blocos";
+    private long _lastKeyRequest;
 
     private int _statFrames;
     private long _statDecodeTicks;
@@ -359,6 +371,39 @@ internal sealed class ReceiverSession
                         _conn.Send(MsgType.FrameAck, ack);
                         FrameReady?.Invoke();
                         break;
+                    case MsgType.VideoH264 when m.Length > 9:
+                    {
+                        long t1 = Stopwatch.GetTimestamp();
+                        var span = m.Span;
+                        int vid = BinaryPrimitives.ReadInt32LittleEndian(span);
+                        int vw = BinaryPrimitives.ReadUInt16LittleEndian(span[4..]);
+                        int vh = BinaryPrimitives.ReadUInt16LittleEndian(span[6..]);
+                        if (_decoder is null && !_decoderFailed)
+                        {
+                            _decoder = Video.H264Decoder.TryCreate(hardware: true);
+                            _decoderFailed = _decoder is null;
+                            _codecLabel = _decoder is null ? "H.264 sem decodificador" : $"H.264 ({(_decoder.Hardware ? "placa de vídeo" : "processador")})";
+                            Log.Info(_decoder is null ? "H.264: sem decodificador neste computador" : $"Decodificando H.264: {_decoder.Name} ({(_decoder.Hardware ? "placa de vídeo" : "processador")})");
+                        }
+                        bool produced = false, error = _decoder is null;
+                        if (_decoder is not null && vw > 0 && vh > 0 && vw <= 8192 && vh <= 8192)
+                            produced = _decoder.Decode(span[9..], vw, vh, Surface, out error);
+                        Interlocked.Add(ref _statDecodeTicks, Stopwatch.GetTimestamp() - t1);
+                        if (produced)
+                        {
+                            Interlocked.Increment(ref _statFrames);
+                            Interlocked.Increment(ref FramesReceived);
+                        }
+                        BinaryPrimitives.WriteInt32LittleEndian(ack, vid);
+                        _conn.Send(MsgType.FrameAck, ack);
+                        if (error && Environment.TickCount64 - _lastKeyRequest > 1000)
+                        {
+                            _lastKeyRequest = Environment.TickCount64;
+                            _conn.Send(MsgType.KeyframeRequest, ReadOnlySpan<byte>.Empty);
+                        }
+                        if (produced) FrameReady?.Invoke();
+                        break;
+                    }
                     case MsgType.Audio:
                         audio?.Add(m.Span);
                         break;
@@ -396,6 +441,8 @@ internal sealed class ReceiverSession
         {
             audio?.Dispose();
             Diag?.Dispose();
+            _decoder?.Dispose();
+            _decoder = null;
         }
     }
 
@@ -446,6 +493,6 @@ internal sealed class ReceiverSession
         long bytes = Interlocked.Read(ref _conn.BytesReceived);
         long delta = bytes - Interlocked.Exchange(ref _statBytesAtLast, bytes);
         double decMs = frames > 0 ? dec * 1000.0 / Stopwatch.Frequency / frames : 0;
-        StatsUpdated?.Invoke($"{SenderName} • {Surface.Width}×{Surface.Height} • {frames / secs:0} quadros/s • {delta * 8 / secs / 1_000_000:0.0} Mbit/s • decodificação {decMs:0} ms");
+        StatsUpdated?.Invoke($"{SenderName} • {Surface.Width}×{Surface.Height} • {frames / secs:0} quadros/s • {delta * 8 / secs / 1_000_000:0.0} Mbit/s • {_codecLabel} • decodificação {decMs:0.0} ms");
     }
 }

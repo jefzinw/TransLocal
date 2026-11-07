@@ -300,6 +300,7 @@ internal sealed class TrayApp : ApplicationContext
         StateChanged?.Invoke();
     }
 
+    private int _pairingPromptOpen;
     private Action? _balloonAction;
     private bool _balloonHooked;
 
@@ -368,7 +369,17 @@ internal sealed class TrayApp : ApplicationContext
         Identity = Identity,
         Trust = Trust,
         LocalName = Settings.DeviceName,
-        ConfirmPairing = p => ConfirmationForm.Ask(_ui, () => ConfirmationForm.ForPairing(p)),
+        ConfirmPairing = p =>
+        {
+            // Um pedido de pareamento por vez: outros que chegarem enquanto ele está aberto são recusados.
+            if (Interlocked.Exchange(ref _pairingPromptOpen, 1) == 1)
+            {
+                Log.Warn($"Pedido de pareamento de {p.PeerName} recusado: já há outro aberto");
+                return false;
+            }
+            try { return ConfirmationForm.Ask(_ui, () => ConfirmationForm.ForPairing(p)); }
+            finally { Volatile.Write(ref _pairingPromptOpen, 0); }
+        },
     };
 
     /// <summary>Código de autorização do acesso remoto (segredo criado na primeira vez, guardado com DPAPI).</summary>

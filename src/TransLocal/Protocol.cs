@@ -50,6 +50,8 @@ internal enum MsgType : byte
 
     Frame = 0x10,
     FrameAck = 0x11,
+    VideoH264 = 0x12,       // transmissor → receptor: [id:int32][largura:u16][altura:u16][flags:u8 (1 = quadro-chave)][Annex B]
+    KeyframeRequest = 0x13, // receptor → transmissor: decodificador perdeu a sequência, mande um quadro-chave
     Audio = 0x20,
     Input = 0x30,
     Gamepad = 0x31,
@@ -91,6 +93,9 @@ internal sealed class WelcomeMessage
 
     /// <summary>O receptor pede uma transmissão leve (computador mais simples).</summary>
     public bool Light { get; set; }
+
+    /// <summary>Formatos de vídeo que este receptor decodifica além dos blocos JPEG (ex.: "h264"). Null em versões antigas.</summary>
+    public string[]? Codecs { get; set; }
 }
 
 /// <summary>Preferências do receptor enviadas no handshake.</summary>

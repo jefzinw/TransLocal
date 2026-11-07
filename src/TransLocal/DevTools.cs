@@ -242,6 +242,12 @@ internal static class DevTools
             "relatório para o GitHub remove IP e pasta do usuário");
         Check(ConversionSelfTest(out var convDetail), "conversão de quadros 10 bits / HDR / RGBA para a transmissão" + convDetail);
         Check(SecureFrameSelfTest(out var sfDetail), "quadro da tela segura pela memória compartilhada (escrita do agente, leitura do TransLocal)" + sfDetail);
+        var lan = NetInfo.GetLocalAddresses().FirstOrDefault(a => !a.Kind.StartsWith("Tailscale") && !a.Kind.StartsWith("ZeroTier"));
+        Check(!NetInfo.IsSameLocalNetwork(System.Net.IPAddress.Parse("100.101.102.103")) &&
+              !NetInfo.IsSameLocalNetwork(System.Net.IPAddress.Parse("8.8.8.8")) &&
+              NetInfo.IsSameLocalNetwork(System.Net.IPAddress.Loopback) &&
+              (lan is null || NetInfo.IsSameLocalNetwork(lan.Address)),
+            "pareamento e descoberta só na rede local (Tailscale e internet recusados; rede de casa aceita)");
         string desk = Input.DesktopFollower.InputDesktopName();
         Check(desk.Equals("Default", StringComparison.OrdinalIgnoreCase), $"área de trabalho de entrada identificada (“{desk}”)");
 
@@ -449,6 +455,128 @@ internal static class DevTools
         One("R16G16B16A16F", Vortice.DXGI.Format.R16G16B16A16_Float, half, 8, 0xFFFFBC00);
         detail = ok ? "" : " — " + string.Join("; ", results);
         return ok;
+    }
+
+    /// <summary>
+    /// --codec-test: 180 quadros 1366×768 com movimento (tela atual + faixa e quadro andando, como num jogo),
+    /// codificados em H.264 e decodificados de volta. Mede tempo, taxa a 60 q/s, fidelidade e compara com JPEG.
+    /// </summary>
+    public static unsafe int CodecTest()
+    {
+        int failures = 0;
+        void Check(bool ok, string what)
+        {
+            Log.Info($"CODECTEST {(ok ? "OK  " : "FALHOU")} {what}");
+            if (!ok) failures++;
+        }
+        const int w = 1366, h = 768, fps = 60, frames = 180;
+        var screen = Screen.PrimaryScreen!;
+        using var cap = ScreenCapturer.Create(screen);
+        Thread.Sleep(100);
+        cap.Capture(drawCursor: false);
+        var scaler = new FrameScaler(cap.Width, cap.Height, w, h);
+        scaler.Scale(cap);
+        var baseFrame = new uint[w * h];
+        fixed (uint* bf = baseFrame) Buffer.MemoryCopy((void*)scaler.Bits, bf, (long)w * h * 4, (long)w * h * 4);
+
+        int bitrate = H264Encoder.BitrateFor(w, h, fps, 75);
+        using var enc = H264Encoder.TryCreate(w, h, fps, bitrate);
+        Check(enc is not null, enc is null ? "codificador H.264 disponível" : $"codificador H.264: {enc.Name} ({(enc.Hardware ? "placa de vídeo" : "software")}), {bitrate / 1e6:0.0} Mbit/s alvo");
+        if (enc is null) return 1;
+        Native.timeBeginPeriod(1); // como no laço de vídeo da transmissão
+        using var dec = H264Decoder.TryCreate(hardware: true);
+        Check(dec is not null, $"decodificador H.264: {dec?.Name} ({(dec?.Hardware == true ? "placa de vídeo" : "processador")})");
+        if (dec is null) return 1;
+        using var decSw = H264Decoder.TryCreate(hardware: false);
+        using var surfaceSw = new FrameSurface();
+        long decSwTicks = 0;
+        int decodedSw = 0;
+
+        using var surface = new FrameSurface();
+        var tiles = new TileEncoder(w, h);
+        var frame = new uint[w * h];
+        long encTicks = 0, decTicks = 0, bytes = 0, jpegBytes = 0;
+        int decoded = 0, encodedFrames = 0, keyFrames = 0;
+        var sw = new Stopwatch();
+        fixed (uint* f = frame)
+        {
+            for (int i = 0; i < frames; i++)
+            {
+                // Movimento: a imagem desliza e um quadrado colorido anda — muda quase tudo a cada quadro.
+                int shift = (i * 7) % w;
+                for (int y = 0; y < h; y++)
+                {
+                    uint* row = f + (long)y * w;
+                    fixed (uint* src = &baseFrame[y * w])
+                    {
+                        Buffer.MemoryCopy(src + shift, row, (w - shift) * 4L, (w - shift) * 4L);
+                        Buffer.MemoryCopy(src, row + (w - shift), shift * 4L, shift * 4L);
+                    }
+                }
+                int bx = (i * 11) % (w - 200), by = (i * 5) % (h - 200);
+                for (int y = by; y < by + 200; y++)
+                    for (int x = bx; x < bx + 200; x++)
+                        f[(long)y * w + x] = 0xFF000000u | (uint)((x * 3 + i * 5) & 0xFF) << 16 | (uint)((y * 2) & 0xFF) << 8 | (uint)(i * 4 & 0xFF);
+
+                sw.Restart();
+                var data = enc.Encode((IntPtr)f, w * 4, i == 0, out bool key);
+                if (data is null) { Thread.Sleep(2); data = enc.Poll(out key); }
+                encTicks += sw.ElapsedTicks;
+                if (data is null) continue;
+                encodedFrames++;
+                if (key) keyFrames++;
+                bytes += data.Length;
+                sw.Restart();
+                if (dec.Decode(data, w, h, surface, out bool err)) decoded++;
+                decTicks += sw.ElapsedTicks;
+                if (err) Log.Info($"CODECTEST erro de decodificação no quadro {i}");
+                if (decSw is not null)
+                {
+                    sw.Restart();
+                    if (decSw.Decode(data, w, h, surfaceSw, out _)) decodedSw++;
+                    decSwTicks += sw.ElapsedTicks;
+                }
+
+                using var jf = tiles.Encode((IntPtr)f, 75, i + 1);
+                jpegBytes += jf.Span.Length;
+            }
+        }
+        // Recolhe o último quadro que ficou no codificador da placa de vídeo (saída assíncrona).
+        for (int k = 0; k < 50 && enc.Pending; k++)
+        {
+            Thread.Sleep(2);
+            var last = enc.Poll(out _);
+            if (last is not null) { encodedFrames++; bytes += last.Length; if (dec.Decode(last, w, h, surface, out _)) decoded++; }
+        }
+        double encMs = encTicks * 1000.0 / Stopwatch.Frequency / frames;
+        double decMs = decoded > 0 ? decTicks * 1000.0 / Stopwatch.Frequency / Math.Max(1, encodedFrames) : 0;
+        double mbps = bytes * 8.0 / frames * fps / 1e6;
+        double jpegMbps = jpegBytes * 8.0 / frames * fps / 1e6;
+        Check(encodedFrames >= frames * 0.9, $"{encodedFrames}/{frames} quadros codificados ({keyFrames} quadro(s)-chave), {encMs:0.0} ms por quadro no PC");
+        Check(decoded >= encodedFrames * 0.9, $"{decoded}/{encodedFrames} quadros decodificados ({(dec.Hardware ? "placa de vídeo" : "processador")}), {decMs:0.0} ms por quadro (inclui conversão para a tela)");
+        if (decSw is not null)
+            Check(decodedSw >= encodedFrames * 0.9, $"{decodedSw}/{encodedFrames} quadros decodificados (processador, reserva), {decSwTicks * 1000.0 / Stopwatch.Frequency / Math.Max(1, encodedFrames):0.0} ms por quadro");
+        Check(mbps < jpegMbps, $"rede a 60 quadros/s: H.264 {mbps:0.0} Mbit/s × JPEG por blocos {jpegMbps:0.0} Mbit/s ({jpegMbps / Math.Max(0.1, mbps):0.0}× menos)");
+
+        // Fidelidade do último quadro decodificado (PSNR de luminância aproximada).
+        double mse = 0;
+        int n = 0;
+        surface.SavePng(Path.Combine(Path.GetTempPath(), "translocal-codectest.png"));
+        fixed (uint* f = frame)
+        {
+            for (int y = 0; y < h; y += 3)
+                for (int x = 0; x < w; x += 3)
+                {
+                    uint pa = f[(long)y * w + x], pb = surface.PixelAt(x, y);
+                    int ga = (int)((pa >> 8) & 0xFF), gb = (int)((pb >> 8) & 0xFF);
+                    mse += (ga - gb) * (ga - gb);
+                    n++;
+                }
+        }
+        double psnr = n > 0 && mse > 0 ? 10 * Math.Log10(255.0 * 255.0 / (mse / n)) : 99;
+        Check(psnr > 28, $"fidelidade do último quadro: {psnr:0.0} dB (acima de 28 dB = boa)");
+        Log.Info(failures == 0 ? "CODECTEST concluído: tudo certo" : $"CODECTEST concluído com {failures} falha(s)");
+        return failures == 0 ? 0 : 1;
     }
 
     /// <summary>

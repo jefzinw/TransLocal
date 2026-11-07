@@ -276,9 +276,27 @@ internal static class ElevatedInput
         string role = systemAgent ? "Agente SYSTEM" : "Controle elevado";
         Log.Info($"{role} ativo (sessão {CurrentSession})");
         var injector = new InputInjector(Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1920, 1080));
-        using var follower = systemAgent ? new DesktopFollower() : null;
         var capture = systemAgent ? new SecureDesktopCapture() : null;
         int session = CurrentSession;
+
+        // Thread própria, MTA e sem janelas: SetThreadDesktop (para seguir a tela segura do UAC) falha em
+        // threads que já têm janelas — e o WinForms pode criar uma janela oculta na thread principal (STA).
+        int exitCode = 0;
+        var worker = new Thread(() => exitCode = HelperLoop(role, systemAgent, injector, capture, session))
+        {
+            IsBackground = false,
+            Name = "TransLocal entrada elevada",
+        };
+        worker.SetApartmentState(ApartmentState.MTA);
+        worker.Start();
+        worker.Join();
+        return exitCode;
+    }
+
+    private static int HelperLoop(string role, bool systemAgent, InputInjector injector, SecureDesktopCapture? capture, int session)
+    {
+        using var follower = systemAgent ? new DesktopFollower() : null;
+        bool followFailLogged = false;
         var buffer = new byte[256];
         while (true)
         {
@@ -308,8 +326,19 @@ internal static class ElevatedInput
                         {
                             case KindInput when len > 1:
                                 // A entrada vai para a área de trabalho ativa: a normal ou a segura (UAC).
-                                if (follower is not null && follower.Follow(out bool changed) && changed)
-                                    Log.Info($"Agente: área de trabalho de entrada agora é “{follower.Current}”");
+                                if (follower is not null)
+                                {
+                                    string before = follower.Current;
+                                    if (follower.Follow(out _))
+                                    {
+                                        if (follower.Current != before) Log.Info($"Agente: entrada indo para a área de trabalho “{follower.Current}”");
+                                    }
+                                    else if (!followFailLogged)
+                                    {
+                                        followFailLogged = true;
+                                        Log.Warn($"Agente: não foi possível seguir a área de trabalho de entrada (erro {Marshal.GetLastWin32Error()})");
+                                    }
+                                }
                                 injector.Apply(msg[1..]);
                                 break;
                             case KindMonitor when len >= 17:

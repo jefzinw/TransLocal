@@ -65,6 +65,32 @@ internal static class NetInfo
         return ("rede", false);
     }
 
+    /// <summary>
+    /// O endereço está na mesma rede local física deste computador (mesma sub-rede de uma placa de rede, cabo direto
+    /// 169.254.x.x ou o próprio computador). Tailscale/ZeroTier (100.64.0.0/10) e internet ficam de fora:
+    /// pareamento e descoberta só acontecem em casa; de fora, só aparelhos já pareados entram.
+    /// </summary>
+    public static bool IsSameLocalNetwork(IPAddress? remote)
+    {
+        if (remote is null) return false;
+        if (remote.IsIPv4MappedToIPv6) remote = remote.MapToIPv4();
+        if (IPAddress.IsLoopback(remote)) return true;
+        if (remote.AddressFamily != AddressFamily.InterNetwork) return false;
+        var r = remote.GetAddressBytes();
+        if (r[0] == 100 && (r[1] & 0xC0) == 64) return false; // CGNAT/Tailscale: acesso de fora de casa
+        foreach (var a in GetLocalAddresses())
+        {
+            if (a.Kind.StartsWith("Tailscale") || a.Kind.StartsWith("ZeroTier")) continue;
+            if (a.Address.Equals(remote)) return true;
+            var l = a.Address.GetAddressBytes();
+            var m = a.Mask.GetAddressBytes();
+            bool same = true;
+            for (int i = 0; i < 4 && same; i++) same = (l[i] & m[i]) == (r[i] & m[i]);
+            if (same) return true;
+        }
+        return false;
+    }
+
     public static IPAddress BroadcastOf(IPAddress addr, IPAddress mask)
     {
         var a = addr.GetAddressBytes();
@@ -129,6 +155,8 @@ internal sealed class DiscoveryResponder : IDisposable
             try
             {
                 if (Encoding.ASCII.GetString(r.Buffer) != Proto.DiscoverRequest) continue;
+                // Só se apresenta para a rede local: quem está fora (internet, Tailscale) nem fica sabendo que ele existe.
+                if (!NetInfo.IsSameLocalNetwork(r.RemoteEndPoint.Address)) continue;
                 var reply = new DiscoveryReply { Name = _name(), Port = _videoPort, Busy = _busy(), Id = _id };
                 var bytes = JsonSerializer.SerializeToUtf8Bytes(reply, Proto.Json);
                 await udp.SendAsync(bytes, r.RemoteEndPoint, ct);

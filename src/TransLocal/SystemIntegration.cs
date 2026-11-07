@@ -111,6 +111,12 @@ internal static class SystemIntegration
         }
     }
 
+    /// <summary>
+    /// De onde o TransLocal aceita conexões: a rede local (inclui cabo direto 169.254.x.x) e o Tailscale.
+    /// A internet aberta fica bloqueada pelo próprio Windows, mesmo que alguém encaminhe a porta no roteador.
+    /// </summary>
+    public const string FirewallRemoteIps = "localsubnet,100.64.0.0/10,fd7a:115c:a1e0::/48";
+
     /// <summary>Cria a regra no firewall (pede permissão de administrador). Retorna true se deu certo.</summary>
     public static bool AddFirewallRule()
     {
@@ -118,7 +124,8 @@ internal static class SystemIntegration
         string args = "/c " +
                       $"netsh advfirewall firewall delete rule name=\"{FirewallRuleName}\" >nul 2>&1 & " +
                       $"netsh advfirewall firewall add rule name=\"{FirewallRuleName}\" dir=in action=allow program=\"{exe}\" enable=yes profile=any " +
-                      "description=\"Permite receber transmissões de tela do TransLocal\"";
+                      $"remoteip={FirewallRemoteIps} " +
+                      "description=\"Permite receber transmissões de tela do TransLocal (rede local e Tailscale)\"";
         try
         {
             var psi = new ProcessStartInfo("cmd.exe", args)

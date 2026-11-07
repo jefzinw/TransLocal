@@ -18,12 +18,15 @@ internal sealed class SenderOptions
     public bool Audio { get; init; } = true;
     public bool AllowControl { get; init; }
 
+    /// <summary>Usar vídeo H.264 quando o receptor suportar (muito menos rede e processador).</summary>
+    public bool H264 { get; init; } = true;
+
     /// <summary>"auto" (tela do receptor), "original" ou um limite como "1280x720".</summary>
     public string Resolution { get; init; } = "auto";
 }
 
 /// <summary>Limites efetivos da transmissão, combinando a configuração local e o pedido do receptor.</summary>
-internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fps, int Quality, bool Light)
+internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fps, int Quality, bool Light, bool H264 = false)
 {
     public static StreamLimits Compute(SenderOptions opt, WelcomeMessage welcome)
     {
@@ -46,14 +49,16 @@ internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fp
                 break;
         }
         int fps = opt.Fps, quality = opt.Quality;
+        bool h264 = opt.H264 && welcome.Codecs?.Contains("h264", StringComparer.OrdinalIgnoreCase) == true;
         if (welcome.Light)
         {
             mw = mw <= 0 ? LightMode.MaxWidth : Math.Min(mw, LightMode.MaxWidth);
             mh = mh <= 0 ? LightMode.MaxHeight : Math.Min(mh, LightMode.MaxHeight);
-            fps = Math.Min(fps, LightMode.MaxFps);
+            // Com H.264 o notebook decodifica pela placa de vídeo: 60 quadros/s cabem no modo leve.
+            fps = Math.Min(fps, h264 ? 60 : LightMode.MaxFps);
             quality = Math.Min(quality, LightMode.MaxQuality);
         }
-        return new StreamLimits(mw, mh, fps, quality, welcome.Light);
+        return new StreamLimits(mw, mh, fps, quality, welcome.Light, h264);
     }
 }
 
@@ -71,6 +76,8 @@ internal sealed class SenderSession : IDisposable
     private bool _cursorCaptured;
     private readonly SemaphoreSlim _inflight = new(Proto.MaxFramesInFlight, Proto.MaxFramesInFlight);
     private readonly CancellationTokenSource _cts = new();
+    private volatile bool _keyRequested;
+    private volatile string _codecLabel = "JPEG por blocos";
     private System.Threading.Timer? _pingTimer;
     private int _ended;
     private int _frameId;
@@ -288,8 +295,10 @@ internal sealed class SenderSession : IDisposable
         Native.SetThreadExecutionState(Native.ES_CONTINUOUS | Native.ES_SYSTEM_REQUIRED | Native.ES_DISPLAY_REQUIRED);
         ScreenCapturer? capturer = null;
         TileEncoder? encoder = null;
+        H264Encoder? h264 = null;
         FrameScaler? scaler = null;
         bool needFrame = true;
+        bool needKey = true;
         var ct = _cts.Token;
         try
         {
@@ -339,10 +348,21 @@ internal sealed class SenderSession : IDisposable
                     capturer = ScreenCapturer.Create(screen);
                     lastDxgiRetry = Stopwatch.GetTimestamp();
                     var size = FrameScaler.Fit(new Size(capturer.Width, capturer.Height), _limits.MaxWidth, _limits.MaxHeight);
+                    if (_limits.H264) size = new Size(size.Width & ~1, size.Height & ~1); // H.264 pede dimensões pares
                     scaler = size == new Size(capturer.Width, capturer.Height)
                         ? null
                         : new FrameScaler(capturer.Width, capturer.Height, size.Width, size.Height);
                     encoder = new TileEncoder(size.Width, size.Height);
+                    h264?.Dispose();
+                    h264 = null;
+                    if (_limits.H264)
+                    {
+                        int bitrate = H264Encoder.BitrateFor(size.Width, size.Height, _limits.Fps, _limits.Quality);
+                        try { h264 = H264Encoder.TryCreate(size.Width, size.Height, _limits.Fps, bitrate); }
+                        catch (Exception ex) { Log.Warn("H.264: falha ao criar o codificador", ex); }
+                        _codecLabel = h264 is null ? "JPEG por blocos (H.264 indisponível)" : $"H.264 {(h264.Hardware ? "placa de vídeo" : "software")} {bitrate / 1e6:0.#} Mbit/s";
+                        Log.Info(h264 is null ? "H.264 indisponível neste PC; usando blocos JPEG" : $"Vídeo H.264: {h264.Name} ({(h264.Hardware ? "placa de vídeo" : "software")}), {size.Width}×{size.Height} a {_limits.Fps} q/s, {bitrate / 1e6:0.0} Mbit/s");
+                    }
                     _sendSize = size;
                     needFrame = true;
                     _injector?.SetMonitor(capturer.Bounds);
@@ -378,8 +398,15 @@ internal sealed class SenderSession : IDisposable
                         _captureSecure = dx.SecureDesktop;
                     }
                     else _captureState = capturer.Method;
-                    if (got && (capturer.LastCaptureChanged || needFrame))
+                    if (h264 is { Pending: true } && !(got && (capturer.LastCaptureChanged || needFrame)))
                     {
+                        // Quadro que o codificador da placa de vídeo terminou depois: envia agora.
+                        var late = h264.Poll(out bool lateKey);
+                        if (late is { Length: > 0 }) sent = SendH264(late, lateKey);
+                    }
+                    else if (got && (capturer.LastCaptureChanged || needFrame || (_keyRequested && h264 is not null)))
+                    {
+                        if (needFrame) needKey = true;
                         needFrame = false;
                         long t0 = Stopwatch.GetTimestamp();
                         IntPtr bits = capturer.Bits;
@@ -388,13 +415,35 @@ internal sealed class SenderSession : IDisposable
                             scaler.Scale(capturer);
                             bits = scaler.Bits;
                         }
-                        using var frame = encoder!.Encode(bits, _limits.Quality, Interlocked.Increment(ref _frameId));
-                        Interlocked.Add(ref _statEncodeTicks, Stopwatch.GetTimestamp() - t0);
-                        if (frame.TileCount > 0)
+                        if (h264 is not null)
                         {
-                            _conn.Send(MsgType.Frame, frame.Span);
-                            sent = true;
-                            Interlocked.Increment(ref _statFrames);
+                            byte[]? data = null;
+                            bool key = false;
+                            bool force = _keyRequested || needKey;
+                            _keyRequested = false;
+                            needKey = false;
+                            try { data = h264.Encode(bits, _sendSize.Width * 4, force, out key); }
+                            catch (Exception ex)
+                            {
+                                // Nunca derruba a transmissão: volta aos blocos JPEG (o receptor entende os dois).
+                                Log.Warn("H.264: falha ao codificar; voltando aos blocos JPEG", ex);
+                                h264.Dispose();
+                                h264 = null;
+                                _codecLabel = "JPEG por blocos (H.264 falhou)";
+                            }
+                            Interlocked.Add(ref _statEncodeTicks, Stopwatch.GetTimestamp() - t0);
+                            if (data is { Length: > 0 }) sent = SendH264(data, key);
+                        }
+                        else
+                        {
+                            using var frame = encoder!.Encode(bits, _limits.Quality, Interlocked.Increment(ref _frameId));
+                            Interlocked.Add(ref _statEncodeTicks, Stopwatch.GetTimestamp() - t0);
+                            if (frame.TileCount > 0)
+                            {
+                                _conn.Send(MsgType.Frame, frame.Span);
+                                sent = true;
+                                Interlocked.Increment(ref _statFrames);
+                            }
                         }
                     }
                 }
@@ -424,6 +473,7 @@ internal sealed class SenderSession : IDisposable
         finally
         {
             capturer?.Dispose();
+            h264?.Dispose();
             Native.timeEndPeriod(1);
             Native.SetThreadExecutionState(Native.ES_CONTINUOUS);
         }
@@ -447,6 +497,9 @@ internal sealed class SenderSession : IDisposable
                         break;
                     case MsgType.Diag:
                         _diag?.Received(m.Span);
+                        break;
+                    case MsgType.KeyframeRequest:
+                        _keyRequested = true;
                         break;
                     case MsgType.Info when m.Length > 0:
                         Log.Info($"[{ReceiverName}] {System.Text.Encoding.UTF8.GetString(m.Span[..Math.Min(m.Length, 2000)])}");
@@ -502,7 +555,7 @@ internal sealed class SenderSession : IDisposable
         double encMs = frames > 0 ? encTicks * 1000.0 / Stopwatch.Frequency / frames : 0;
         string rtt = double.IsNaN(_rttMs) ? "–" : $"{_rttMs:0.#} ms";
         string size = _sendSize.IsEmpty ? "" : $"{_sendSize.Width}×{_sendSize.Height}{(_limits.Light ? " (leve)" : "")} • ";
-        StatsUpdated?.Invoke($"{size}{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s • codificação {encMs:0} ms • ida e volta {rtt}");
+        StatsUpdated?.Invoke($"{size}{frames / secs:0} quadros/s • {mbps:0.0} Mbit/s • {_codecLabel} • codificação {encMs:0} ms • ida e volta {rtt}");
 
         try { CheckCompatibility(frames / secs, mbps, rtt); }
         catch (Exception ex) { Log.Warn("Falha no diagnóstico", ex); }
@@ -557,7 +610,7 @@ internal sealed class SenderSession : IDisposable
         // Estado resumido: só quando muda (ou a cada 30 s), para o arquivo de diagnóstico ser leve.
         string control = !_opt.AllowControl ? "desligado" : bridge is null ? "comum"
             : elevatedOk ? (bridge.IsSystemAgent ? "comum + administrador + UAC (serviço)" : "comum + administrador (tarefa)") : "comum (auxiliar ausente)";
-        string snapshot = $"captura: {_captureState} • primeiro plano: {fg} • cursor {(_cursorCaptured ? "preso (relativo)" : "livre")} • controle: {control}";
+        string snapshot = $"captura: {_captureState} • vídeo: {_codecLabel} • primeiro plano: {fg} • cursor {(_cursorCaptured ? "preso (relativo)" : "livre")} • controle: {control}";
         long now = Environment.TickCount64;
         if (snapshot != _lastSnapshot || now - _lastSnapshotTick > 30_000)
         {
@@ -572,6 +625,19 @@ internal sealed class SenderSession : IDisposable
         Log.Warn("Aviso ao receptor: " + text);
         if (!IsRunning) return;
         try { _conn.Send(MsgType.Notice, System.Text.Encoding.UTF8.GetBytes(text)); } catch { }
+    }
+
+    private bool SendH264(byte[] data, bool key)
+    {
+        var msg = new byte[9 + data.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(msg, Interlocked.Increment(ref _frameId));
+        BinaryPrimitives.WriteUInt16LittleEndian(msg.AsSpan(4), (ushort)_sendSize.Width);
+        BinaryPrimitives.WriteUInt16LittleEndian(msg.AsSpan(6), (ushort)_sendSize.Height);
+        msg[8] = (byte)(key ? 1 : 0);
+        data.CopyTo(msg, 9);
+        _conn.Send(MsgType.VideoH264, msg);
+        Interlocked.Increment(ref _statFrames);
+        return true;
     }
 
     private void SendDiag(byte[] payload)

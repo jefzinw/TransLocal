@@ -56,6 +56,14 @@ internal static class Notifications
             return PendingIntent.GetBroadcast(ctx, code, intent, PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent)!;
         }
 
+        Notification.Action AllowAction(int id)
+        {
+            var b = new Notification.Action.Builder(null, "Permitir", Action(ApprovalActionReceiver.Approve, id * 2));
+            // Android 12+: aprovar exige desbloquear o celular — quem pegar o aparelho bloqueado não libera o acesso.
+            if (OperatingSystem.IsAndroidVersionAtLeast(31)) b.SetAuthenticationRequired(true);
+            return b.Build()!;
+        }
+
         int nid = IdFor(r.Id);
         var n = new Notification.Builder(ctx, RequestChannel)
             .SetContentTitle("Pedido de acesso")!
@@ -64,10 +72,11 @@ internal static class Notifications
                 $"{r.DeviceName} (ID {r.DeviceId}) quer ver e usar a tela de {pcName}. Permita só se foi você."))!
             .SetSmallIcon(Resource.Mipmap.appicon)!
             .SetCategory(Notification.CategoryCall)!
+            .SetVisibility(NotificationVisibility.Private)!
             .SetAutoCancel(true)!
             .SetTimeoutAfter(Math.Max(10, r.TimeoutSeconds) * 1000L)!
             .SetContentIntent(OpenApp(ctx))!
-            .AddAction(new Notification.Action.Builder(null, "Permitir", Action(ApprovalActionReceiver.Approve, nid * 2)).Build())!
+            .AddAction(AllowAction(nid))!
             .AddAction(new Notification.Action.Builder(null, "Negar", Action(ApprovalActionReceiver.Deny, nid * 2 + 1)).Build())!
             .Build()!;
         var nm = (NotificationManager)ctx.GetSystemService(Context.NotificationService)!;
