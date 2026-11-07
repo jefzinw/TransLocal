@@ -29,6 +29,9 @@ internal sealed class AppSettings
     public bool ViewerFullscreen { get; set; } = true;
     public string? ViewerMonitor { get; set; }
     public bool ReceiverPlayAudio { get; set; } = true;
+
+    /// <summary>Saída de som escolhida na janela de exibição; null = padrão do Windows (acompanha a troca).</summary>
+    public string? ReceiverAudioDevice { get; set; }
     public bool ShowStats { get; set; }
 
     /// <summary>Ao exibir, já começa controlando (mouse, teclado e controles) quando o outro computador permite.</summary>

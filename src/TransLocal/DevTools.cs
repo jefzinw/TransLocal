@@ -377,6 +377,68 @@ internal static class DevTools
     }
 
     /// <summary>
+    /// Toca silêncio pelo AudioPlayer e troca de saída (cada dispositivo ligado e de volta ao padrão),
+    /// conferindo que o som acompanha a escolha sem parar. Não altera as configurações salvas.
+    /// </summary>
+    public static int AudioTest()
+    {
+        int failures = 0;
+        void Check(bool ok, string what)
+        {
+            Log.Info($"AUDIOTEST {(ok ? "OK  " : "FALHOU")} {what}");
+            if (!ok) failures++;
+        }
+
+        Audio.AudioOutput.Initialize(null);
+        var outputs = Audio.AudioOutput.List();
+        Log.Info($"AUDIOTEST saídas: {string.Join(" | ", outputs.Select(o => o.Name))}; padrão: {Audio.AudioOutput.DefaultName()}");
+        Check(outputs.Count > 0, $"{outputs.Count} saída(s) de áudio ligada(s)");
+        if (outputs.Count == 0) return 1;
+
+        var format = new NAudio.Wave.WaveFormat(48000, 16, 2);
+        var silence = new byte[format.AverageBytesPerSecond / 50]; // 20 ms
+        using var player = new Audio.AudioPlayer(format);
+        using var cts = new CancellationTokenSource();
+        var feeder = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested)
+            {
+                player.Add(silence);
+                await Task.Delay(20);
+            }
+        });
+
+        string? WaitFor(string? expected, int ms = 3000)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < ms)
+            {
+                if (player.DeviceName == expected) return expected;
+                Thread.Sleep(50);
+            }
+            return player.DeviceName;
+        }
+
+        string? def = Audio.AudioOutput.DefaultName();
+        Check(WaitFor(def) == def, $"começa no padrão do Windows ({player.DeviceName})");
+        foreach (var (id, name) in outputs)
+        {
+            Audio.AudioOutput.Preferred = id;
+            var got = WaitFor(name);
+            Check(got == name, $"trocou para \"{name}\" (tocando em \"{got}\")");
+        }
+        Audio.AudioOutput.Preferred = "{0.0.0.00000000}.{00000000-0000-0000-0000-000000000000}";
+        Check(WaitFor(def) == def, $"escolha desligada volta ao padrão ({player.DeviceName})");
+        Audio.AudioOutput.Preferred = null;
+        Check(WaitFor(def) == def, $"volta ao padrão do Windows ({player.DeviceName})");
+
+        cts.Cancel();
+        try { feeder.Wait(1000); } catch { }
+        Log.Info(failures == 0 ? "AUDIOTEST concluído: tudo certo" : $"AUDIOTEST concluído com {failures} falha(s)");
+        return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
     /// Cria um controle virtual (ViGEmBus), aplica estados e confere lendo de volta pelo XInput deste computador.
     /// </summary>
     public static int GamepadTest()
@@ -528,7 +590,7 @@ internal static class DevTools
             surface.MarkUpdated();
         }
         var viewer = new ViewerForm("NOTEBOOK-TESTE", surface, _ => { }, screen, fullscreen: false, showStats: true,
-            new Size(surface.Width, surface.Height)) { NoActivate = true, ShowInTaskbar = false };
+            new Size(surface.Width, surface.Height), audio: true) { NoActivate = true, ShowInTaskbar = false };
         viewer.Location = new Point(-30000, -30000);
         viewer.Show();
         viewer.SetStats("NOTEBOOK-TESTE • 1920×1080 • 30 quadros/s • 41,2 Mbit/s • decodificação 4 ms");

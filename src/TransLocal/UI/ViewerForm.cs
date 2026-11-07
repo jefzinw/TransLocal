@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using TransLocal.Audio;
 using TransLocal.Input;
 using TransLocal.Video;
 
@@ -313,6 +314,7 @@ internal sealed class SurfaceView : Control
                 Keys.C => "control",
                 Keys.S => "stats",
                 Keys.M => "mouse-mode",
+                Keys.A => "audio-next",
                 _ => null,
             };
         }
@@ -354,6 +356,7 @@ internal sealed class ViewerForm : Form
     private readonly Button _btnFull;
     private readonly Button _btnControl;
     private readonly Button _btnStats;
+    private readonly Button? _btnAudio;
     private readonly System.Windows.Forms.Timer _barTimer;
     private readonly string _title;
     private readonly bool _controlAvailable;
@@ -378,7 +381,7 @@ internal sealed class ViewerForm : Form
     protected override bool ShowWithoutActivation => NoActivate;
 
     public ViewerForm(string title, FrameSurface surface, Action<byte[]>? sendInput, Screen target, bool fullscreen, bool showStats,
-        Size initialImageSize, bool startWithControl = false)
+        Size initialImageSize, bool startWithControl = false, bool audio = false)
     {
         _title = title;
         _controlAvailable = sendInput is not null;
@@ -427,7 +430,16 @@ internal sealed class ViewerForm : Form
         _btnStats = BarButton("Estatísticas", (_, _) => ToggleStats());
         _btnFull = BarButton("Tela cheia", (_, _) => ToggleFullscreen());
         var btnClose = BarButton("Fechar", (_, _) => Close());
-        flow.Controls.AddRange(new Control[] { _gamepadLabel, _btnControl, _btnStats, _btnFull, btnClose });
+        flow.Controls.Add(_gamepadLabel);
+        if (audio)
+        {
+            // O clique do BarButton devolve o foco à imagem; o menu abre logo depois.
+            _btnAudio = BarButton("Som", (_, _) => BeginInvoke(ShowAudioMenu));
+            flow.Controls.Add(_btnAudio);
+            AudioOutput.Changed += OnAudioOutputsChanged;
+            HandleCreated += (_, _) => UpdateAudioButton();
+        }
+        flow.Controls.AddRange(new Control[] { _btnControl, _btnStats, _btnFull, btnClose });
         _bar.Controls.Add(_barTitle);
         _bar.Controls.Add(flow);
 
@@ -540,6 +552,7 @@ internal sealed class ViewerForm : Form
     {
         _barTimer.Stop();
         _barTimer.Dispose();
+        AudioOutput.Changed -= OnAudioOutputsChanged;
         base.OnFormClosed(e);
         if (!_closingFromCode) UserClosed?.Invoke();
     }
@@ -554,7 +567,70 @@ internal sealed class ViewerForm : Form
             case "control": ToggleControl(); break;
             case "stats": ToggleStats(); break;
             case "mouse-mode": _view.ToggleForceAbsolute(); break;
+            case "audio-next": if (_btnAudio is not null) NextAudioOutput(); break;
         }
+    }
+
+    // ---------- Saída de som ----------
+
+    private static string Short(string? name, int max = 28) =>
+        string.IsNullOrEmpty(name) ? "nenhuma" : name.Length <= max ? name : name[..(max - 1)] + "…";
+
+    private void OnAudioOutputsChanged()
+    {
+        if (!IsHandleCreated || IsDisposed) return;
+        try { BeginInvoke(UpdateAudioButton); } catch (InvalidOperationException) { }
+    }
+
+    private void UpdateAudioButton()
+    {
+        if (_btnAudio is null || IsDisposed) return;
+        string? current = null;
+        string? preferred = AudioOutput.Preferred;
+        if (preferred is not null) current = AudioOutput.List().FirstOrDefault(o => o.Id == preferred).Name;
+        bool missing = preferred is not null && current is null;
+        current ??= AudioOutput.DefaultName();
+        _btnAudio.Text = $"Som: {Short(current)}{(missing ? " (escolhido desligado)" : "")} ▾";
+    }
+
+    private void ShowAudioMenu()
+    {
+        if (_btnAudio is null) return;
+        var menu = new ContextMenuStrip { ShowCheckMargin = true, ShowImageMargin = false };
+        string? preferred = AudioOutput.Preferred;
+        var def = new ToolStripMenuItem($"Padrão do Windows ({Short(AudioOutput.DefaultName(), 40)}) — muda sozinho ao ligar um fone")
+        {
+            Checked = preferred is null,
+        };
+        def.Click += (_, _) => { AudioOutput.Preferred = null; UpdateAudioButton(); };
+        menu.Items.Add(def);
+        menu.Items.Add(new ToolStripSeparator());
+        var outputs = AudioOutput.List();
+        foreach (var (id, name) in outputs)
+        {
+            var item = new ToolStripMenuItem(name) { Checked = id == preferred };
+            item.Click += (_, _) => { AudioOutput.Preferred = id; UpdateAudioButton(); };
+            menu.Items.Add(item);
+        }
+        if (outputs.Count == 0) menu.Items.Add(new ToolStripMenuItem("Nenhuma saída de som ligada") { Enabled = false });
+        menu.Items.Add(new ToolStripSeparator());
+        var hint = new ToolStripMenuItem("Ctrl+Alt+Shift+A troca para a próxima saída") { Enabled = false };
+        menu.Items.Add(hint);
+        menu.Closed += (_, _) => BeginInvoke(() => { menu.Dispose(); _view.Focus(); });
+        menu.Show(_btnAudio, new Point(0, _btnAudio.Height));
+    }
+
+    /// <summary>Atalho: Padrão → cada saída ligada → Padrão…</summary>
+    private void NextAudioOutput()
+    {
+        var outputs = AudioOutput.List();
+        string? preferred = AudioOutput.Preferred;
+        int idx = preferred is null ? -1 : outputs.FindIndex(o => o.Id == preferred);
+        string? next = idx + 1 < outputs.Count ? outputs[idx + 1].Id : null;
+        AudioOutput.Preferred = next;
+        UpdateAudioButton();
+        string label = next is null ? $"Padrão do Windows ({AudioOutput.DefaultName() ?? "nenhuma"})" : outputs[idx + 1].Name;
+        _barTitle.Text = $"{_title} — som em: {label}";
     }
 
     /// <summary>O outro computador avisou se um jogo prendeu o cursor (mouse relativo).</summary>

@@ -72,6 +72,7 @@ Exemplo: o notebook exibe a tela do PC e você quer jogar ou usar o PC pelo note
 - Para parear por Bluetooth: *Configurações do Windows › Bluetooth e dispositivos › Adicionar dispositivo*, com o controle em modo de pareamento (PS4: Share + PS; PS5: Create + PS; Xbox: botão de pareamento; genéricos: veja o manual).
 - Os controles só são enviados enquanto a janela de exibição está em primeiro plano. **Ctrl+Alt+Shift+C** solta/retoma o controle.
 - **Mouse em jogos:** quando um jogo prende ou esconde o cursor (câmera em 1ª/3ª pessoa), o TransLocal passa sozinho a enviar **movimento relativo** (como um mouse ligado direto no PC) e prende o cursor na janela de exibição. **Ctrl+Alt+Shift+M** força o modo normal se precisar. O teclado é enviado pelo código físico das teclas (o que os jogos leem), e todas as teclas são soltas quando a janela perde o foco.
+- **Som:** o som recebido toca na saída padrão do Windows e **acompanha a troca** — ligou um fone Bluetooth ou USB durante a transmissão, o som passa para ele sozinho. Para escolher outra saída, use o botão **Som** na barra da janela de exibição (leve o mouse ao topo) ou **Ctrl+Alt+Shift+A**; a escolha fica salva e, se aquele dispositivo estiver desligado, o som volta ao padrão.
 - Sem a Xbox Game Bar instalada, o Windows mostraria a janela “Obter um aplicativo para abrir este link ‘ms-gamebar’” a cada controle conectado; o TransLocal registra um manipulador silencioso para o seu usuário (desfeito na desinstalação, ou com `TransLocal.exe --restore-gamebar-prompt`).
 
 ### Atalhos
@@ -84,6 +85,7 @@ Exemplo: o notebook exibe a tela do PC e você quer jogar ou usar o PC pelo note
 | Ctrl+Alt+Shift+F | janela de exibição | tela cheia (também com o controle ligado) |
 | Ctrl+Alt+Shift+C | janela de exibição | liga/desliga o controle do outro computador |
 | Ctrl+Alt+Shift+M | janela de exibição | força o mouse normal (desliga o modo relativo de jogos) |
+| Ctrl+Alt+Shift+A | janela de exibição | troca a saída de som (padrão do Windows → cada saída ligada) |
 | Ctrl+Alt+Shift+Q | janela de exibição | fecha |
 
 ### Acesso remoto (de fora de casa) com aprovação pelo celular

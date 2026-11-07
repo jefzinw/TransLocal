@@ -286,6 +286,9 @@ internal sealed class ReceiverSession
     public bool FromThisComputer { get; }
 
     public bool ControlAllowed => _hello.Control && !FromThisComputer;
+
+    /// <summary>A transmissão traz som e este computador vai tocá-lo.</summary>
+    public bool HasAudio => _hello.Audio && _playAudio && _hello.AudioRate > 0 && _hello.AudioChannels is 1 or 2;
     public int InitialWidth => _hello.Width;
     public int InitialHeight => _hello.Height;
     public long FramesReceived;
@@ -324,7 +327,7 @@ internal sealed class ReceiverSession
     public string? Run()
     {
         AudioPlayer? audio = null;
-        if (_hello.Audio && _playAudio && _hello.AudioRate > 0 && _hello.AudioChannels is 1 or 2)
+        if (HasAudio)
         {
             try { audio = new AudioPlayer(new WaveFormat(_hello.AudioRate, 16, _hello.AudioChannels)); }
             catch (Exception ex) { Log.Warn("Não foi possível tocar o áudio recebido", ex); }

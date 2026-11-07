@@ -89,6 +89,13 @@ internal sealed class TrayApp : ApplicationContext
         _receiver = CreateServer();
         Log.Info($"Identidade deste aparelho: {Identity.ShortId}");
 
+        Audio.AudioOutput.Initialize(Settings.ReceiverAudioDevice);
+        Audio.AudioOutput.PreferredChanged += id =>
+        {
+            Settings.ReceiverAudioDevice = id;
+            try { Settings.Save(); } catch (Exception ex) { Log.Warn("Falha ao salvar a saída de som", ex); }
+        };
+
         var menu = new ContextMenuStrip();
         var miOpen = new ToolStripMenuItem("Abrir TransLocal", null, (_, _) => ShowMain()) { Font = new Font(SystemFonts.MenuFont ?? Control.DefaultFont, FontStyle.Bold) };
         _miSend = new ToolStripMenuItem("Transmitir", null, async (_, _) => await ToggleSendFromShortcutAsync());
@@ -537,7 +544,7 @@ internal sealed class TrayApp : ApplicationContext
         var screen = Monitors.Resolve(Settings.ViewerMonitor);
         var viewer = new ViewerForm(s.SenderName, s.Surface, s.ControlAllowed ? s.SendInput : null, screen,
             Settings.ViewerFullscreen, Settings.ShowStats, new Size(s.InitialWidth, s.InitialHeight),
-            startWithControl: Settings.ViewerAutoControl);
+            startWithControl: Settings.ViewerAutoControl, audio: s.HasAudio);
         viewer.UserClosed += () => s.Close();
         s.FrameReady += viewer.NotifyFrame;
         s.StatsUpdated += viewer.SetStats;
@@ -735,7 +742,7 @@ internal sealed class TrayApp : ApplicationContext
         var screen = Monitors.Resolve(Settings.ViewerMonitor);
         var viewer = new ViewerForm($"HDMI — {device.Descriptor.Name}", session.Surface, null, screen,
             Settings.HdmiFullscreen, Settings.ShowStats,
-            new Size(format.Characteristics.Width, format.Characteristics.Height));
+            new Size(format.Characteristics.Width, format.Characteristics.Height), audio: !string.IsNullOrEmpty(audioInputId));
         session.FrameReady += viewer.NotifyFrame;
         session.StatsUpdated += viewer.SetStats;
         viewer.UserClosed += () => _ = CloseHdmiAsync();
