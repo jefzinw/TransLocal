@@ -13,8 +13,9 @@ Funciona nos dois sentidos: notebook → PC ou PC → notebook.
 
 - **`TransLocal-Setup-x.y.z.exe`** — instalador (recomendado)
 - **`TransLocal.exe`** — executável único, roda sem instalar
+- **`TransLocal-Android.apk`** — app de celular que aprova acessos remotos e mostra o código de autorização
 
-Instale nos dois computadores. Não é preciso ter o .NET instalado.
+Instale nos dois computadores. Não é preciso ter o .NET instalado. **A versão 1.3 só conversa com a 1.3 ou mais nova** (as conexões passaram a ser criptografadas): atualize os dois computadores.
 
 ## Que cabo usar
 
@@ -47,7 +48,8 @@ Instale nos dois computadores. Não é preciso ter o .NET instalado.
 1. Ligue o cabo entre os dois computadores e abra o TransLocal nos dois.
 2. No computador que vai **mostrar** a tela (ex.: o PC): aba **Receber nesta tela** — deixe “Aceitar transmissões” ligado.
 3. No computador que vai **enviar** a tela (ex.: o notebook): aba **Transmitir esta tela** › **Procurar receptores**, escolha o PC (prefira a linha “cabo…”) e clique em **Transmitir**.
-4. A tela abre no PC em tela cheia. Leve o mouse ao topo para ver os botões.
+4. **Na primeira vez**, os dois computadores mostram um **código de 6 dígitos**: confira se é o mesmo nas duas telas e confirme nas duas. Depois de pareados, eles se reconhecem sozinhos.
+5. A tela abre no PC em tela cheia. Leve o mouse ao topo para ver os botões.
 
 Opções do transmissor: monitor a transmitir, **resolução enviada**, quadros por segundo (até 60), qualidade, som do sistema e **permitir que o outro computador use o mouse, o teclado e os controles** (desligado por padrão).
 
@@ -69,6 +71,7 @@ Exemplo: o notebook exibe a tela do PC e você quer jogar ou usar o PC pelo note
 - **Controle não reconhecido ou com botões trocados?** Aba *Receber* › selecione o controle na lista › **Configurar botões do controle selecionado…** — um assistente pede cada botão, gatilho e analógico, e o ajuste fica salvo para aquele modelo.
 - Para parear por Bluetooth: *Configurações do Windows › Bluetooth e dispositivos › Adicionar dispositivo*, com o controle em modo de pareamento (PS4: Share + PS; PS5: Create + PS; Xbox: botão de pareamento; genéricos: veja o manual).
 - Os controles só são enviados enquanto a janela de exibição está em primeiro plano. **Ctrl+Alt+Shift+C** solta/retoma o controle.
+- **Mouse em jogos:** quando um jogo prende ou esconde o cursor (câmera em 1ª/3ª pessoa), o TransLocal passa sozinho a enviar **movimento relativo** (como um mouse ligado direto no PC) e prende o cursor na janela de exibição. **Ctrl+Alt+Shift+M** força o modo normal se precisar. O teclado é enviado pelo código físico das teclas (o que os jogos leem), e todas as teclas são soltas quando a janela perde o foco.
 - Sem a Xbox Game Bar instalada, o Windows mostraria a janela “Obter um aplicativo para abrir este link ‘ms-gamebar’” a cada controle conectado; o TransLocal registra um manipulador silencioso para o seu usuário (desfeito na desinstalação, ou com `TransLocal.exe --restore-gamebar-prompt`).
 
 ### Atalhos
@@ -80,7 +83,30 @@ Exemplo: o notebook exibe a tela do PC e você quer jogar ou usar o PC pelo note
 | F11 / Esc | janela de exibição | alterna / sai da tela cheia |
 | Ctrl+Alt+Shift+F | janela de exibição | tela cheia (também com o controle ligado) |
 | Ctrl+Alt+Shift+C | janela de exibição | liga/desliga o controle do outro computador |
+| Ctrl+Alt+Shift+M | janela de exibição | força o mouse normal (desliga o modo relativo de jogos) |
 | Ctrl+Alt+Shift+Q | janela de exibição | fecha |
+
+### Acesso remoto (de fora de casa) com aprovação pelo celular
+
+Exemplo: você está fora com o notebook e quer usar o PC de casa, que ficou ligado com o TransLocal aberto.
+
+1. **Em casa, uma vez só:**
+   - pareie o notebook com o PC (basta uma transmissão entre os dois — veja *Como usar*);
+   - no PC, aba **Acesso remoto** › marque *Permitir acesso remoto a este computador*;
+   - instale o **Tailscale** (gratuito, [tailscale.com](https://tailscale.com/download)) no PC, no notebook e no celular, com a mesma conta — é o que faz os aparelhos se enxergarem pela internet sem abrir portas no roteador;
+   - instale o **`TransLocal-Android.apk`** no celular, abra-o na mesma rede do PC, toque em **Parear com um computador** e confirme o mesmo código no celular e no PC. Toque também em *Permitir funcionar em segundo plano*.
+2. **Fora de casa:** no notebook, aba **Acesso remoto** › escolha o PC, confira o endereço (o 100.x.x.x do PC no Tailscale) e clique em **Pedir a tela**.
+3. O celular recebe a notificação **“Notebook quer acessar o PC — Permitir / Negar”**. Ao permitir, a tela do PC abre no notebook, sem ninguém tocar no PC.
+4. Sem o celular conectado? Digite no notebook o **código de autorização** de 6 dígitos que o app mostra (muda a cada 30 s; também funciona com Google/Microsoft Authenticator — QR na aba *Acesso remoto* do PC).
+
+### Segurança
+
+- Cada aparelho tem uma **chave criptográfica própria** (no Windows, guardada pelo sistema e não exportável).
+- Toda conexão usa **TLS** (criptografia de imagem, som, teclado e mouse) e **autenticação mútua**: cada lado prova quem é com a sua chave.
+- Dois aparelhos só conversam depois de **pareados**, com um código de 6 dígitos confirmado nas duas telas. O código é gerado de forma que um intermediário não consegue fazer as duas telas mostrarem o mesmo número. **Se aparecer um pedido de pareamento que você não esperava, cancele.**
+- **Acesso remoto** é desligado por padrão, só aceita aparelhos pareados (não permite parear de fora) e cada acesso precisa ser aprovado (celular, tela do PC ou código de autorização). Códigos não podem ser reutilizados; 5 códigos errados bloqueiam por 10 minutos; endereços com 5 conexões inválidas são bloqueados por 5 minutos.
+- O controle do PC (mouse, teclado, controles) continua exigindo *Permitir que o outro computador use…* no PC.
+- Aparelhos pareados podem ser removidos em *Configurações e ajuda › Aparelhos pareados*.
 
 ### Usar como segundo monitor (área estendida)
 
@@ -95,13 +121,18 @@ O TransLocal transmite um monitor existente. Para estender a área de trabalho, 
 - **Controle de jogo não funciona:** na barra da janela de exibição (leve o mouse ao topo) aparece o estado dos controles. “Falta o driver no outro PC” → instale o suporte a controles no PC. Na aba *Receber* aparece a lista de controles detectados neste computador; se o seu não aparecer, confira o pareamento Bluetooth; se aparecer como “não reconhecido”, use **Configurar botões**.
 - **Imagem lenta ou travando no computador que exibe:** marque *Pedir transmissão leve* nele e, no transmissor, deixe *Resolução enviada: Automática*.
 - **Controle não funciona em janelas de administrador:** o Windows bloqueia entrada simulada em programas elevados, a não ser que o TransLocal também seja executado como administrador. A tela de UAC e a tela de bloqueio não podem ser transmitidas.
+- **Mouse “preso” para um lado em jogos:** o modo relativo entra quando o jogo esconde/prende o cursor; se o jogo não fizer isso, use **Ctrl+Alt+Shift+M**. Jogos com anti-cheat que bloqueiam entrada simulada podem ignorar o controle remoto.
+- **“Não está pareado” ao pedir acesso de fora:** o pareamento precisa ser feito antes, em casa, na mesma rede.
+- **Celular não recebe os pedidos:** confira no app se aparece “Conectado a …”; o celular precisa alcançar o PC (mesma rede ou Tailscale) e ter permissão de funcionar em segundo plano. Sem isso, use o código de autorização.
 - **Registros:** aba *Configurações e ajuda › Abrir pasta de registros* (`%LOCALAPPDATA%\TransLocal`).
 
 ## Como funciona
 
 - **Captura:** DXGI Desktop Duplication (a mesma API da gravação de tela do Windows, ~4 ms por quadro em 1080p), com GDI como reserva automática. O cursor é desenhado na imagem.
 - **Codificação:** a tela é dividida em faixas de 64 px; só os trechos que mudaram são enviados, em JPEG codificado em paralelo (~4 ms para um quadro 1080p inteiro). Controle de fluxo com no máximo 2 quadros em trânsito mantém o atraso baixo mesmo quando a rede é mais lenta.
-- **Rede:** TCP 52020 (vídeo, som, controle) e UDP 52021 (descoberta por broadcast em todas as interfaces, inclusive 169.254.x.x).
+- **Rede:** TCP 52020 com TLS 1.2/1.3 (vídeo, som, controle, acesso remoto, celular aprovador) e UDP 52021 (descoberta por broadcast em todas as interfaces, inclusive 169.254.x.x).
+- **Autenticação:** identidade ECDSA P-256 por aparelho; quem aceita a conexão envia um desafio que quem conecta assina junto com as duas chaves e a finalidade; pareamento por comparação de código (compromisso e revelação); código de autorização TOTP (RFC 6238).
+- **Captura resiliente:** quando um jogo assume a tela, a captura é recriada com espera crescente (0,2 s → 3 s) e, após falhas seguidas, o dispositivo de vídeo é reiniciado — sem sobrecarregar o PC.
 - **Som:** loopback WASAPI do transmissor → PCM 16 bits → reprodução com descarte de atraso acumulado.
 - **Redução de resolução:** média de área (separável, ponto fixo, linhas em paralelo), ~6 ms para 1920×1080 → 1366×768; quando a tela não muda, captura, redução e compressão são puladas.
 - **Controles de jogo:** o receptor lê os controles pela SDL3 (USB/Bluetooth, com XInput direto como reserva) a cada 4 ms e envia só as mudanças; o transmissor os reproduz como controles de Xbox 360 virtuais (ViGEmBus) e devolve a vibração.
@@ -111,7 +142,7 @@ Bibliotecas: [NAudio](https://github.com/naudio/NAudio) (MIT), [FlashCap](https:
 
 ## Compilar
 
-Requisitos: SDK do .NET 10 e, para o instalador, Inno Setup 6 (`winget install JRSoftware.InnoSetup`).
+Requisitos: SDK do .NET 10 e, para o instalador, Inno Setup 6 (`winget install JRSoftware.InnoSetup`). Para o app Android: `dotnet workload install android` e as dependências (`dotnet build android\TransLocal.Android -t:InstallAndroidDependencies -f net10.0-android -p:AndroidSdkDirectory=… -p:JavaSdkDirectory=… -p:AcceptAndroidSDKLicenses=True`). O app Android usa os mesmos arquivos de protocolo e segurança do Windows (`Protocol.cs`, `Security\*`, `Streaming\RemoteAccess.cs`).
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1            # dist\win-x64\TransLocal.exe + dist\TransLocal-Setup-1.0.0.exe

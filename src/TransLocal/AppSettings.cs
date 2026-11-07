@@ -1,4 +1,5 @@
 using System.Text.Json;
+using TransLocal.Security;
 
 namespace TransLocal;
 
@@ -6,6 +7,15 @@ internal sealed class AppSettings
 {
     // Geral
     public string DeviceName { get; set; } = Environment.MachineName;
+
+    /// <summary>Aparelhos pareados (impressão digital da chave conferida a cada conexão).</summary>
+    public List<TrustedDevice> TrustedDevices { get; set; } = new();
+
+    /// <summary>Permite que aparelhos pareados peçam a tela deste computador (acesso remoto).</summary>
+    public bool RemoteAccessEnabled { get; set; }
+
+    /// <summary>Segredo do código de autorização (TOTP), cifrado com DPAPI para o usuário atual.</summary>
+    public string? TotpSecretProtected { get; set; }
 
     /// <summary>Procura e instala atualizações do GitHub ao abrir (e a cada 12 h).</summary>
     public bool AutoUpdate { get; set; } = true;

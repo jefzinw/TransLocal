@@ -5,35 +5,55 @@ using System.Net.Sockets;
 using NAudio.Wave;
 using TransLocal.Audio;
 using TransLocal.Input;
+using TransLocal.Security;
 using TransLocal.Video;
 
 namespace TransLocal.Streaming;
 
 /// <summary>
-/// Fica aguardando transmissões (TCP 52020) e responde às procuras (UDP 52021).
+/// Aceita conexões (TCP 52020) e responde às procuras (UDP 52021). Toda conexão passa pelo canal seguro
+/// (TLS + autenticação + pareamento) e depois é encaminhada conforme a finalidade: receber uma tela,
+/// pedido de acesso remoto (alguém quer a tela deste computador) ou celular aprovador.
 /// Exibe uma transmissão por vez.
 /// </summary>
 internal sealed class ReceiverServer : IDisposable
 {
+    private const int MaxConcurrentHandshakes = 8;
+    private const int MaxFailuresPerAddress = 5;
+    private static readonly TimeSpan BlockTime = TimeSpan.FromMinutes(5);
+
     private readonly int _port;
     private readonly int _discoveryPort;
-    private readonly Func<string> _name;
+    private readonly Func<SecureChannelOptions> _channel;
     private readonly Func<bool> _playAudio;
     private readonly Func<ReceiverPrefs> _prefs;
+    private readonly Func<bool> _acceptStreams;
+    private readonly Dictionary<IPAddress, (int Failures, DateTime Until)> _failures = new();
     private TcpListener? _listener;
     private DiscoveryResponder? _discovery;
     private CancellationTokenSource? _cts;
     private ReceiverSession? _active;
+    private int _handshakes;
 
     public event Action<ReceiverSession>? SessionStarted;
     public event Action<ReceiverSession, string?>? SessionEnded;
 
-    public ReceiverServer(Func<string> name, Func<bool> playAudio, Func<ReceiverPrefs>? prefs = null,
-        int port = Proto.VideoPort, int discoveryPort = Proto.DiscoveryPort)
+    /// <summary>Aparelho autenticado (para atualizar “visto por último”).</summary>
+    public event Action<PeerInfo, IPAddress?>? PeerAuthenticated;
+
+    /// <summary>Pedido de acesso remoto. Retorna true se assumiu a conexão (ela não é fechada aqui).</summary>
+    public Func<Connection, PeerInfo, bool>? PullHandler { get; set; }
+
+    /// <summary>Celular aprovador conectado; bloqueia até ele sair.</summary>
+    public Action<Connection, PeerInfo>? ApproverHandler { get; set; }
+
+    public ReceiverServer(Func<SecureChannelOptions> channel, Func<bool> playAudio, Func<ReceiverPrefs>? prefs = null,
+        Func<bool>? acceptStreams = null, int port = Proto.VideoPort, int discoveryPort = Proto.DiscoveryPort)
     {
+        _channel = channel;
         _prefs = prefs ?? (() => default);
-        _name = name;
         _playAudio = playAudio;
+        _acceptStreams = acceptStreams ?? (() => true);
         _port = port;
         _discoveryPort = discoveryPort;
     }
@@ -52,7 +72,7 @@ internal sealed class ReceiverServer : IDisposable
         _cts = new CancellationTokenSource();
         try
         {
-            _discovery = new DiscoveryResponder(_discoveryPort, _port, _name, () => Active is not null);
+            _discovery = new DiscoveryResponder(_discoveryPort, _port, () => _channel().LocalName, () => Active is not null, _channel().Identity.ShortId);
             _discovery.Start();
         }
         catch (Exception ex)
@@ -60,7 +80,7 @@ internal sealed class ReceiverServer : IDisposable
             Log.Warn($"Descoberta automática indisponível (porta UDP {_discoveryPort})", ex);
         }
         _ = AcceptLoopAsync(listener, _cts.Token);
-        Log.Info($"Receptor aguardando na porta TCP {_port} (descoberta UDP {_discoveryPort})");
+        Log.Info($"Aguardando conexões seguras na porta TCP {_port} (descoberta UDP {_discoveryPort})");
     }
 
     public void Stop()
@@ -91,38 +111,125 @@ internal sealed class ReceiverServer : IDisposable
                 Log.Warn("Falha ao aceitar conexão", ex);
                 continue;
             }
-            var t = new Thread(() => HandleClient(client)) { IsBackground = true, Name = "TransLocal receptor" };
+            var t = new Thread(() => HandleClient(client)) { IsBackground = true, Name = "TransLocal conexão" };
             t.Start();
+        }
+    }
+
+    private bool IsBlocked(IPAddress? ip)
+    {
+        if (ip is null) return false;
+        lock (_failures)
+            return _failures.TryGetValue(ip, out var f) && f.Failures >= MaxFailuresPerAddress && DateTime.UtcNow < f.Until;
+    }
+
+    private void RegisterFailure(IPAddress? ip)
+    {
+        if (ip is null) return;
+        lock (_failures)
+        {
+            _failures.TryGetValue(ip, out var f);
+            if (DateTime.UtcNow >= f.Until) f = (0, default);
+            f = (f.Failures + 1, DateTime.UtcNow + BlockTime);
+            _failures[ip] = f;
+            if (f.Failures == MaxFailuresPerAddress)
+                Log.Warn($"Endereço {ip} bloqueado por {BlockTime.TotalMinutes:0} minutos após {MaxFailuresPerAddress} conexões recusadas");
         }
     }
 
     private void HandleClient(TcpClient client)
     {
-        Connection conn;
-        try { conn = new Connection(client); }
-        catch { client.Dispose(); return; }
+        var ip = (client.Client.RemoteEndPoint as IPEndPoint)?.Address;
+        if (ip is not null && ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+        if (IsBlocked(ip) || Interlocked.Increment(ref _handshakes) > MaxConcurrentHandshakes)
+        {
+            if (!IsBlocked(ip)) Interlocked.Decrement(ref _handshakes);
+            client.Dispose();
+            return;
+        }
 
+        Connection conn;
+        PeerInfo peer;
+        ChannelPurpose purpose;
+        try
+        {
+            // Pareamento só pode ser feito para transmitir/aprovar (com alguém confirmando o código nas duas
+            // telas); pedido de acesso remoto exige aparelho já pareado.
+            (conn, peer, purpose) = SecureChannel.Accept(client, _channel(), p => p != ChannelPurpose.Pull);
+        }
+        catch (Exception ex)
+        {
+            RegisterFailure(ip);
+            Log.Warn($"Conexão recusada de {ip}: {ex.Message}");
+            client.Dispose();
+            return;
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _handshakes);
+        }
+
+        Log.Info($"Conexão segura de {peer.Name} ({peer.ShortId}, {ip}) para {purpose}");
+        try { PeerAuthenticated?.Invoke(peer, ip); } catch { }
+
+        bool keepOpen = false;
+        try
+        {
+            switch (purpose)
+            {
+                case ChannelPurpose.Stream:
+                    ServeIncomingStream(conn, peer, requestedByUs: false);
+                    break;
+                case ChannelPurpose.Pull:
+                    if (PullHandler is null)
+                        conn.SendJson(MsgType.StreamDecision, new StreamDecisionMessage { Reason = "Acesso remoto indisponível." });
+                    else
+                        keepOpen = PullHandler(conn, peer);
+                    break;
+                case ChannelPurpose.Approver:
+                    ApproverHandler?.Invoke(conn, peer);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Conexão de {peer.Name} encerrada", ex);
+        }
+        finally
+        {
+            if (!keepOpen) conn.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Exibe a tela que o outro aparelho envia por esta conexão (bloqueia até terminar).
+    /// <paramref name="requestedByUs"/> = este aparelho pediu a tela (acesso remoto).
+    /// </summary>
+    public void ServeIncomingStream(Connection conn, PeerInfo peer, bool requestedByUs)
+    {
         ReceiverSession? session = null;
         try
         {
-            conn.ReceiveTimeoutMs = 10_000;
-            HelloMessage hello;
-            using (var m = conn.Receive())
-            {
-                if (m.Type != MsgType.Hello) return;
-                hello = m.ReadJson<HelloMessage>();
-            }
+            conn.ReceiveTimeoutMs = 15_000;
+            var hello = conn.ReceiveJson<HelloMessage>(MsgType.Hello);
             if (hello.App != Proto.AppId || hello.ProtocolVersion != Proto.Version)
             {
-                conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = false, Name = _name(), Reason = "Versão do TransLocal incompatível. Atualize os dois computadores." });
+                conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = false, Name = _channel().LocalName, Reason = "Versão do TransLocal incompatível. Atualize os dois computadores." });
                 return;
             }
+            if (!requestedByUs && !_acceptStreams())
+            {
+                conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = false, Name = _channel().LocalName, Reason = $"{_channel().LocalName} não está aceitando transmissões agora." });
+                return;
+            }
+            // O nome exibido é o do aparelho autenticado, não o que veio na mensagem.
+            hello.Name = peer.Name;
 
             var prefs = _prefs();
             session = new ReceiverSession(conn, hello, _playAudio(), prefs.Light);
             if (Interlocked.CompareExchange(ref _active, session, null) is not null)
             {
-                conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = false, Name = _name(), Reason = "Este computador já está exibindo outra transmissão." });
+                conn.SendJson(MsgType.Welcome, new WelcomeMessage { Accepted = false, Name = _channel().LocalName, Reason = "Este computador já está exibindo outra transmissão." });
                 session.Surface.Dispose();
                 session = null;
                 return;
@@ -131,7 +238,7 @@ internal sealed class ReceiverServer : IDisposable
             conn.SendJson(MsgType.Welcome, new WelcomeMessage
             {
                 Accepted = true,
-                Name = _name(),
+                Name = _channel().LocalName,
                 ScreenWidth = prefs.ScreenWidth,
                 ScreenHeight = prefs.ScreenHeight,
                 Light = prefs.Light,
@@ -146,20 +253,17 @@ internal sealed class ReceiverServer : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Warn($"Conexão de {conn.RemoteEndPoint} encerrada", ex);
+            Log.Warn($"Exibição de {peer.Name} encerrada", ex);
             if (session is not null && Interlocked.CompareExchange(ref _active, null, session) == session)
             {
                 try { SessionEnded?.Invoke(session, "A ligação foi perdida."); } catch { }
             }
         }
-        finally
-        {
-            conn.Dispose();
-        }
     }
 
     public void Dispose() => Stop();
 }
+
 
 /// <summary>Uma transmissão sendo exibida neste computador.</summary>
 internal sealed class ReceiverSession
@@ -196,6 +300,10 @@ internal sealed class ReceiverSession
 
     /// <summary>Vibração pedida pelo jogo no outro computador: (slot, motor grande, motor pequeno).</summary>
     public event Action<int, byte, byte>? GamepadFeedback;
+
+    /// <summary>O transmissor avisou que um jogo prendeu (true) ou soltou (false) o cursor.</summary>
+    public event Action<bool>? CursorModeChanged;
+    public bool RemoteCursorCaptured { get; private set; }
 
     /// <summary>Este receptor pediu transmissão leve (desenho mais rápido também).</summary>
     public bool Light { get; }
@@ -244,6 +352,10 @@ internal sealed class ReceiverSession
                     case MsgType.Audio:
                         audio?.Add(m.Span);
                         break;
+                    case MsgType.CursorMode when m.Length >= 1:
+                        RemoteCursorCaptured = m.Span[0] != 0;
+                        CursorModeChanged?.Invoke(RemoteCursorCaptured);
+                        break;
                     case MsgType.GamepadFeedback when m.Length >= 3:
                         GamepadFeedback?.Invoke(m.Span[0], m.Span[1], m.Span[2]);
                         break;
@@ -273,6 +385,13 @@ internal sealed class ReceiverSession
     {
         if (!ControlAllowed || _closing) return;
         try { _conn.Send(MsgType.Input, payload); } catch { }
+    }
+
+    /// <summary>Texto para o registro do outro computador (diagnóstico).</summary>
+    public void SendInfo(string text)
+    {
+        if (_closing) return;
+        try { _conn.Send(MsgType.Info, System.Text.Encoding.UTF8.GetBytes(text)); } catch { }
     }
 
     public void SendGamepad(byte[] payload)

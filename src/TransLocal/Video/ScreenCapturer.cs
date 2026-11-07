@@ -185,6 +185,7 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
     private bool _hasFrame;
     private bool _cleanChanged;
     private long _nextRetry;
+    private int _failures;
 
     public override string Method => "DXGI";
 
@@ -285,20 +286,28 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
     {
         if (_dup is null)
         {
-            // A duplicação se perde em mudanças de modo, UAC, tela de bloqueio… tenta recriar de tempos em tempos.
+            // A duplicação se perde quando um jogo assume a tela, em mudanças de modo, UAC, tela de bloqueio…
+            // Recria com espera crescente: recriar a cada quadro esgota a memória de vídeo e trava o PC.
             if (Environment.TickCount64 >= _nextRetry)
             {
                 try
                 {
-                    CreateDuplication();
-                    SeedFromGdi();
+                    if (_device is null)
+                    {
+                        Open(); // já cria a duplicação e captura a imagem inicial
+                    }
+                    else
+                    {
+                        CreateDuplication();
+                        SeedFromGdi();
+                    }
+                    if (_failures > 0) Log.Info($"Captura DXGI restabelecida após {_failures} tentativa(s)");
                 }
                 catch (Exception ex)
                 {
                     _dup?.Dispose();
                     _dup = null;
-                    _nextRetry = Environment.TickCount64 + 500;
-                    Log.Warn("Recriando a captura DXGI", ex);
+                    RegisterFailure($"recriação falhou: {ex.GetType().Name}: {ex.Message}");
                 }
             }
             if (_dup is null)
@@ -334,6 +343,7 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
                     _hasFrame = true;
                     _cleanChanged = true;
                 }
+                _failures = 0;
             }
             finally
             {
@@ -343,14 +353,44 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         }
         else if (hr.Code != DXGI_ERROR_WAIT_TIMEOUT)
         {
-            // DXGI_ERROR_ACCESS_LOST e similares
-            Log.Info($"Captura DXGI interrompida (0x{hr.Code:X8}); será recriada");
+            // DXGI_ERROR_ACCESS_LOST (jogo em tela cheia, troca de modo), DXGI_ERROR_INVALID_CALL…
             _dup.Dispose();
             _dup = null;
-            _nextRetry = 0;
+            RegisterFailure($"interrompida (0x{hr.Code:X8})");
         }
         changed = TakeCleanChanged();
         return _hasFrame;
+    }
+
+    /// <summary>Agenda a próxima tentativa com espera crescente e, após várias falhas, recria o dispositivo.</summary>
+    private void RegisterFailure(string what)
+    {
+        _failures++;
+        int delay = Math.Min(3000, 100 << Math.Min(_failures, 5)); // 200, 400, 800, 1600, 3000 ms…
+        _nextRetry = Environment.TickCount64 + delay;
+        if (_failures == 1 || _failures % 20 == 0)
+            Log.Info($"Captura DXGI {what}; nova tentativa em {delay} ms (falha nº {_failures}). A última imagem continua sendo enviada.");
+        if (_failures % 6 == 0)
+        {
+            // Dispositivo possivelmente perdido (reinício do driver, troca de GPU): recomeça do zero.
+            ReleaseDevice();
+        }
+    }
+
+    private void ReleaseDevice()
+    {
+        _dup?.Dispose();
+        _dup = null;
+        _staging?.Dispose();
+        _staging = null;
+        _context?.Dispose();
+        _context = null;
+        _device?.Dispose();
+        _device = null;
+        _output?.Dispose();
+        _output = null;
+        _adapter?.Dispose();
+        _adapter = null;
     }
 
     private bool TakeCleanChanged()
@@ -367,15 +407,7 @@ internal sealed unsafe class DxgiCapturer : ScreenCapturer
         Buffer.MemoryCopy(_cleanPtr, (void*)Bits, bytes, bytes);
     }
 
-    protected override void DisposeCore()
-    {
-        _staging?.Dispose();
-        _dup?.Dispose();
-        _context?.Dispose();
-        _device?.Dispose();
-        _output?.Dispose();
-        _adapter?.Dispose();
-    }
+    protected override void DisposeCore() => ReleaseDevice();
 }
 
 internal static class Monitors

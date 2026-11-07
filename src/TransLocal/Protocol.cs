@@ -8,11 +8,18 @@ namespace TransLocal;
 internal static class Proto
 {
     public const string AppId = "TransLocal";
-    public const int Version = 1;
+
+    /// <summary>2 = conexões com TLS, autenticação mútua e pareamento (incompatível com a 1).</summary>
+    public const int Version = 2;
     public const int VideoPort = 52020;
     public const int DiscoveryPort = 52021;
     public const string DiscoverRequest = "TRANSLOCAL?1";
-    public const int MaxMessageBytes = 64 * 1024 * 1024;
+
+    /// <summary>Limite depois da autenticação (um quadro 1080p inteiro tem ~0,3–1 MB).</summary>
+    public const int MaxMessageBytes = 16 * 1024 * 1024;
+
+    /// <summary>Limite antes da autenticação: só mensagens pequenas do aperto de mão.</summary>
+    public const int HandshakeMaxBytes = 16 * 1024;
     public const int MaxFramesInFlight = 2;
 
     public static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
@@ -22,12 +29,33 @@ internal enum MsgType : byte
 {
     Hello = 0x01,
     Welcome = 0x02,
+
+    // Autenticação e pareamento (dentro do TLS, antes de qualquer outra mensagem)
+    AuthChallenge = 0x03,
+    AuthResponse = 0x04,
+    AuthResult = 0x05,
+    AuthDone = 0x06,
+    PairCommit = 0x07,
+    PairNonce = 0x08,
+    PairReveal = 0x09,
+    PairDecision = 0x0A,
+
+    // Acesso remoto (o aparelho pede a tela) e aprovação pelo celular
+    StreamRequest = 0x60,
+    StreamDecision = 0x61,
+    ApprovalRequest = 0x62,
+    ApprovalResponse = 0x63,
+    ApproverHello = 0x64,
+    ApproverStatus = 0x65,
+
     Frame = 0x10,
     FrameAck = 0x11,
     Audio = 0x20,
     Input = 0x30,
     Gamepad = 0x31,
     GamepadFeedback = 0x32,
+    CursorMode = 0x33,      // transmissor → receptor: [1 = cursor preso por um jogo (mouse relativo)]
+    Info = 0x34,            // receptor → transmissor: texto para o registro (ex.: controles conectados)
     Ping = 0x40,
     Pong = 0x41,
     Bye = 0x50,
@@ -82,6 +110,9 @@ internal sealed class DiscoveryReply
     public string Name { get; set; } = "";
     public int Port { get; set; }
     public bool Busy { get; set; }
+
+    /// <summary>Identificador curto da chave do aparelho (pública; mostra se já está pareado).</summary>
+    public string? Id { get; set; }
 }
 
 /// <summary>Mensagem recebida. O buffer vem do ArrayPool e deve ser devolvido com Dispose().</summary>
@@ -116,7 +147,7 @@ internal readonly struct NetMessage : IDisposable
 internal sealed class Connection : IDisposable
 {
     private readonly TcpClient _client;
-    private readonly NetworkStream _stream;
+    private readonly Stream _stream;
     private readonly object _writeLock = new();
     private readonly byte[] _header = new byte[5];
     private int _closed;
@@ -126,16 +157,40 @@ internal sealed class Connection : IDisposable
     public long BytesSent;
     public long BytesReceived;
 
-    public Connection(TcpClient client)
+    /// <summary>Maior mensagem aceita. Pequeno até a autenticação terminar.</summary>
+    public int MaxMessageBytes { get; set; } = Proto.HandshakeMaxBytes;
+
+    /// <param name="stream">Fluxo já protegido (TLS). null = o fluxo TCP do próprio cliente.</param>
+    public Connection(TcpClient client, Stream? stream = null)
     {
         _client = client;
-        _client.NoDelay = true;
-        _client.SendBufferSize = 2 * 1024 * 1024;
-        _client.ReceiveBufferSize = 2 * 1024 * 1024;
-        _client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-        _stream = client.GetStream();
+        PrepareSocket(client);
+        _stream = stream ?? client.GetStream();
         RemoteEndPoint = client.Client.RemoteEndPoint?.ToString() ?? "?";
         RemoteAddress = (client.Client.RemoteEndPoint as System.Net.IPEndPoint)?.Address;
+    }
+
+    public static void PrepareSocket(TcpClient client)
+    {
+        client.NoDelay = true;
+        client.SendBufferSize = 2 * 1024 * 1024;
+        client.ReceiveBufferSize = 2 * 1024 * 1024;
+        client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+    }
+
+    /// <summary>Recebe uma mensagem que precisa ser do tipo indicado.</summary>
+    public NetMessage Expect(MsgType type)
+    {
+        var m = Receive();
+        if (m.Type == type) return m;
+        m.Dispose();
+        throw new InvalidDataException($"Mensagem inesperada ({m.Type}; esperado {type}).");
+    }
+
+    public T ReceiveJson<T>(MsgType type)
+    {
+        using var m = Expect(type);
+        return m.ReadJson<T>();
     }
 
     public bool IsClosed => Volatile.Read(ref _closed) != 0;
@@ -190,8 +245,8 @@ internal sealed class Connection : IDisposable
         _stream.ReadExactly(_header, 0, 5);
         var type = (MsgType)_header[0];
         int len = BinaryPrimitives.ReadInt32LittleEndian(_header.AsSpan(1));
-        if (len < 0 || len > Proto.MaxMessageBytes)
-            throw new InvalidDataException($"Mensagem inválida ({len} bytes)");
+        if (len < 0 || len > MaxMessageBytes)
+            throw new InvalidDataException($"Mensagem inválida ({len} bytes; limite {MaxMessageBytes})");
         if (len == 0)
             return new NetMessage(type, Array.Empty<byte>(), 0);
         var buf = ArrayPool<byte>.Shared.Rent(len);

@@ -54,6 +54,19 @@ foreach ($rid in $rids) {
     Get-ChildItem $out -Filter *.pdb -ErrorAction SilentlyContinue | Remove-Item -Force
 }
 
+# App Android (aprovador): só se o componente Android do .NET estiver instalado.
+$androidProj = Join-Path $root 'android\TransLocal.Android\TransLocal.Android.csproj'
+$workloads = & $dotnet workload list 2>$null
+if ((Test-Path $androidProj) -and ($workloads -match '^\s*android\s')) {
+    Write-Host "==> Gerando o app Android" -ForegroundColor Cyan
+    & $dotnet publish $androidProj -c Release -f net10.0-android -p:ApplicationDisplayVersion=$Version --nologo -v q
+    if ($LASTEXITCODE -ne 0) { throw "Falha ao gerar o app Android" }
+    $apk = Get-ChildItem (Join-Path $root 'android\TransLocal.Android\bin\Release\net10.0-android\publish') -Filter '*-Signed.apk' | Select-Object -First 1
+    Copy-Item $apk.FullName (Join-Path $root 'dist\TransLocal-Android.apk') -Force
+} else {
+    Write-Warning "Componente Android do .NET não instalado; app de celular não gerado (dotnet workload install android)."
+}
+
 if (-not $SkipInstaller) {
     $iscc = Find-First @(
         "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
@@ -69,6 +82,6 @@ if (-not $SkipInstaller) {
 }
 
 Write-Host "`nPronto:" -ForegroundColor Green
-Get-ChildItem (Join-Path $root 'dist') -Recurse -Include *.exe | ForEach-Object {
+Get-ChildItem (Join-Path $root 'dist') -Recurse -Include *.exe, *.apk | ForEach-Object {
     "  {0}  ({1:N1} MB)" -f $_.FullName, ($_.Length / 1MB)
 }

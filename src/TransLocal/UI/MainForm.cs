@@ -16,7 +16,7 @@ internal sealed class ComboItem<T>
     public override string ToString() => Text;
 }
 
-internal sealed class MainForm : Form
+internal sealed partial class MainForm : Form
 {
     private static readonly Color Accent = Color.FromArgb(0, 103, 192);
     private static readonly Color Muted = Color.FromArgb(96, 96, 96);
@@ -97,12 +97,13 @@ internal sealed class MainForm : Form
         var header = BuildHeader();
         _tabs.Dock = DockStyle.Fill;
         _tabs.Padding = new Point(12, 6);
-        _tabs.TabPages.AddRange(new[] { _tabReceive, _tabSend, _tabHdmi, _tabSettings });
+        _tabs.TabPages.AddRange(new[] { _tabReceive, _tabSend, _tabRemote, _tabHdmi, _tabSettings });
         _tabs.SelectedIndexChanged += (_, _) => OnTabChanged();
 
         BuildReceiveTab();
         BuildSendTab();
         BuildHdmiTab();
+        BuildRemoteTab();
         BuildSettingsTab();
 
         Controls.Add(_tabs);
@@ -129,6 +130,7 @@ internal sealed class MainForm : Form
             "send" => _tabSend,
             "hdmi" => _tabHdmi,
             "settings" => _tabSettings,
+            "remote" => _tabRemote,
             _ => _tabReceive,
         };
     }
@@ -575,6 +577,7 @@ internal sealed class MainForm : Form
         _txtName.Margin = new Padding(0, 3, 12, 3);
         _txtName.Leave += (_, _) => SaveSetting(s => s.DeviceName = _txtName.Text);
         Add(t, Row(Caption("Nome exibido nos outros computadores:"), _txtName));
+        BuildPairedDevicesSection(t);
 
         SetupCheck(_chkAutostart, "Iniciar com o Windows (o TransLocal fica na área de notificação, pronto para receber)");
         _chkAutostart.CheckedChanged += (_, _) =>
@@ -777,6 +780,7 @@ internal sealed class MainForm : Form
         {
             LoadHdmiDevices();
         }
+        if (_tabs.SelectedTab == _tabRemote) RefreshTailscale();
         if (_tabs.SelectedTab == _tabReceive)
         {
             RefreshAddresses();
@@ -804,7 +808,9 @@ internal sealed class MainForm : Form
             _lvReceivers.Items.Clear();
             foreach (var r in found)
             {
-                string name = r.Name + (r.IsThisComputer ? " (este computador)" : "") + (r.Busy ? " — ocupado" : "");
+                bool paired = r.Id is not null && _app.Trust.All().Any(d => d.ShortId == r.Id);
+                string name = r.Name + (r.IsThisComputer ? " (este computador)" : "") + (paired ? " ✔ pareado" : "") +
+                              (r.ProtocolVersion < Proto.Version ? " — versão antiga, atualize" : "") + (r.Busy ? " — ocupado" : "");
                 var item = new ListViewItem(new[] { name, r.Endpoint, r.Via }) { Tag = r };
                 if (r.IsThisComputer || r.Busy) item.ForeColor = Muted;
                 _lvReceivers.Items.Add(item);
@@ -953,6 +959,7 @@ internal sealed class MainForm : Form
     {
         if (IsDisposed) return;
         _updateStatus.Text = _app.UpdateStatus;
+        RefreshRemoteState();
 
         // Receber
         if (_app.ReceiverError is { } err)

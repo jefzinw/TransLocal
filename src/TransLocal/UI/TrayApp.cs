@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using TransLocal.Input;
+using TransLocal.Security;
 using TransLocal.Streaming;
 using TransLocal.Video;
 
@@ -28,7 +29,8 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem _miReceive;
 
     private MainForm? _main;
-    private ReceiverServer? _receiver;
+    private readonly ReceiverServer _receiver;
+    private Totp? _totp;
     private ReceiverSession? _viewSession;
     private ViewerForm? _viewViewer;
     private GamepadForwarder? _gamepadForwarder;
@@ -41,7 +43,10 @@ internal sealed class TrayApp : ApplicationContext
 
     public AppSettings Settings { get; }
     public bool IsExiting { get; private set; }
-    public bool IsReceiving => _receiver?.IsRunning == true;
+    public bool IsReceiving => _receiver.IsRunning && Settings.ReceiverEnabled;
+    public DeviceIdentity Identity { get; }
+    public SettingsTrustStore Trust { get; }
+    public ApprovalHub Approvals { get; }
     public string? ReceiverError { get; private set; }
     public string? ViewingFrom => _viewSession?.SenderName;
     public bool IsSending => _sender?.IsRunning == true;
@@ -66,6 +71,23 @@ internal sealed class TrayApp : ApplicationContext
 
         _ui = new Control();
         _ = _ui.Handle; // cria a janela usada para despachar eventos para a thread da interface
+
+        // Identidade criptográfica e aparelhos pareados (base de todas as conexões).
+        try
+        {
+            Identity = DeviceIdentity.LoadOrCreate();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Não foi possível carregar a identidade deste aparelho; usando uma temporária (os pareamentos não valerão depois de reiniciar)", ex);
+            Identity = DeviceIdentity.CreateEphemeral();
+        }
+        Trust = new SettingsTrustStore(Settings);
+        Approvals = new ApprovalHub { StatusProvider = ApproverStatus };
+        Approvals.ApproversChanged += () => Ui(Changed);
+        Trust.Changed += () => Ui(Changed);
+        _receiver = CreateServer();
+        Log.Info($"Identidade deste aparelho: {Identity.ShortId}");
 
         var menu = new ContextMenuStrip();
         var miOpen = new ToolStripMenuItem("Abrir TransLocal", null, (_, _) => ShowMain()) { Font = new Font(SystemFonts.MenuFont ?? Control.DefaultFont, FontStyle.Bold) };
@@ -107,10 +129,10 @@ internal sealed class TrayApp : ApplicationContext
         SystemIntegration.RefreshAutoStartPath();
         SystemIntegration.RestoreGameBarPromptIfGameBarInstalled();
 
-        // Controles de jogo (SDL): mapeamentos salvos e inicialização em segundo plano.
+        // Controles de jogo (SDL): iniciada só quando necessária (exibição com controle ou aba Receber),
+        // para não abrir no PC que transmite os controles virtuais que ele mesmo cria.
         ControllerService.InitialMappings = () => Settings.ControllerMappings.ToArray();
-        _ = Task.Run(() => _ = ControllerService.Instance);
-        if (Settings.ReceiverEnabled) StartReceiver();
+        UpdateListening();
         if (firstRun) Settings.Save();
 
         if (!startMinimized) ShowMain();
@@ -282,52 +304,226 @@ internal sealed class TrayApp : ApplicationContext
         _tray.Text = IsSending ? "TransLocal — transmitindo" : ViewingFrom is not null ? "TransLocal — exibindo" : "TransLocal";
     }
 
-    // ================= Receptor =================
+    // ================= Segurança =================
+
+    /// <summary>Opções do canal seguro (identidade, pareados, confirmação de pareamento na tela).</summary>
+    public SecureChannelOptions Channel() => new()
+    {
+        Identity = Identity,
+        Trust = Trust,
+        LocalName = Settings.DeviceName,
+        ConfirmPairing = p => ConfirmationForm.Ask(_ui, () => ConfirmationForm.ForPairing(p)),
+    };
+
+    /// <summary>Código de autorização do acesso remoto (segredo criado na primeira vez, guardado com DPAPI).</summary>
+    public Totp RemoteTotp
+    {
+        get
+        {
+            if (_totp is not null) return _totp;
+            var secret = LocalSecret.Unprotect(Settings.TotpSecretProtected);
+            if (secret is null)
+            {
+                secret = Totp.NewSecret();
+                Settings.TotpSecretProtected = LocalSecret.Protect(secret);
+                Settings.Save();
+            }
+            return _totp = new Totp(secret);
+        }
+    }
+
+    /// <summary>Gera um novo segredo (invalida autenticadores cadastrados antes).</summary>
+    public void ResetRemoteTotp()
+    {
+        var secret = Totp.NewSecret();
+        Settings.TotpSecretProtected = LocalSecret.Protect(secret);
+        Settings.Save();
+        _totp = new Totp(secret);
+        Approvals.BroadcastStatus();
+        Log.Info("Novo segredo do código de autorização gerado");
+    }
+
+    private ApproverStatusMessage ApproverStatus() => new()
+    {
+        PcName = Settings.DeviceName,
+        PcId = Identity.ShortId,
+        RemoteAccessEnabled = Settings.RemoteAccessEnabled,
+        Streaming = IsSending,
+        StreamingTo = _sender?.ReceiverName,
+        TotpSecret = RemoteTotp.Base32Secret,
+    };
+
+    // ================= Receptor / conexões recebidas =================
 
     public void SetReceiverEnabled(bool enabled)
     {
         Settings.ReceiverEnabled = enabled;
         Settings.Save();
-        if (enabled) StartReceiver(); else StopReceiver();
+        UpdateListening();
         Changed();
     }
 
-    private void StartReceiver()
+    public void SetRemoteAccessEnabled(bool enabled)
     {
-        if (_receiver is not null) return;
-        var server = new ReceiverServer(() => Settings.DeviceName, () => Settings.ReceiverPlayAudio, () =>
+        Settings.RemoteAccessEnabled = enabled;
+        Settings.Save();
+        Log.Info($"Acesso remoto {(enabled ? "ligado" : "desligado")}");
+        UpdateListening();
+        Approvals.BroadcastStatus();
+        Changed();
+    }
+
+    private ReceiverServer CreateServer()
+    {
+        var server = new ReceiverServer(Channel, () => Settings.ReceiverPlayAudio, () =>
         {
             // A imagem chega no tamanho da tela onde será exibida (o transmissor reduz se for maior).
             var screen = Monitors.Resolve(Settings.ViewerMonitor).Bounds;
             return new ReceiverPrefs(screen.Width, screen.Height, Settings.ReceiverLight);
-        });
+        }, acceptStreams: () => Settings.ReceiverEnabled);
         server.SessionStarted += s => Ui(() => OnViewStarted(s));
         server.SessionEnded += (s, reason) => Ui(() => OnViewEnded(s, reason));
-        try
+        server.PeerAuthenticated += (peer, ip) => Trust.Touch(peer.Fingerprint, peer.Name, ip?.ToString());
+        server.PullHandler = OnPullRequested;
+        server.ApproverHandler = (conn, peer) => Approvals.Serve(conn, peer);
+        return server;
+    }
+
+    /// <summary>Escuta conexões se for aceitar transmissões ou acesso remoto.</summary>
+    private void UpdateListening()
+    {
+        bool want = Settings.ReceiverEnabled || Settings.RemoteAccessEnabled;
+        if (want && !_receiver.IsRunning)
         {
-            server.Start();
-            _receiver = server;
+            try
+            {
+                _receiver.Start();
+                ReceiverError = null;
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
+            {
+                ReceiverError = $"A porta {Proto.VideoPort} já está em uso por outro programa.";
+                Log.Error(ReceiverError, ex);
+                _receiver.Stop();
+            }
+            catch (Exception ex)
+            {
+                ReceiverError = "Não foi possível começar a receber: " + ex.Message;
+                Log.Error(ReceiverError, ex);
+                _receiver.Stop();
+            }
+        }
+        else if (!want && _receiver.IsRunning)
+        {
+            _receiver.Stop();
             ReceiverError = null;
-        }
-        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
-        {
-            ReceiverError = $"A porta {Proto.VideoPort} já está em uso por outro programa.";
-            Log.Error(ReceiverError, ex);
-            server.Dispose();
-        }
-        catch (Exception ex)
-        {
-            ReceiverError = "Não foi possível começar a receber: " + ex.Message;
-            Log.Error(ReceiverError, ex);
-            server.Dispose();
         }
     }
 
     private void StopReceiver()
     {
-        _receiver?.Dispose();
-        _receiver = null;
+        _receiver.Stop();
         ReceiverError = null;
+    }
+
+    /// <summary>
+    /// Um aparelho pareado pede a tela deste computador (acesso remoto). Roda na thread da conexão.
+    /// Retorna true se a conexão passou a ser usada pela transmissão.
+    /// </summary>
+    private bool OnPullRequested(Connection conn, PeerInfo peer)
+    {
+        void Reject(string reason)
+        {
+            Log.Info($"Acesso remoto de {peer.Name} recusado: {reason}");
+            try { conn.SendJson(MsgType.StreamDecision, new StreamDecisionMessage { Approved = false, Reason = reason }); } catch { }
+        }
+
+        if (!Settings.RemoteAccessEnabled)
+        {
+            Reject($"O acesso remoto está desligado em {Settings.DeviceName}.");
+            return false;
+        }
+        StreamRequestMessage req;
+        try
+        {
+            conn.ReceiveTimeoutMs = 15_000;
+            req = conn.ReceiveJson<StreamRequestMessage>(MsgType.StreamRequest);
+        }
+        catch
+        {
+            return false;
+        }
+        if (IsSending || IsConnecting)
+        {
+            Reject($"{Settings.DeviceName} já está transmitindo para outro aparelho.");
+            return false;
+        }
+
+        bool approved;
+        string by;
+        if (!string.IsNullOrWhiteSpace(req.Code))
+        {
+            approved = RemoteTotp.Verify(req.Code, out var error);
+            by = "código de autorização";
+            if (!approved)
+            {
+                Reject(error ?? "Código inválido.");
+                return false;
+            }
+        }
+        else
+        {
+            Ui(() => Balloon("Pedido de acesso", $"{peer.Name} quer acessar esta tela. Aprove aqui ou pelo celular."));
+            (approved, by) = Approvals.Request(peer, TimeSpan.FromSeconds(60),
+                ct => ConfirmationForm.Ask(_ui, () => ConfirmationForm.ForAccess(peer.Name, peer.ShortId), ct));
+            if (!approved)
+            {
+                Reject(by == "tempo esgotado"
+                    ? "Ninguém autorizou a tempo. Aprove pelo celular ou digite o código de autorização."
+                    : $"Acesso negado ({by}).");
+                return false;
+            }
+        }
+
+        try
+        {
+            conn.SendJson(MsgType.StreamDecision, new StreamDecisionMessage { Approved = true, ApprovedBy = by });
+            Log.Info($"Acesso remoto de {peer.Name} autorizado ({by}); iniciando transmissão");
+            var session = SenderSession.StartOnConnection(conn, BuildSenderOptions());
+            Ui(() =>
+            {
+                RegisterSender(session);
+                Balloon($"Acesso remoto: transmitindo para {peer.Name}", $"Autorizado por {by}. Ctrl+Alt+Shift+T encerra.");
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Falha ao iniciar o acesso remoto de {peer.Name}", ex);
+        }
+        return true; // a conexão pertence à transmissão (ou já foi fechada por ela)
+    }
+
+    /// <summary>Pede a tela de um computador pareado (acesso remoto) e a exibe aqui.</summary>
+    public async Task RequestRemoteScreenAsync(string address, string? code, Action<string> status)
+    {
+        if (_viewSession is not null) throw new InvalidOperationException("Já há uma tela sendo exibida aqui.");
+        string host = address.Trim();
+        int port = Proto.VideoPort;
+        int colon = host.LastIndexOf(':');
+        if (colon > 0 && host.IndexOf(':') == colon && int.TryParse(host[(colon + 1)..], out var p))
+        {
+            port = p;
+            host = host[..colon];
+        }
+        status($"Conectando a {host}…");
+        var (conn, peer) = await RemotePull.RequestAsync(host, port, Channel(), code, s => Ui(() => status(s)), CancellationToken.None);
+        Trust.Touch(peer.Fingerprint, peer.Name, port == Proto.VideoPort ? host : $"{host}:{port}");
+        status($"Autorizado. Recebendo a tela de {peer.Name}…");
+        _ = Task.Run(() =>
+        {
+            try { _receiver.ServeIncomingStream(conn, peer, requestedByUs: true); }
+            finally { conn.Dispose(); }
+        });
     }
 
     private void OnViewStarted(ReceiverSession s)
@@ -345,6 +541,7 @@ internal sealed class TrayApp : ApplicationContext
         viewer.UserClosed += () => s.Close();
         s.FrameReady += viewer.NotifyFrame;
         s.StatsUpdated += viewer.SetStats;
+        s.CursorModeChanged += viewer.SetRemoteCursorCaptured;
         _viewViewer = viewer;
         s.Surface.FastScaling = s.Light;
         if (s.ControlAllowed) StartGamepads(s, viewer);
@@ -366,6 +563,7 @@ internal sealed class TrayApp : ApplicationContext
         s.GamepadFeedback += forwarder.Rumble;
         _gamepadForwarder = forwarder;
         _gamepadWarned = false;
+        string? lastNames = null;
         _gamepadTimer = new System.Windows.Forms.Timer { Interval = 1000 };
         _gamepadTimer.Tick += (_, _) =>
         {
@@ -379,6 +577,14 @@ internal sealed class TrayApp : ApplicationContext
                 _ => null,
             };
             viewer.SetGamepadInfo(info);
+
+            // Registra no outro computador quais controles estão aqui (ajuda a diagnosticar).
+            string names = string.Join("; ", forwarder.Names);
+            if (names != lastNames)
+            {
+                lastNames = names;
+                s.SendInfo(names.Length == 0 ? "Controles no computador que exibe: nenhum" : "Controles no computador que exibe: " + names);
+            }
             if (n > 0 && status != VirtualGamepads.StatusOk && !_gamepadWarned)
             {
                 _gamepadWarned = true;
@@ -435,31 +641,8 @@ internal sealed class TrayApp : ApplicationContext
         Changed();
         try
         {
-            var opt = new SenderOptions
-            {
-                Name = Settings.DeviceName,
-                MonitorDeviceName = Settings.SenderMonitor,
-                Fps = Settings.SenderFps,
-                Quality = Settings.SenderQuality,
-                Audio = Settings.SenderAudio,
-                AllowControl = Settings.SenderAllowControl,
-                Resolution = Settings.SenderResolution,
-            };
-            var session = await SenderSession.ConnectAsync(host, port, opt, CancellationToken.None);
-            session.StatsUpdated += text => Ui(() =>
-            {
-                SenderStats = text;
-                Changed();
-            });
-            session.Ended += (ss, reason) => Ui(() =>
-            {
-                if (_sender == ss) _sender = null;
-                SenderStats = null;
-                LastSendEnd = reason is null ? "Transmissão parada." : reason;
-                if (reason is not null && !IsExiting) Balloon("Transmissão encerrada", reason, ToolTipIcon.Warning);
-                Changed();
-            });
-            _sender = session;
+            var session = await SenderSession.ConnectAsync(host, port, BuildSenderOptions(), Channel(), CancellationToken.None);
+            RegisterSender(session);
             Settings.LastReceiverAddress = port == Proto.VideoPort ? host : $"{host}:{port}";
             Settings.LastReceiverName = session.ReceiverName;
             Settings.Save();
@@ -470,6 +653,39 @@ internal sealed class TrayApp : ApplicationContext
             IsConnecting = false;
             Changed();
         }
+    }
+
+    private SenderOptions BuildSenderOptions() => new()
+    {
+        Name = Settings.DeviceName,
+        MonitorDeviceName = Settings.SenderMonitor,
+        Fps = Settings.SenderFps,
+        Quality = Settings.SenderQuality,
+        Audio = Settings.SenderAudio,
+        AllowControl = Settings.SenderAllowControl,
+        Resolution = Settings.SenderResolution,
+    };
+
+    /// <summary>Passa a acompanhar uma transmissão iniciada (normal ou por acesso remoto). Thread da interface.</summary>
+    private void RegisterSender(SenderSession session)
+    {
+        session.StatsUpdated += text => Ui(() =>
+        {
+            SenderStats = text;
+            Changed();
+        });
+        session.Ended += (ss, reason) => Ui(() =>
+        {
+            if (_sender == ss) _sender = null;
+            SenderStats = null;
+            LastSendEnd = reason is null ? "Transmissão parada." : reason;
+            if (reason is not null && !IsExiting) Balloon("Transmissão encerrada", reason, ToolTipIcon.Warning);
+            Approvals.BroadcastStatus();
+            Changed();
+        });
+        _sender = session;
+        Approvals.BroadcastStatus();
+        Changed();
     }
 
     public void StopSending()

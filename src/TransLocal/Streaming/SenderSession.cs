@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using TransLocal.Audio;
 using TransLocal.Input;
+using TransLocal.Security;
 using TransLocal.Video;
 
 namespace TransLocal.Streaming;
@@ -67,6 +68,7 @@ internal sealed class SenderSession : IDisposable
     private readonly VirtualGamepads? _gamepads;
     private readonly StreamLimits _limits;
     private Size _sendSize;
+    private bool _cursorCaptured;
     private readonly SemaphoreSlim _inflight = new(Proto.MaxFramesInFlight, Proto.MaxFramesInFlight);
     private readonly CancellationTokenSource _cts = new();
     private System.Threading.Timer? _pingTimer;
@@ -118,7 +120,8 @@ internal sealed class SenderSession : IDisposable
         }
     }
 
-    public static async Task<SenderSession> ConnectAsync(string host, int port, SenderOptions opt, CancellationToken ct)
+    /// <summary>Conecta (canal seguro, pareando se preciso) e começa a transmitir para o receptor.</summary>
+    public static async Task<SenderSession> ConnectAsync(string host, int port, SenderOptions opt, SecureChannelOptions channel, CancellationToken ct)
     {
         var address = await ResolveAsync(host, ct);
         var client = new TcpClient(AddressFamily.InterNetwork);
@@ -139,10 +142,30 @@ internal sealed class SenderSession : IDisposable
             throw new IOException($"Não foi possível conectar a {address}:{port} ({ex.SocketErrorCode}). Confira se o outro computador está com “Aceitar transmissões” ligado e liberado no firewall.", ex);
         }
 
-        var conn = new Connection(client);
+        return await Task.Run(() =>
+        {
+            var (conn, peer) = SecureChannel.Connect(client, ChannelPurpose.Stream, channel);
+            try
+            {
+                return Handshake(conn, opt);
+            }
+            catch
+            {
+                conn.Dispose();
+                throw;
+            }
+        }, ct);
+    }
+
+    /// <summary>
+    /// Começa a transmitir numa conexão já autenticada (acesso remoto: o outro aparelho pediu a tela).
+    /// Bloqueante. Em caso de erro, a conexão é fechada.
+    /// </summary>
+    public static SenderSession StartOnConnection(Connection conn, SenderOptions opt)
+    {
         try
         {
-            return await Task.Run(() => Handshake(conn, opt), ct);
+            return Handshake(conn, opt);
         }
         catch
         {
@@ -250,6 +273,7 @@ internal sealed class SenderSession : IDisposable
             long interval = Stopwatch.Frequency / Math.Clamp(_limits.Fps, 1, 120);
             long next = Stopwatch.GetTimestamp();
             long lastBoundsCheck = Stopwatch.GetTimestamp();
+            long lastCursorCheck = 0;
             var screen = _screen;
 
             while (!ct.IsCancellationRequested)
@@ -280,6 +304,19 @@ internal sealed class SenderSession : IDisposable
                     _injector?.SetMonitor(capturer.Bounds);
                     Log.Info($"Captura {capturer.Method} de {screen.DeviceName} {capturer.Width}×{capturer.Height}" +
                              (scaler is null ? "" : $", enviada em {size.Width}×{size.Height}"));
+                }
+
+                // Jogo prendeu/escondeu o cursor? O receptor passa a enviar movimento relativo do mouse.
+                if (_opt.AllowControl && now - lastCursorCheck > Stopwatch.Frequency / 10)
+                {
+                    lastCursorCheck = now;
+                    bool captured = CursorCapture.IsCaptured(capturer.Bounds);
+                    if (captured != _cursorCaptured)
+                    {
+                        _cursorCaptured = captured;
+                        Log.Info(captured ? "Cursor preso por um jogo: mouse relativo" : "Cursor livre: mouse absoluto");
+                        _conn.Send(MsgType.CursorMode, new[] { (byte)(captured ? 1 : 0) });
+                    }
                 }
 
                 if (!_inflight.Wait(500, ct)) continue;
@@ -354,6 +391,9 @@ internal sealed class SenderSession : IDisposable
                         break;
                     case MsgType.Input:
                         if (_opt.AllowControl) _injector?.Apply(m.Span);
+                        break;
+                    case MsgType.Info when m.Length > 0:
+                        Log.Info($"[{ReceiverName}] {System.Text.Encoding.UTF8.GetString(m.Span[..Math.Min(m.Length, 2000)])}");
                         break;
                     case MsgType.Gamepad:
                         if (_gamepads is not null && GamepadCodec.TryDecode(m.Span, out var pad))

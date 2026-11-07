@@ -115,6 +115,30 @@ internal static class Native
 
     public const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     public const uint KEYEVENTF_KEYUP = 0x0002;
+    public const uint KEYEVENTF_SCANCODE = 0x0008;
+
+    // ---------- Cursor preso / Raw Input (mouse relativo em jogos) ----------
+    public const int WM_INPUT = 0x00FF;
+    public const uint RID_INPUT = 0x10000003;
+    public const uint RIDEV_REMOVE = 0x00000001;
+    public const uint RIM_TYPEMOUSE = 0;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RAWINPUTDEVICE
+    {
+        public ushort usUsagePage;
+        public ushort usUsage;
+        public uint dwFlags;
+        public IntPtr hwndTarget;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool RegisterRawInputDevices([In] RAWINPUTDEVICE[] pRawInputDevices, uint uiNumDevices, uint cbSize);
+    [DllImport("user32.dll")]
+    public static extern uint GetRawInputData(IntPtr hRawInput, uint uiCommand, byte[]? pData, ref uint pcbSize, uint cbSizeHeader);
+    [DllImport("user32.dll")] public static extern bool ClipCursor(ref RECT lpRect);
+    [DllImport("user32.dll", EntryPoint = "ClipCursor")] public static extern bool ClipCursorNone(IntPtr lpRect);
+    [DllImport("user32.dll")] public static extern bool GetClipCursor(out RECT lpRect);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct MOUSEINPUT

@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -18,7 +18,7 @@
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     <TieredPGO>true</TieredPGO>
 
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
     <Product>TransLocal</Product>
     <Description>Transmite a tela de um computador para outro por cabo (rede USB4/Thunderbolt, cabo bridge USB, Ethernet) ou exibe uma placa de captura HDMI.</Description>
     <Copyright>TransLocal</Copyright>
@@ -44,6 +44,7 @@
     <PackageReference Include="NAudio" Version="3.3.0" />
     <PackageReference Include="Nefarius.ViGEm.Client" Version="1.21.256" />
     <PackageReference Include="ppy.SDL3-CS" Version="2026.1002.1" />
+    <PackageReference Include="QRCoder" Version="1.8.1" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
   </ItemGroup>
 

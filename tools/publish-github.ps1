@@ -99,14 +99,17 @@ Veja o README para instruções e solução de problemas.
     $notesFile = Join-Path ([IO.Path]::GetTempPath()) "translocal-notes-$Version.md"
     [IO.File]::WriteAllText($notesFile, $notes, (New-Object Text.UTF8Encoding($false)))
 
+    $assets = @("$setup#Instalador para Windows (x64)", "$exe#Executável único, sem instalar (Windows x64)")
+    $apk = Join-Path $root 'dist\TransLocal-Android.apk'
+    if (Test-Path $apk) { $assets += "$apk#App para celular Android (aprova acessos)" }
+
     & $gh release view "v$Version" --repo $full 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) {
         Write-Host "==> Release v$Version já existe; atualizando os arquivos" -ForegroundColor Cyan
-        & $gh release upload "v$Version" $setup $exe --repo $full --clobber
+        & $gh release upload "v$Version" @($assets | ForEach-Object { $_.Split('#')[0] }) --repo $full --clobber
     } else {
         Write-Host "==> Criando a Release v$Version" -ForegroundColor Cyan
-        & $gh release create "v$Version" "$setup#Instalador para Windows (x64)" "$exe#Executável único, sem instalar (Windows x64)" `
-            --repo $full --title "TransLocal $Version" --notes-file $notesFile --target main
+        & $gh release create "v$Version" @assets --repo $full --title "TransLocal $Version" --notes-file $notesFile --target main
     }
     if ($LASTEXITCODE -ne 0) { Fail "Falha ao publicar a Release." }
     Remove-Item $notesFile -ErrorAction SilentlyContinue

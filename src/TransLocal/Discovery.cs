@@ -9,7 +9,7 @@ namespace TransLocal;
 
 internal sealed record LocalAddress(IPAddress Address, IPAddress Mask, string InterfaceName, string Kind, bool IsCable);
 
-internal sealed record ReceiverInfo(string Name, IPAddress Address, int Port, string Via, bool IsCable, bool IsThisComputer, bool Busy)
+internal sealed record ReceiverInfo(string Name, IPAddress Address, int Port, string Via, bool IsCable, bool IsThisComputer, bool Busy, string? Id = null, int ProtocolVersion = 1)
 {
     public string Endpoint => $"{Address}:{Port}";
 }
@@ -46,6 +46,10 @@ internal static class NetInfo
     private static (string kind, bool cable) Classify(NetworkInterface ni)
     {
         var d = (ni.Description + " " + ni.Name).ToLowerInvariant();
+        if (d.Contains("tailscale"))
+            return ("Tailscale (acesso de fora de casa)", false);
+        if (d.Contains("zerotier"))
+            return ("ZeroTier (acesso de fora de casa)", false);
         if (d.Contains("usb4") || d.Contains("p2p network") || d.Contains("thunderbolt"))
             return ("cabo USB4/Thunderbolt", true);
         if (d.Contains("rndis") || d.Contains("prolific") || d.Contains("pl27a1") || d.Contains("bridge") && d.Contains("usb") || d.Contains("usb link") || d.Contains("easy transfer"))
@@ -85,15 +89,17 @@ internal sealed class DiscoveryResponder : IDisposable
     private readonly int _videoPort;
     private readonly Func<string> _name;
     private readonly Func<bool> _busy;
+    private readonly string _id;
     private UdpClient? _udp;
     private CancellationTokenSource? _cts;
 
-    public DiscoveryResponder(int port, int videoPort, Func<string> name, Func<bool> busy)
+    public DiscoveryResponder(int port, int videoPort, Func<string> name, Func<bool> busy, string id)
     {
         _port = port;
         _videoPort = videoPort;
         _name = name;
         _busy = busy;
+        _id = id;
     }
 
     public void Start()
@@ -123,7 +129,7 @@ internal sealed class DiscoveryResponder : IDisposable
             try
             {
                 if (Encoding.ASCII.GetString(r.Buffer) != Proto.DiscoverRequest) continue;
-                var reply = new DiscoveryReply { Name = _name(), Port = _videoPort, Busy = _busy() };
+                var reply = new DiscoveryReply { Name = _name(), Port = _videoPort, Busy = _busy(), Id = _id };
                 var bytes = JsonSerializer.SerializeToUtf8Bytes(reply, Proto.Json);
                 await udp.SendAsync(bytes, r.RemoteEndPoint, ct);
             }
@@ -201,7 +207,7 @@ internal static class DiscoveryScanner
                         if (reply is null || reply.App != Proto.AppId) continue;
                         var ip = r.RemoteEndPoint.Address;
                         bool self = localSet.Contains(ip);
-                        found[$"{ip}:{reply.Port}"] = new ReceiverInfo(reply.Name, ip, reply.Port, kind, cable, self, reply.Busy);
+                        found[$"{ip}:{reply.Port}"] = new ReceiverInfo(reply.Name, ip, reply.Port, kind, cable, self, reply.Busy, reply.Id, reply.ProtocolVersion);
                     }
                     catch (OperationCanceledException) { break; }
                     catch (SocketException) { }

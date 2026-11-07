@@ -124,7 +124,19 @@ internal static class DevTools
         return 0;
     }
 
-    /// <summary>Transmissão completa pela interface de loopback: descoberta, vídeo, recusa por ocupado e encerramento.</summary>
+    /// <summary>Lista de pareados só em memória (os testes não mexem nas configurações reais).</summary>
+    private sealed class MemoryTrust : Security.ITrustStore
+    {
+        private readonly HashSet<string> _set = new();
+        public bool IsTrusted(string fingerprint) { lock (_set) return _set.Contains(fingerprint); }
+        public void Trust(string name, string fingerprint, string kind) { lock (_set) _set.Add(fingerprint); }
+        public int Count { get { lock (_set) return _set.Count; } }
+    }
+
+    /// <summary>
+    /// Teste completo pela interface local: segurança (TLS, pareamento, recusa de não pareados, código de
+    /// autorização, aprovação pelo celular, bloqueio após falhas), vídeo, modo leve e encerramentos.
+    /// </summary>
     public static int SelfTest(string outDir) => SelfTestAsync(outDir).GetAwaiter().GetResult();
 
     private static async Task<int> SelfTestAsync(string outDir)
@@ -138,45 +150,82 @@ internal static class DevTools
             if (!ok) failures++;
         }
 
+        // Aparelhos do teste: “PC” (chave persistida do Windows, como no app), “Notebook”, “Celular” e “Invasor”.
+        using var pcId = Security.DeviceIdentity.LoadOrCreate();
+        using var nbId = Security.DeviceIdentity.CreateEphemeral();
+        using var phoneId = Security.DeviceIdentity.CreateEphemeral();
+        using var evilId = Security.DeviceIdentity.CreateEphemeral();
+        var pcTrust = new MemoryTrust();
+        var nbTrust = new MemoryTrust();
+        var phoneTrust = new MemoryTrust();
+        string? pcCode = null, nbCode = null;
+        bool pcAcceptsPairing = true;
+        Security.SecureChannelOptions PcChannel() => new()
+        {
+            Identity = pcId, Trust = pcTrust, LocalName = "PC-Teste",
+            ConfirmPairing = p => { pcCode = p.Code; return pcAcceptsPairing; },
+        };
+        Security.SecureChannelOptions NbChannel(bool allowPairing = true) => new()
+        {
+            Identity = nbId, Trust = nbTrust, LocalName = "Notebook-Teste",
+            ConfirmPairing = allowPairing ? p => { nbCode = p.Code; return true; } : null,
+        };
+
         var prefs = new ReceiverPrefs(0, 0, false);
-        using var server = new ReceiverServer(() => "Receptor-Teste", () => false, () => prefs, port, discoveryPort);
+        var totp = new Security.Totp(Security.Totp.NewSecret());
+        var hub = new ApprovalHub { StatusProvider = () => new ApproverStatusMessage { PcName = "PC-Teste", RemoteAccessEnabled = true, TotpSecret = totp.Base32Secret } };
+        using var server = new ReceiverServer(PcChannel, () => false, () => prefs, port: port, discoveryPort: discoveryPort);
         var started = new TaskCompletionSource<ReceiverSession>(TaskCreationOptions.RunContinuationsAsynchronously);
         var ended = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         server.SessionStarted += s => started.TrySetResult(s);
         server.SessionEnded += (_, reason) => ended.TrySetResult(reason);
+        SenderSession? pulledSender = null;
+        server.ApproverHandler = (conn, peer) => hub.Serve(conn, peer);
+        server.PullHandler = (conn, peer) =>
+        {
+            var req = conn.ReceiveJson<StreamRequestMessage>(MsgType.StreamRequest);
+            bool ok;
+            string? error = null;
+            if (!string.IsNullOrEmpty(req.Code)) ok = totp.Verify(req.Code, out error);
+            else ok = hub.Request(peer, TimeSpan.FromSeconds(10), null).Approved;
+            conn.SendJson(MsgType.StreamDecision, new StreamDecisionMessage { Approved = ok, Reason = error ?? "negado" });
+            if (!ok) return false;
+            pulledSender = SenderSession.StartOnConnection(conn, new SenderOptions { Name = "PC-Teste", Fps = 30, Quality = 60, Audio = false });
+            return true;
+        };
         server.Start();
 
+        // --- Descoberta
         var found = await DiscoveryScanner.ScanAsync(discoveryPort, TimeSpan.FromSeconds(1.5), includeLoopback: true, CancellationToken.None);
-        foreach (var r in found) Log.Info($"SELFTEST descoberto: {r.Name} {r.Endpoint} via {r.Via}");
-        Check(found.Any(r => r.Name == "Receptor-Teste"), "descoberta UDP encontra o receptor");
+        Check(found.Any(r => r.Name == "PC-Teste" && r.Id == pcId.ShortId && r.ProtocolVersion == Proto.Version),
+            "descoberta UDP encontra o receptor (com ID da chave e versão do protocolo)");
 
-        var opt = new SenderOptions { Name = "Transmissor-Teste", Fps = 30, Quality = 75, Audio = true };
-        var sender = await SenderSession.ConnectAsync("127.0.0.1", port, opt, CancellationToken.None);
+        // --- 1ª conexão: aparelhos desconhecidos → pareamento com código igual nas duas telas
+        var opt = new SenderOptions { Name = "Notebook-Teste", Fps = 30, Quality = 75, Audio = true };
+        var sender = await SenderSession.ConnectAsync("127.0.0.1", port, opt, NbChannel(), CancellationToken.None);
         sender.StatsUpdated += t => Log.Info("SELFTEST [transmissor] " + t);
-        var session = await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        session.StatsUpdated += t => Log.Info("SELFTEST [receptor] " + t);
-        Check(sender.ReceiverName == "Receptor-Teste", "handshake (nome do receptor)");
+        var session = await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Check(pcCode is not null && pcCode == nbCode, $"pareamento: o mesmo código nas duas telas ({pcCode} / {nbCode})");
+        Check(pcTrust.IsTrusted(nbId.Fingerprint) && nbTrust.IsTrusted(pcId.Fingerprint), "pareamento salvo nos dois lados");
+        Check(sender.ReceiverName == "PC-Teste" && session.SenderName == "Notebook-Teste", "nomes autenticados nos dois lados");
 
-        // Segundo transmissor enquanto o primeiro está ativo: deve ser recusado.
+        // --- Segunda conexão já pareada (sem pedir código) enquanto ocupado: recusada por estar exibindo
+        pcCode = nbCode = null;
         try
         {
-            using var second = await SenderSession.ConnectAsync("127.0.0.1", port, opt, CancellationToken.None);
+            using var second = await SenderSession.ConnectAsync("127.0.0.1", port, opt, NbChannel(), CancellationToken.None);
             Check(false, "segundo transmissor deveria ser recusado");
         }
         catch (InvalidOperationException ex)
         {
-            Check(true, $"segundo transmissor recusado (“{ex.Message}”)");
+            Check(pcCode is null && nbCode is null, $"reconexão de pareado sem novo código; ocupado recusado (“{ex.Message}”)");
         }
 
-        await Task.Delay(3500);
+        await Task.Delay(3000);
         long frames = Interlocked.Read(ref session.FramesReceived);
-        Check(frames >= 1, $"quadros recebidos: {frames}");
-        Check(session.Surface.Width == Screen.PrimaryScreen!.Bounds.Width, $"resolução recebida {session.Surface.Width}×{session.Surface.Height}");
-        var png = Path.Combine(outDir, "selftest-recebido.png");
-        session.Surface.SavePng(png);
-        Log.Info($"SELFTEST imagem recebida salva em {png}");
+        Check(frames >= 1, $"vídeo pela conexão criptografada: {frames} quadro(s) (tela parada só envia o que muda)");
+        session.Surface.SavePng(Path.Combine(outDir, "selftest-recebido.png"));
 
-        // Encerramento pelo receptor: o transmissor deve ser avisado.
         var senderEnded = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         sender.Ended += (_, reason) => senderEnded.TrySetResult(reason);
         session.Close();
@@ -185,44 +234,141 @@ internal static class DevTools
         await ended.Task.WaitAsync(TimeSpan.FromSeconds(5));
         session.Surface.Dispose();
 
-        // Controles de jogo: formato da mensagem e leitura do XInput deste computador.
+        // --- Pareamento recusado no PC: nada é salvo
+        var evilTrust = new MemoryTrust();
+        pcAcceptsPairing = false;
+        try
+        {
+            await SenderSession.ConnectAsync("127.0.0.1", port, opt, new Security.SecureChannelOptions
+            {
+                Identity = evilId, Trust = evilTrust, LocalName = "Notebook-Teste", ConfirmPairing = _ => true,
+            }, CancellationToken.None);
+            Check(false, "pareamento recusado deveria impedir a conexão");
+        }
+        catch (Security.AuthException ex)
+        {
+            Check(!pcTrust.IsTrusted(evilId.Fingerprint), $"pareamento recusado no PC bloqueia o aparelho (“{ex.Message}”)");
+        }
+        pcAcceptsPairing = true;
+
+        // --- Invasor não pareado pedindo a tela (acesso remoto): recusado sem chance de parear
+        try
+        {
+            await RemotePull.RequestAsync("127.0.0.1", port, new Security.SecureChannelOptions
+            {
+                Identity = evilId, Trust = evilTrust, LocalName = "Invasor", ConfirmPairing = _ => true,
+            }, null, _ => { }, CancellationToken.None);
+            Check(false, "invasor não pareado deveria ser recusado");
+        }
+        catch (Security.AuthException ex)
+        {
+            Check(true, $"acesso remoto de aparelho não pareado recusado (“{ex.Message}”)");
+        }
+
+        // --- Acesso remoto com código de autorização errado e depois certo
+        try
+        {
+            await RemotePull.RequestAsync("127.0.0.1", port, NbChannel(false), "000000", _ => { }, CancellationToken.None);
+            Check(false, "código errado deveria ser recusado");
+        }
+        catch (Security.AuthException ex)
+        {
+            Check(true, $"código de autorização errado recusado (“{ex.Message}”)");
+        }
+        using var nbViewer = new ReceiverServer(() => NbChannel(false), () => false, () => new ReceiverPrefs(1366, 768, true));
+        var pulledStarted = new TaskCompletionSource<ReceiverSession>(TaskCreationOptions.RunContinuationsAsynchronously);
+        nbViewer.SessionStarted += s => pulledStarted.TrySetResult(s);
+        var (pullConn, pullPeer) = await RemotePull.RequestAsync("127.0.0.1", port, NbChannel(false), totp.Current(), _ => { }, CancellationToken.None);
+        var pullTask = Task.Run(() => { try { nbViewer.ServeIncomingStream(pullConn, pullPeer, requestedByUs: true); } finally { pullConn.Dispose(); } });
+        var pulled = await pulledStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await Task.Delay(2000);
+        Check(Interlocked.Read(ref pulled.FramesReceived) >= 1 && pulled.Surface.Width == 1366 && pulledSender?.Limits.Light == true,
+            $"acesso remoto com código: tela do PC recebida no notebook em {pulled.Surface.Width}×{pulled.Surface.Height} (modo leve)");
+        try
+        {
+            await RemotePull.RequestAsync("127.0.0.1", port, NbChannel(false), totp.Current(), _ => { }, CancellationToken.None);
+            Check(false, "código já usado deveria ser recusado");
+        }
+        catch (Security.AuthException)
+        {
+            Check(true, "código de autorização não pode ser reutilizado");
+        }
+        pulled.Close();
+        await pullTask.WaitAsync(TimeSpan.FromSeconds(5));
+        pulled.Surface.Dispose();
+        pulledSender?.Stop();
+
+        // --- Celular aprovador: pareia, recebe o pedido e aprova
+        var phoneClient = new System.Net.Sockets.TcpClient();
+        await phoneClient.ConnectAsync(System.Net.IPAddress.Loopback, port);
+        pcCode = null;
+        string? phoneCode = null;
+        var (phoneConn, phonePeer) = await Task.Run(() => Security.SecureChannel.Connect(phoneClient, Security.ChannelPurpose.Approver,
+            new Security.SecureChannelOptions
+            {
+                Identity = phoneId, Trust = phoneTrust, LocalName = "Celular-Teste", LocalKind = "phone",
+                ConfirmPairing = p => { phoneCode = p.Code; return true; },
+            }));
+        var status = phoneConn.ReceiveJson<ApproverStatusMessage>(MsgType.ApproverStatus);
+        Check(phoneCode is not null && phoneCode == pcCode && status.TotpSecret == totp.Base32Secret,
+            $"celular pareado como aprovador (código {phoneCode}) e recebe o segredo do código de autorização");
+        string? requestSeen = null;
+        var phoneLoop = Task.Run(() =>
+        {
+            try
+            {
+                while (true)
+                {
+                    using var m = phoneConn.Receive();
+                    if (m.Type != MsgType.ApprovalRequest) continue;
+                    var r = m.ReadJson<ApprovalRequestMessage>();
+                    if (r.Cancelled) continue;
+                    requestSeen = r.DeviceName;
+                    phoneConn.SendJson(MsgType.ApprovalResponse, new ApprovalResponseMessage { Id = r.Id, Approved = true });
+                }
+            }
+            catch { }
+        });
+        pulledStarted = new TaskCompletionSource<ReceiverSession>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (pc2, peer2) = await RemotePull.RequestAsync("127.0.0.1", port, NbChannel(false), null, _ => { }, CancellationToken.None);
+        var pullTask2 = Task.Run(() => { try { nbViewer.ServeIncomingStream(pc2, peer2, requestedByUs: true); } finally { pc2.Dispose(); } });
+        var pulled2 = await pulledStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Check(requestSeen == "Notebook-Teste", $"pedido de acesso aprovado pelo celular (pedido de “{requestSeen}”)");
+        pulled2.Close();
+        await pullTask2.WaitAsync(TimeSpan.FromSeconds(5));
+        pulled2.Surface.Dispose();
+        pulledSender?.Stop();
+        phoneConn.Dispose();
+
+        // --- Controles de jogo e entrada
         var padIn = new Input.GamepadState(2, true, 0x1F3F, 10, 250, -32768, 32767, 1234, -4321);
         Check(Input.GamepadCodec.TryDecode(Input.GamepadCodec.Encode(padIn), out var padOut) && padOut == padIn, "controle de jogo: codificação ida e volta");
-        Log.Info($"SELFTEST controles XInput conectados neste computador: {Input.XInput.CountConnected()}");
-        bool driver = Input.VirtualGamepads.IsDriverInstalled(out var driverError);
-        Log.Info($"SELFTEST driver ViGEmBus neste computador: {(driver ? "instalado" : "ausente (" + driverError + ")")}");
+        Check(Input.InputCodec.EncodeRelativeMove(-5, 7).Length == 5 && Input.InputCodec.EncodeButtonOnly(MouseButtons.Left, true)[0] == Input.InputCodec.ButtonOnly,
+            "mensagens de mouse relativo e botão sem posição");
         var sdl = Input.ControllerService.Instance;
         Check(sdl.Available, $"SDL3 carregada para controles USB/Bluetooth{(sdl.Available ? "" : " — " + sdl.Error)}");
-        await Task.Delay(400);
-        foreach (var c in sdl.Snapshot.Controllers) Log.Info($"SELFTEST controle neste computador: {c.Describe()} [{c.Kind}]");
-        Log.Info($"SELFTEST controles via SDL neste computador: {sdl.Snapshot.Controllers.Count}");
 
-        // Nova sessão: receptor pede modo leve numa tela 1366×768; controle permitido; encerrada pelo transmissor.
-        prefs = new ReceiverPrefs(1366, 768, true);
-        var started2 = new TaskCompletionSource<ReceiverSession>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var ended2 = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        server.SessionStarted += s => started2.TrySetResult(s);
-        server.SessionEnded += (_, reason) => ended2.TrySetResult(reason);
-        var optControl = new SenderOptions { Name = "Transmissor-Teste", Fps = 30, Quality = 75, Audio = false, AllowControl = true };
-        var sender2 = await SenderSession.ConnectAsync("127.0.0.1", port, optControl, CancellationToken.None);
-        var session2 = await started2.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        string expected = driver ? Input.VirtualGamepads.StatusOk : Input.VirtualGamepads.StatusNoDriver;
-        Check(sender2.GamepadStatus == expected, $"transmissor anuncia controles de jogo (“{sender2.GamepadStatus}”)");
-        // Transmissão vinda do próprio computador: controle bloqueado (evita ciclo de mouse e de controles virtuais).
-        Check(session2.FromThisComputer && !session2.ControlAllowed && session2.GamepadStatus == Input.VirtualGamepads.StatusDisabled,
-            "controle bloqueado quando a transmissão vem do próprio computador");
-        session2.SendGamepad(Input.GamepadCodec.Encode(padIn with { Slot = 0 })); // deve ser ignorado
-        await Task.Delay(1500);
-        Check(sender2.IsRunning && Input.XInput.CountConnected() == 0, "nenhum controle virtual criado; transmissão segue ativa");
-        Check(sender2.Limits == new StreamLimits(1366, 768, 30, 55, true),
-            $"modo leve aplicado pelo transmissor ({sender2.Limits})");
-        Check(Interlocked.Read(ref session2.FramesReceived) >= 1 && session2.Surface.Width == 1366 && session2.Surface.Height == 768,
-            $"imagem reduzida recebida em {session2.Surface.Width}×{session2.Surface.Height} (pedido: 1366×768)");
-        session2.Surface.SavePng(Path.Combine(outDir, "selftest-leve-1366x768.png"));
-        sender2.Stop();
-        var reasonAtReceiver = await ended2.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        Check(reasonAtReceiver is not null, $"receptor avisado do fim (“{reasonAtReceiver}”)");
-        session2.Surface.Dispose();
+        // --- Cliente antigo (sem TLS) e bloqueio após falhas repetidas
+        for (int i = 0; i < 5; i++)
+        {
+            using var old = new System.Net.Sockets.TcpClient();
+            await old.ConnectAsync(System.Net.IPAddress.Loopback, port);
+            var s = old.GetStream();
+            s.Write(new byte[] { (byte)MsgType.Hello, 2, 0, 0, 0, (byte)'{', (byte)'}' });
+            try { s.ReadTimeout = 3000; s.ReadByte(); } catch { }
+        }
+        await Task.Delay(300);
+        bool blocked;
+        try
+        {
+            await RemotePull.RequestAsync("127.0.0.1", port, NbChannel(false), totp.Current(), _ => { }, CancellationToken.None);
+            blocked = false;
+        }
+        catch (Exception ex)
+        {
+            blocked = ex is Security.AuthException or IOException;
+        }
+        Check(blocked, "endereço bloqueado depois de 5 conexões inválidas (inclusive do aparelho pareado)");
 
         server.Stop();
         Input.ControllerService.Shutdown();
@@ -354,7 +500,7 @@ internal static class DevTools
             ShowInTaskbar = false,
         };
         form.Show();
-        foreach (var tab in new[] { "receive", "send", "hdmi", "settings" })
+        foreach (var tab in new[] { "receive", "send", "remote", "hdmi", "settings" })
         {
             form.SelectTab(tab);
             for (int i = 0; i < 40; i++)

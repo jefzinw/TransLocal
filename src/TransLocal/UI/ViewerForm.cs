@@ -40,9 +40,111 @@ internal sealed class SurfaceView : Control
         get => _controlEnabled;
         set
         {
+            bool was = _controlEnabled;
             _controlEnabled = value && SendInput is not null;
             Cursor = _controlEnabled ? BlankCursor : Cursors.Default;
+            if (was && !_controlEnabled) SendInput?.Invoke(InputCodec.EncodeReleaseAll());
+            UpdateRelativeMode();
         }
+    }
+
+    // ---------------- Mouse relativo (jogos que prendem o cursor) ----------------
+
+    private bool _remoteCaptured;
+    private bool _forceAbsolute;
+    private bool _relativeOn;
+
+    /// <summary>O outro computador avisou que um jogo prendeu/escondeu o cursor.</summary>
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool RemoteCursorCaptured
+    {
+        get => _remoteCaptured;
+        set
+        {
+            _remoteCaptured = value;
+            UpdateRelativeMode();
+        }
+    }
+
+    /// <summary>Modo relativo ativo agora (para a barra da janela).</summary>
+    public bool RelativeActive => _relativeOn;
+
+    public event Action? RelativeModeChanged;
+
+    /// <summary>Ctrl+Alt+Shift+M: força o mouse absoluto mesmo com o cursor preso.</summary>
+    public void ToggleForceAbsolute()
+    {
+        _forceAbsolute = !_forceAbsolute;
+        UpdateRelativeMode();
+    }
+
+    private void UpdateRelativeMode()
+    {
+        if (!IsHandleCreated) return;
+        bool want = _controlEnabled && _remoteCaptured && !_forceAbsolute && ContainsFocus;
+        if (want == _relativeOn)
+        {
+            if (want) ClipToView();
+            return;
+        }
+        _relativeOn = want;
+        var rid = new[]
+        {
+            new Native.RAWINPUTDEVICE
+            {
+                usUsagePage = 0x01, // Generic Desktop
+                usUsage = 0x02,     // Mouse
+                dwFlags = want ? 0u : Native.RIDEV_REMOVE,
+                hwndTarget = want ? Handle : IntPtr.Zero,
+            },
+        };
+        Native.RegisterRawInputDevices(rid, 1, (uint)Marshal.SizeOf<Native.RAWINPUTDEVICE>());
+        if (want) ClipToView(); else Native.ClipCursorNone(IntPtr.Zero);
+        RelativeModeChanged?.Invoke();
+    }
+
+    /// <summary>Mantém o cursor local dentro da imagem enquanto o modo relativo está ativo.</summary>
+    private void ClipToView()
+    {
+        var r = RectangleToScreen(ClientRectangle);
+        var rc = new Native.RECT(r.Left, r.Top, r.Right, r.Bottom);
+        Native.ClipCursor(ref rc);
+    }
+
+    private readonly byte[] _rawBuffer = new byte[64];
+
+    private void HandleRawInput(IntPtr lParam)
+    {
+        uint size = (uint)_rawBuffer.Length;
+        uint header = (uint)(8 + 2 * IntPtr.Size);
+        if (Native.GetRawInputData(lParam, Native.RID_INPUT, _rawBuffer, ref size, header) == uint.MaxValue) return;
+        if (BitConverter.ToUInt32(_rawBuffer, 0) != Native.RIM_TYPEMOUSE) return;
+        int mouse = (int)header;                       // RAWMOUSE logo após o cabeçalho
+        ushort flags = BitConverter.ToUInt16(_rawBuffer, mouse);
+        if ((flags & 0x01) != 0) return;               // MOUSE_MOVE_ABSOLUTE (tablets, área de trabalho remota)
+        int dx = BitConverter.ToInt32(_rawBuffer, mouse + 12);
+        int dy = BitConverter.ToInt32(_rawBuffer, mouse + 16);
+        if (dx != 0 || dy != 0) SendInput?.Invoke(InputCodec.EncodeRelativeMove(dx, dy));
+    }
+
+    protected override void OnGotFocus(EventArgs e)
+    {
+        base.OnGotFocus(e);
+        UpdateRelativeMode();
+    }
+
+    protected override void OnLostFocus(EventArgs e)
+    {
+        base.OnLostFocus(e);
+        // Teclas seguradas na hora de trocar de janela ficariam presas no outro computador.
+        if (_controlEnabled) SendInput?.Invoke(InputCodec.EncodeReleaseAll());
+        UpdateRelativeMode();
+    }
+
+    protected override void OnHandleDestroyed(EventArgs e)
+    {
+        if (_relativeOn) Native.ClipCursorNone(IntPtr.Zero);
+        base.OnHandleDestroyed(e);
     }
 
     public void NotifyFrame()
@@ -113,7 +215,8 @@ internal sealed class SurfaceView : Control
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
-        if (!_controlEnabled || !Map(e.Location, out var nx, out var ny)) return;
+        // No modo relativo o movimento vai pelo Raw Input (WM_INPUT), não por posição.
+        if (!_controlEnabled || _relativeOn || !Map(e.Location, out var nx, out var ny)) return;
         if (nx == _lastNx && ny == _lastNy) return;
         _lastNx = nx;
         _lastNy = ny;
@@ -124,15 +227,17 @@ internal sealed class SurfaceView : Control
     {
         base.OnMouseDown(e);
         if (!Focused) Focus();
-        if (_controlEnabled && Map(e.Location, out var nx, out var ny))
-            SendInput?.Invoke(InputCodec.EncodeButton(e.Button, true, nx, ny));
+        if (!_controlEnabled) return;
+        if (_relativeOn) SendInput?.Invoke(InputCodec.EncodeButtonOnly(e.Button, true));
+        else if (Map(e.Location, out var nx, out var ny)) SendInput?.Invoke(InputCodec.EncodeButton(e.Button, true, nx, ny));
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
-        if (_controlEnabled && Map(e.Location, out var nx, out var ny))
-            SendInput?.Invoke(InputCodec.EncodeButton(e.Button, false, nx, ny));
+        if (!_controlEnabled) return;
+        if (_relativeOn) SendInput?.Invoke(InputCodec.EncodeButtonOnly(e.Button, false));
+        else if (Map(e.Location, out var nx, out var ny)) SendInput?.Invoke(InputCodec.EncodeButton(e.Button, false, nx, ny));
     }
 
     protected override void OnMouseWheel(MouseEventArgs e)
@@ -157,6 +262,9 @@ internal sealed class SurfaceView : Control
     {
         switch (m.Msg)
         {
+            case Native.WM_INPUT:
+                if (_relativeOn && _controlEnabled) HandleRawInput(m.LParam);
+                break;
             case Native.WM_KEYDOWN:
             case Native.WM_SYSKEYDOWN:
             case Native.WM_KEYUP:
@@ -204,6 +312,7 @@ internal sealed class SurfaceView : Control
                 Keys.Q => "close",
                 Keys.C => "control",
                 Keys.S => "stats",
+                Keys.M => "mouse-mode",
                 _ => null,
             };
         }
@@ -284,6 +393,7 @@ internal sealed class ViewerForm : Form
 
         _view = new SurfaceView(surface) { Dock = DockStyle.Fill, SendInput = sendInput };
         _view.LocalCommand += OnLocalCommand;
+        _view.RelativeModeChanged += UpdateTitleForMouseMode;
 
         _bar = new Panel { Height = 40, BackColor = Color.FromArgb(32, 32, 32), Dock = DockStyle.Top, Padding = new Padding(6, 4, 6, 4) };
         _barTitle = new Label
@@ -443,7 +553,23 @@ internal sealed class ViewerForm : Form
             case "close": Close(); break;
             case "control": ToggleControl(); break;
             case "stats": ToggleStats(); break;
+            case "mouse-mode": _view.ToggleForceAbsolute(); break;
         }
+    }
+
+    /// <summary>O outro computador avisou se um jogo prendeu o cursor (mouse relativo).</summary>
+    public void SetRemoteCursorCaptured(bool captured)
+    {
+        if (!IsHandleCreated || IsDisposed) return;
+        try { BeginInvoke(() => _view.RemoteCursorCaptured = captured); } catch (InvalidOperationException) { }
+    }
+
+    private void UpdateTitleForMouseMode()
+    {
+        if (!_view.ControlEnabled) return;
+        _barTitle.Text = _view.RelativeActive
+            ? $"{_title} — mouse de jogo (relativo) • Ctrl+Alt+Shift+M alterna • Ctrl+Alt+Shift+C solta"
+            : $"{_title} — controlando (Ctrl+Alt+Shift+C para soltar)";
     }
 
     private void ToggleControl()
