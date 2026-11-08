@@ -102,6 +102,10 @@ internal sealed class H264Sps
         if (!s.FrameMbsOnly) r.U(1);
         s.Direct8x8 = r.Flag();
         if (s.ChromaFormat != 1 || s.BitDepthLuma != 8 || s.BitDepthChroma != 8) unsupported ??= "formato de cor diferente de 4:2:0 8 bits";
+        // Limites do padrão (e de qualquer placa): dados fora disso são inválidos — nunca viram tamanhos de textura.
+        if (s.Id > 31 || s.PocType > 2 || s.Log2MaxFrameNum > 16 || s.Log2MaxPocLsb > 16 || s.MaxRefFrames > 16 ||
+            s.WidthMbs > 512 || s.HeightMapUnits > 288)
+            throw new InvalidDataException("SPS fora dos limites do H.264");
         return s;
     }
 }
@@ -119,6 +123,7 @@ internal sealed class H264Pps
         if (r.Ue() != 0) { unsupported = "grupos de fatias (FMO)"; return p; }
         p.NumRefIdxL0 = (int)r.Ue() + 1;
         p.NumRefIdxL1 = (int)r.Ue() + 1;
+        if (p.Id > 255 || p.SpsId > 31 || p.NumRefIdxL0 > 32 || p.NumRefIdxL1 > 32) throw new InvalidDataException("PPS fora dos limites do H.264");
         p.WeightedPred = r.Flag();
         p.WeightedBipredIdc = (int)r.U(2);
         p.PicInitQp = r.Se() + 26;
@@ -454,6 +459,14 @@ internal sealed unsafe class D3D11H264Decoder : IDisposable
         catch (InvalidDataException ex)
         {
             Log.Info($"H.264 (D3D11VA): {ex.Message}");
+            error = true;
+            return false;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            // Erro da placa ou dado inesperado: deixa este caminho e volta ao decodificador do Windows.
+            Log.Warn("H.264 (D3D11VA): falha ao decodificar; usando o decodificador do Windows", ex);
+            Unsupported = "falha na decodificação direta";
             error = true;
             return false;
         }

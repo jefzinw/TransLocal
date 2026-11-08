@@ -437,6 +437,13 @@ internal sealed class UdpVideoReceiver : IDisposable
             int blocks = (dataShards + UdpProto.MaxDataPerBlock - 1) / UdpProto.MaxDataPerBlock;
             a = new Assembly { Length = total, Width = w, Height = h, Key = key, Blocks = blocks, Parts = new Block[blocks], Data = new byte[dataShards * S] };
             for (int i = 0; i < blocks; i++) a.Parts[i] = new Block();
+            // No máximo 16 quadros em montagem (limita a memória mesmo com pacotes estranhos).
+            while (_frames.Count >= 16)
+            {
+                int oldest = _frames.Keys.Min();
+                _frames.Remove(oldest);
+                Interlocked.Increment(ref FramesLost);
+            }
             _frames[id] = a;
         }
         if (block >= a.Blocks) return;
@@ -449,7 +456,8 @@ internal sealed class UdpVideoReceiver : IDisposable
             blk.Shards = new byte[k + m][];
             blk.Present = new bool[k + m];
         }
-        if (blk.Present![shard] || k != blk.K) return;
+        // Pedaço que não combina com o bloco (k/m diferentes) é descartado antes de qualquer acesso.
+        if (k != blk.K || m != blk.M || shard >= blk.K + blk.M || blk.Present![shard]) return;
         var dst = blk.Shards[shard] = new byte[S];
         p.Slice(UdpProto.VideoHeaderLen, S).CopyTo(dst);
         blk.Present[shard] = true;

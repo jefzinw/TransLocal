@@ -49,6 +49,15 @@ internal readonly record struct StreamLimits(int MaxWidth, int MaxHeight, int Fp
                 }
                 break;
         }
+        // Com H.264, mandar mais pixels do que a tela de quem exibe só custa: rede, decodificação e redução no
+        // receptor (no notebook com Intel UHD 600, 1080p → 768p gerava quadros de 40–67 ms e picos de atraso).
+        // A redução aqui, na placa do PC, tem a mesma qualidade e é de graça.
+        if (opt.H264 && welcome.Codecs?.Contains("h264", StringComparer.OrdinalIgnoreCase) == true &&
+            welcome.ScreenWidth > 0 && welcome.ScreenHeight > 0)
+        {
+            mw = mw <= 0 ? welcome.ScreenWidth : Math.Min(mw, welcome.ScreenWidth);
+            mh = mh <= 0 ? welcome.ScreenHeight : Math.Min(mh, welcome.ScreenHeight);
+        }
         int fps = opt.Fps, quality = opt.Quality;
         bool h264 = opt.H264 && welcome.Codecs?.Contains("h264", StringComparer.OrdinalIgnoreCase) == true;
         if (welcome.Light)

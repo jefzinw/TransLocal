@@ -38,12 +38,79 @@ namespace TransLocal.Mobile
             e.Commit();
         }
 
+        // ---- Segredos (chave do aparelho e código de autorização) cifrados pelo Android Keystore ----
+        // A chave AES fica no hardware seguro do celular e nunca sai dele: mesmo com root ou cópia do armazenamento,
+        // os segredos não são legíveis. Valores antigos em texto puro são cifrados na primeira leitura.
+        private const string Sealed = "ks1:";
+        private const string KeyAlias = "translocal-store";
+
+        private static Javax.Crypto.ISecretKey StoreKey()
+        {
+            var ks = Java.Security.KeyStore.GetInstance("AndroidKeyStore")!;
+            ks.Load(null);
+            if (ks.GetEntry(KeyAlias, null) is Java.Security.KeyStore.SecretKeyEntry entry) return entry.SecretKey!;
+            var gen = Javax.Crypto.KeyGenerator.GetInstance(global::Android.Security.Keystore.KeyProperties.KeyAlgorithmAes, "AndroidKeyStore")!;
+            gen.Init(new global::Android.Security.Keystore.KeyGenParameterSpec.Builder(KeyAlias,
+                    global::Android.Security.Keystore.KeyStorePurpose.Encrypt | global::Android.Security.Keystore.KeyStorePurpose.Decrypt)
+                .SetBlockModes(global::Android.Security.Keystore.KeyProperties.BlockModeGcm)
+                .SetEncryptionPaddings(global::Android.Security.Keystore.KeyProperties.EncryptionPaddingNone)
+                .SetKeySize(256)
+                .Build());
+            return gen.GenerateKey()!;
+        }
+
+        private static string Seal(string plain)
+        {
+            var c = Javax.Crypto.Cipher.GetInstance("AES/GCM/NoPadding")!;
+            c.Init(Javax.Crypto.CipherMode.EncryptMode, StoreKey());
+            byte[] ct = c.DoFinal(System.Text.Encoding.UTF8.GetBytes(plain))!;
+            return Sealed + Convert.ToBase64String(c.GetIV()!) + ":" + Convert.ToBase64String(ct);
+        }
+
+        private static string Open(string stored)
+        {
+            var parts = stored[Sealed.Length..].Split(':');
+            var c = Javax.Crypto.Cipher.GetInstance("AES/GCM/NoPadding")!;
+            c.Init(Javax.Crypto.CipherMode.DecryptMode, StoreKey(), new Javax.Crypto.Spec.GCMParameterSpec(128, Convert.FromBase64String(parts[0])));
+            return System.Text.Encoding.UTF8.GetString(c.DoFinal(Convert.FromBase64String(parts[1]))!);
+        }
+
+        private string? GetSecret(string key)
+        {
+            var v = Get(key);
+            if (v is null) return null;
+            if (v.StartsWith(Sealed, StringComparison.Ordinal))
+            {
+                try { return Open(v); }
+                catch (Exception ex)
+                {
+                    // Chave do Keystore apagada (ex.: credenciais do aparelho limpas): o segredo não pode mais ser lido.
+                    Log.Warn($"Segredo “{key}” ilegível (chave do Keystore perdida); será necessário parear de novo", ex);
+                    return null;
+                }
+            }
+            PutSecret(key, v); // migração: valor antigo em texto puro passa a ser guardado cifrado
+            return v;
+        }
+
+        private void PutSecret(string key, string? value)
+        {
+            if (value is null) { Put(key, null); return; }
+            try { Put(key, Seal(value)); }
+            catch (Exception ex)
+            {
+                // Aparelho sem Keystore utilizável: continua funcionando no armazenamento privado do app.
+                Log.Warn("Keystore indisponível; segredo guardado só no armazenamento privado do app", ex);
+                Put(key, value);
+            }
+        }
+
         public DeviceIdentity LoadIdentity()
         {
-            var saved = Get("identity");
+            var saved = GetSecret("identity");
             if (saved is not null) return DeviceIdentity.FromPkcs8(Convert.FromBase64String(saved));
             var (identity, pkcs8) = DeviceIdentity.CreateExportable();
-            Put("identity", Convert.ToBase64String(pkcs8));
+            PutSecret("identity", Convert.ToBase64String(pkcs8));
             return identity;
         }
 
@@ -56,7 +123,7 @@ namespace TransLocal.Mobile
         public string? PcName { get => Get("pcName"); set => Put("pcName", value); }
         public string? PcFingerprint { get => Get("pcFp"); set => Put("pcFp", value); }
         public string? PcAddress { get => Get("pcAddress"); set => Put("pcAddress", value); }
-        public string? TotpSecret { get => Get("totp"); set => Put("totp", value); }
+        public string? TotpSecret { get => GetSecret("totp"); set => PutSecret("totp", value); }
 
         public bool HasPc => PcFingerprint is not null && PcAddress is not null;
 

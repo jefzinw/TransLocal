@@ -110,10 +110,16 @@ internal static class Updater
             fi.Delete();
             throw new InvalidDataException($"Download incompleto ({fi.Length} de {info.Size} bytes).");
         }
+        // Sem a impressão digital publicada pelo GitHub não há como provar que o arquivo é o original: não instala.
+        if (info.Sha256 is null)
+        {
+            fi.Delete();
+            throw new InvalidDataException("O GitHub não informou a impressão digital (SHA-256) do arquivo; atualização cancelada por segurança.");
+        }
         string hash;
         await using (var fs = File.OpenRead(part))
             hash = Convert.ToHexString(await SHA256.HashDataAsync(fs, ct)).ToLowerInvariant();
-        if (info.Sha256 is not null && hash != info.Sha256)
+        if (hash != info.Sha256)
         {
             File.Delete(part);
             throw new InvalidDataException("O arquivo baixado não confere com o publicado (SHA-256 diferente).");
@@ -127,11 +133,29 @@ internal static class Updater
     /// Executa o instalador em modo silencioso. Ele pede permissão de administrador, fecha esta instância
     /// (comando --quit) e reabre o TransLocal ao terminar. Retorna o processo do instalador.
     /// </summary>
-    public static Process? StartInstaller(string setupPath) =>
-        Process.Start(new ProcessStartInfo(setupPath, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RELAUNCH=1")
+    public static Process? StartInstaller(string setupPath, string expectedSha256)
+    {
+        // O instalador roda como administrador: trava o arquivo contra escrita, confere de novo a impressão digital e
+        // só então o executa — outro programa não consegue trocá-lo entre a conferência e a execução.
+        using var guard = new FileStream(setupPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        string hash = Convert.ToHexString(SHA256.HashData(guard)).ToLowerInvariant();
+        if (hash != expectedSha256)
+            throw new InvalidDataException("O instalador baixado foi alterado depois da conferência; atualização cancelada.");
+        var p = Process.Start(new ProcessStartInfo(setupPath, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RELAUNCH=1")
         {
             UseShellExecute = true,
         });
+        // Process.Start só volta depois que o Windows criou o processo (e a confirmação do UAC): a imagem já está
+        // carregada quando a trava é solta.
+        return p;
+    }
+
+    /// <summary>Confere a impressão digital de um arquivo já baixado (cópia portátil, antes de substituir o executável).</summary>
+    public static bool Matches(string path, string expectedSha256)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        return Convert.ToHexString(SHA256.HashData(fs)).ToLowerInvariant() == expectedSha256;
+    }
 
     /// <summary>
     /// Cópia portátil: renomeia o executável em uso (o Windows permite) e coloca o novo no lugar.

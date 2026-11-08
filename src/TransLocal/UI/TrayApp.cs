@@ -232,7 +232,7 @@ internal sealed class TrayApp : ApplicationContext
             {
                 SetUpdateStatus($"Instalando a versão {info.Version}… confirme a permissão do Windows.");
                 Balloon("Instalando atualização", $"Versão {info.Version}: confirme a permissão do Windows. O TransLocal fecha e reabre sozinho.");
-                var setup = Updater.StartInstaller(file);
+                var setup = Updater.StartInstaller(file, info.Sha256!);
                 if (setup is not null)
                 {
                     // Se o instalador terminar e este processo ainda estiver aberto, a instalação não aconteceu
@@ -243,7 +243,7 @@ internal sealed class TrayApp : ApplicationContext
             }
             else
             {
-                if (Updater.ReplaceExecutable(SystemIntegration.ExePath, file))
+                if (Updater.Matches(file, info.Sha256!) && Updater.ReplaceExecutable(SystemIntegration.ExePath, file))
                 {
                     Log.Info($"Executável atualizado para {info.Version}; reabrindo");
                     Updater.RelaunchUpdated();

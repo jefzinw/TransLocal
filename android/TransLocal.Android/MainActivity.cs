@@ -31,6 +31,8 @@ public class MainActivity : Activity
     protected override void OnCreate(Bundle? savedInstanceState)
     {
         base.OnCreate(savedInstanceState);
+        // O código de autorização não aparece em capturas de tela, gravações nem na lista de apps recentes.
+        Window!.SetFlags(WindowManagerFlags.Secure, WindowManagerFlags.Secure);
         _store = new PhoneStore(this);
         _handler = new Handler(Looper.MainLooper!);
         BuildUi();
