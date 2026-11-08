@@ -200,6 +200,12 @@ internal sealed class UdpVideoSender : IDisposable
     public long PacketsSent;
     public long ParityPackets;
 
+    /// <summary>Ritmo de envio dos pacotes de um quadro (bits/s); 0 = sem cadência.</summary>
+    public double PaceBitsPerSecond { get; set; } = 40_000_000;
+
+    /// <summary>Tempo máximo para espalhar um quadro (ms) — normalmente ~70% do intervalo entre quadros.</summary>
+    public double MaxPaceMs { get; set; } = 11;
+
     /// <summary>Porcentagem de paridade (ajustada pela perda que o receptor relata).</summary>
     public double Fec { get; set; } = 0.20;
 
@@ -249,7 +255,42 @@ internal sealed class UdpVideoSender : IDisposable
         }
     }
 
-    /// <summary>Envia um quadro H.264 inteiro (com paridade). Thread única (laço de vídeo).</summary>
+    private readonly System.Collections.Concurrent.BlockingCollection<(int Id, bool Key, int W, int H, byte[] Data)> _queue = new(boundedCapacity: 8);
+    private Thread? _sendThread;
+
+    /// <summary>
+    /// Entrega o quadro para a thread de envio, que espalha os pacotes no tempo sem segurar a captura e a
+    /// codificação do quadro seguinte.
+    /// </summary>
+    public void Enqueue(int frameId, bool key, int width, int height, byte[] data)
+    {
+        if (_disposed) return;
+        if (_sendThread is null)
+        {
+            _sendThread = new Thread(SendLoop) { IsBackground = true, Name = "TransLocal UDP envio", Priority = ThreadPriority.Highest };
+            _sendThread.Start();
+        }
+        // Fila cheia (rede travada): espera um pouco em vez de descartar — os quadros seguintes dependem deste.
+        try { _queue.TryAdd((frameId, key, width, height, data), 50); } catch (InvalidOperationException) { }
+    }
+
+    private void SendLoop()
+    {
+        var mmcss = Realtime.BoostThread("Capture");
+        try
+        {
+            foreach (var f in _queue.GetConsumingEnumerable())
+            {
+                if (_disposed) break;
+                try { SendFrame(f.Id, f.Key, f.W, f.H, f.Data); }
+                catch (Exception ex) { Log.Warn("UDP: falha ao enviar quadro", ex); }
+            }
+        }
+        catch (ObjectDisposedException) { }
+        finally { Realtime.Revert(mmcss); }
+    }
+
+    /// <summary>Envia um quadro H.264 inteiro (com paridade) já, nesta thread.</summary>
     public void SendFrame(int frameId, bool key, int width, int height, ReadOnlySpan<byte> data)
     {
         var peer = _peer;
@@ -258,7 +299,19 @@ internal sealed class UdpVideoSender : IDisposable
         int dataShards = Math.Max(1, (data.Length + S - 1) / S);
         int blocks = (dataShards + UdpProto.MaxDataPerBlock - 1) / UdpProto.MaxDataPerBlock;
         double fec = key ? Math.Max(Fec, 0.25) : Fec; // o quadro-chave é o que mais custa perder
-        int sentInBurst = 0;
+        // Cadência: os pacotes do quadro saem espaçados (grupos de 4) ao longo de parte do intervalo entre quadros,
+        // em vez de uma rajada só — roteadores Wi-Fi descartam rajadas quando a fila enche (era a origem das perdas).
+        int totalPackets = 0;
+        for (int b = 0; b < blocks; b++)
+        {
+            int kk = Math.Min(UdpProto.MaxDataPerBlock, dataShards - b * UdpProto.MaxDataPerBlock);
+            totalPackets += kk + (fec <= 0 ? 0 : Math.Max(1, (int)Math.Ceiling(kk * fec)));
+        }
+        double perPacketTicks = PaceBitsPerSecond > 0 ? (UdpProto.ShardSize + 60) * 8.0 * Stopwatch.Frequency / PaceBitsPerSecond : 0;
+        double maxTicks = MaxPaceMs * Stopwatch.Frequency / 1000.0;
+        if (perPacketTicks * totalPackets > maxTicks) perPacketTicks = maxTicks / Math.Max(1, totalPackets);
+        long start = Stopwatch.GetTimestamp();
+        int sent = 0;
         for (int b = 0; b < blocks; b++)
         {
             int first = b * UdpProto.MaxDataPerBlock;
@@ -292,8 +345,14 @@ internal sealed class UdpVideoSender : IDisposable
                 catch (SocketException) { }
                 Interlocked.Increment(ref PacketsSent);
                 if (j >= k) Interlocked.Increment(ref ParityPackets);
-                // Quadros grandes (quadro-chave) saem em rajadas curtas: a fila do roteador Wi-Fi não transborda.
-                if (++sentInBurst % 24 == 0) Thread.SpinWait(2000);
+                if (++sent % 4 == 0 && perPacketTicks > 0 && sent < totalPackets)
+                {
+                    long due = start + (long)(perPacketTicks * sent);
+                    while (Stopwatch.GetTimestamp() < due)
+                    {
+                        if (due - Stopwatch.GetTimestamp() > Stopwatch.Frequency / 1000) Thread.Sleep(0); else Thread.SpinWait(50);
+                    }
+                }
             }
         }
     }
@@ -301,6 +360,8 @@ internal sealed class UdpVideoSender : IDisposable
     public void Dispose()
     {
         _disposed = true;
+        try { _queue.CompleteAdding(); } catch { }
+        try { _sendThread?.Join(200); } catch { }
         try { _socket.Dispose(); } catch { }
         _aes.Dispose();
     }

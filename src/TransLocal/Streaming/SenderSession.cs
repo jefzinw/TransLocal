@@ -96,6 +96,8 @@ internal sealed class SenderSession : IDisposable
     private volatile bool _udpWasActive;
     private int _lastAckedId;
     private double _lossRate;
+    private long _lastForcedKey;
+    private readonly Queue<double> _lossHistory = new();
     private int _framesLostWindow, _framesRecoveredWindow;
     private volatile string _transportLabel = "TCP";
     private readonly CancellationTokenSource _cts = new();
@@ -314,7 +316,12 @@ internal sealed class SenderSession : IDisposable
         {
             try
             {
-                _udp = new UdpVideoSender(peer);
+                _udp = new UdpVideoSender(peer)
+                {
+                    // Cada quadro espalhado por ~70% do intervalo entre quadros (11 ms a 60 q/s).
+                    MaxPaceMs = 700.0 / Math.Clamp(_limits.Fps, 1, 120),
+                    Fec = 0.20,
+                };
                 _udp.PeerReady += ep => Log.Info($"Vídeo por UDP com correção de erros: {ReceiverName} recebe em {ep} (paridade {_udp.Fec:P0})");
                 _conn.SendJson(MsgType.UdpSetup, new UdpSetupMessage { Port = _udp.Port, Key = Convert.ToBase64String(_udp.Key), Session = _udp.Session });
                 _transportLabel = "TCP (aguardando UDP)";
@@ -569,8 +576,11 @@ internal sealed class SenderSession : IDisposable
                         {
                             byte[]? data = null;
                             bool key = false;
-                            bool force = _keyRequested || needKey;
-                            _keyRequested = false;
+                            // No máximo um quadro-chave a cada 250 ms: pedidos em sequência (perdas no Wi-Fi) não viram uma
+                            // cascata de quadros grandes, que perderiam ainda mais pacotes.
+                            bool keyCooldown = Stopwatch.GetTimestamp() - _lastForcedKey < Stopwatch.Frequency / 4;
+                            bool force = needKey || (_keyRequested && !keyCooldown);
+                            if (force) { _keyRequested = false; _lastForcedKey = Stopwatch.GetTimestamp(); }
                             needKey = false;
                             try
                             {
@@ -767,6 +777,8 @@ internal sealed class SenderSession : IDisposable
         string rtt = double.IsNaN(_rttMs) ? "–" : $"{_rttMs:0.#} ms";
         string size = _sendSize.IsEmpty ? "" : $"{_sendSize.Width}×{_sendSize.Height}{(_limits.Light ? " (leve)" : "")} • ";
         int blocked = Interlocked.Exchange(ref _statBlocked, 0);
+        // Ritmo dos pacotes: bem acima da taxa média (o quadro sai em parte do intervalo), nunca abaixo de 30 Mbit/s.
+        if (_udp is { } pace) pace.PaceBitsPerSecond = Math.Max(30_000_000, _targetBitrate * 4.0);
         if (_udpWasActive && _udp is { Active: false })
         {
             // O receptor parou de se apresentar por UDP (rede mudou, firewall): volta ao TCP com quadro-chave.
@@ -876,8 +888,11 @@ internal sealed class SenderSession : IDisposable
         Interlocked.Add(ref _framesRecoveredWindow, recovered);
         if (_udp is { } udp)
         {
-            // Paridade proporcional à perda medida: 10% com a rede limpa, até 50% num Wi-Fi ruim.
-            double fec = Math.Clamp(0.10 + rate * 4, 0.10, 0.50);
+            // Paridade pela pior perda dos últimos 5 s (as perdas do Wi-Fi vêm em rajadas: baixar logo depois de um
+            // segundo limpo deixava a rajada seguinte sem correção). Mínimo de 15%, máximo de 50%.
+            _lossHistory.Enqueue(rate);
+            while (_lossHistory.Count > 5) _lossHistory.Dequeue();
+            double fec = Math.Clamp(0.15 + _lossHistory.Max() * 4, 0.15, 0.50);
             if (Math.Abs(fec - udp.Fec) >= 0.05)
             {
                 Log.Info($"UDP: perda de {rate:P1} → paridade {fec:P0} (quadros recuperados {recovered}, perdidos {framesLost})");
@@ -972,7 +987,7 @@ internal sealed class SenderSession : IDisposable
                 _udpWasActive = true;
                 _transportLabel = "UDP + correção de erros";
             }
-            udp.SendFrame(id, key, _sendSize.Width, _sendSize.Height, data);
+            udp.Enqueue(id, key, _sendSize.Width, _sendSize.Height, data);
             Interlocked.Add(ref _conn.BytesSent, data.Length); // estatística de taxa
             Interlocked.Increment(ref _statFrames);
             return true;

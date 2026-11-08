@@ -500,6 +500,7 @@ internal sealed class ReceiverSession
     private volatile int _videoW, _videoH;
     private long _lastSlowLog;
     private bool _waitKey;
+    private long _waitKeySince;
 
     /// <summary>O transmissor ofereceu vídeo por UDP: abre o socket e se apresenta (o vídeo passa a vir por ele).</summary>
     private void StartUdp(UdpSetupMessage setup)
@@ -531,7 +532,11 @@ internal sealed class ReceiverSession
 
     private void RequestKey(bool fast, bool skip = true)
     {
-        if (skip) _waitKey = true;
+        if (skip && !_waitKey)
+        {
+            _waitKey = true;
+            _waitKeySince = Environment.TickCount64;
+        }
         long now = Environment.TickCount64;
         if (now - Interlocked.Read(ref _lastKeyRequest) < (fast ? 150 : 1000)) return;
         Interlocked.Exchange(ref _lastKeyRequest, now);
@@ -579,6 +584,9 @@ internal sealed class ReceiverSession
                 _hwFailed = true;
                 RequestKey(fast: true, skip: false);
             }
+            // Depois de uma perda, segura a imagem no máximo ~100 ms esperando o quadro-chave; passado isso, volta a
+            // mostrar os quadros seguintes (algum borrão some quando o quadro-chave chega) — nada de tela congelada.
+            if (_waitKey && viaUdp && Environment.TickCount64 - _waitKeySince > 100) _waitKey = false;
             if (_waitKey && viaUdp)
             {
                 Interlocked.Increment(ref _framesSkipped);

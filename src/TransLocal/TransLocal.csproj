@@ -18,7 +18,7 @@
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     <TieredPGO>true</TieredPGO>
 
-    <Version>2.1.0</Version>
+    <Version>2.2.0</Version>
     <Product>TransLocal</Product>
     <Description>Transmite a tela de um computador para outro por cabo (rede USB4/Thunderbolt, cabo bridge USB, Ethernet) ou exibe uma placa de captura HDMI.</Description>
     <Copyright>TransLocal</Copyright>
