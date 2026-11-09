@@ -620,6 +620,7 @@ internal sealed unsafe class H264Decoder : IDisposable
     private bool _ownsDevice;
     private IMFDXGIDeviceManager? _manager;
     private IGpuFrameSink? _sink;
+    private bool _present = true;
     private static readonly Guid IID_Texture2D = typeof(Vortice.Direct3D11.ID3D11Texture2D).GUID;
 
     /// <summary>O último quadro foi entregue direto à placa de vídeo (sem passar pela memória do processador).</summary>
@@ -803,8 +804,9 @@ internal sealed unsafe class H264Decoder : IDisposable
     /// Como o outro Decode, mas entrega o quadro a <paramref name="gpu"/> quando ele está na placa de vídeo
     /// (<see cref="LastOnGpu"/>); senão, escreve na superfície.
     /// </summary>
-    public bool Decode(ReadOnlySpan<byte> annexB, int width, int height, FrameSurface surface, IGpuFrameSink? gpu, out bool error)
+    public bool Decode(ReadOnlySpan<byte> annexB, int width, int height, FrameSurface surface, IGpuFrameSink? gpu, out bool error, bool present = true)
     {
+        _present = present;
         error = false;
         LastOnGpu = false;
         _sink = gpu is { Failed: false } ? gpu : null;
@@ -869,6 +871,14 @@ internal sealed unsafe class H264Decoder : IDisposable
                 if (outSample is null) return produced;
                 try
                 {
+                    if (!_present)
+                    {
+                        // Fila no receptor: decodifica (mantém as referências) sem gastar tempo mostrando.
+                        produced = true;
+                        LastOnGpu = true;
+                        if (data.Events != IntPtr.Zero) Marshal.Release(data.Events);
+                        continue;
+                    }
                     if (_sink is not null && TryPresentGpu(outSample, width, height))
                     {
                         produced = true;

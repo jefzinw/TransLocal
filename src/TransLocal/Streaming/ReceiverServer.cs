@@ -353,6 +353,9 @@ internal sealed class ReceiverSession
 
     /// <summary>O transmissor avisou que um jogo prendeu (true) ou soltou (false) o cursor.</summary>
     public event Action<bool>? CursorModeChanged;
+
+    /// <summary>A transmissão passou a mostrar outro monitor: posição do cursor nele (0–65535), para reposicionar o mouse local.</summary>
+    public event Action<ushort, ushort>? CursorWarp;
     public bool RemoteCursorCaptured { get; private set; }
 
     /// <summary>Este receptor pediu transmissão leve (desenho mais rápido também).</summary>
@@ -417,6 +420,9 @@ internal sealed class ReceiverSession
                         break;
                     case MsgType.Audio:
                         audio?.Add(m.Span);
+                        break;
+                    case MsgType.CursorWarp when m.Length >= 4:
+                        CursorWarp?.Invoke(BinaryPrimitives.ReadUInt16LittleEndian(m.Span), BinaryPrimitives.ReadUInt16LittleEndian(m.Span[2..]));
                         break;
                     case MsgType.CursorMode when m.Length >= 1:
                         RemoteCursorCaptured = m.Span[0] != 0;
@@ -499,6 +505,8 @@ internal sealed class ReceiverSession
     private int _lastVideoId = int.MinValue;
     private volatile int _videoW, _videoH;
     private long _lastSlowLog;
+    private long _catchUpFrames;
+    private const int CatchUpBytes = 48 * 1024; // ~1 quadro de 1366×768 a 15 Mbit/s
     private bool _waitKey;
     private long _waitKeySince;
 
@@ -550,6 +558,9 @@ internal sealed class ReceiverSession
         bool produced = false, error = false, onGpu = false;
         _videoW = vw;
         _videoH = vh;
+        // Quadros acumulados esperando (o notebook ficou um pouco atrás): decodifica este sem mostrar e mostra só o
+        // mais novo — a imagem alcança o tempo real em vez de carregar um atraso fixo.
+        bool present = !(viaUdp && _udp is { } q && q.PendingBytes > CatchUpBytes);
         lock (_videoGate)
         {
             long t1 = Stopwatch.GetTimestamp();
@@ -593,7 +604,7 @@ internal sealed class ReceiverSession
             }
             else if (_hw is not null && !_hwFailed && hwSink is { Failed: false } && (_hwActive || key))
             {
-                produced = _hw.Decode(annexB, vw, vh, hwSink, out error);
+                produced = _hw.Decode(annexB, vw, vh, hwSink, out error, present);
                 onGpu = produced;
                 if (produced && !_hwActive)
                 {
@@ -623,7 +634,7 @@ internal sealed class ReceiverSession
                 // Se a exibição pela placa de vídeo cair, o decodificador passa sozinho a entregar pelo processador.
                 var sink = GpuSink;
                 if (_decoder is not null && vw > 0 && vh > 0 && vw <= 8192 && vh <= 8192)
-                    produced = _decoder.Decode(annexB, vw, vh, Surface, sink, out error);
+                    produced = _decoder.Decode(annexB, vw, vh, Surface, sink, out error, present);
                 onGpu = produced && _decoder!.LastOnGpu;
             }
             long spent = Stopwatch.GetTimestamp() - t1;
@@ -646,7 +657,8 @@ internal sealed class ReceiverSession
         BinaryPrimitives.WriteInt32LittleEndian(ack, vid);
         if (!_closing) try { _conn.Send(MsgType.FrameAck, ack); } catch { }
         if (error) RequestKey(fast: false);
-        if (produced && !onGpu) FrameReady?.Invoke();
+        if (produced && !present) Interlocked.Increment(ref _catchUpFrames);
+        if (produced && !onGpu && present) FrameReady?.Invoke();
     }
 
     /// <summary>Começa o diagnóstico compartilhado (chamado quando a exibição é aceita).</summary>
@@ -712,7 +724,8 @@ internal sealed class ReceiverSession
             BinaryPrimitives.WriteUInt32LittleEndian(rep[12..], (uint)fr);
             if (!_closing) try { _conn.Send(MsgType.NetReport, rep); } catch { }
             double loss = pk + lost > 0 ? lost / (double)(pk + lost) : 0;
-            _udpLabel = $" • UDP: perda {loss:P1}, {fr} quadro(s) salvos pela correção, {fl} perdido(s)";
+            long caught = Interlocked.Exchange(ref _catchUpFrames, 0);
+            _udpLabel = $" • UDP: perda {loss:P1}, {fr} quadro(s) salvos pela correção, {fl} perdido(s){(caught > 0 ? $", {caught} decodificado(s) sem mostrar para alcançar o tempo real" : "")}";
         }
         string decWord = gpu > 0 ? "decodificação + exibição" : "decodificação";
         long udpBytes = _udp is null ? 0 : Interlocked.Exchange(ref _udpBytes, 0);

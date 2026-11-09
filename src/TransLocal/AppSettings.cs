@@ -37,6 +37,12 @@ internal sealed class AppSettings
     /// <summary>Ao exibir, já começa controlando (mouse, teclado e controles) quando o outro computador permite.</summary>
     public bool ViewerAutoControl { get; set; } = true;
 
+    /// <summary>Trava de atalhos: Alt+Tab, tecla Windows e afins vão para o outro computador enquanto controla.</summary>
+    public bool ViewerKeyLock { get; set; } = true;
+
+    /// <summary>Transmitindo com controle: a transmissão segue o cursor para outros monitores (telas estendidas).</summary>
+    public bool SendFollowCursor { get; set; } = true;
+
     /// <summary>Pede ao transmissor uma transmissão leve (até 1366×768, 30 quadros/s, mais compressão).</summary>
     public bool ReceiverLight { get; set; }
 

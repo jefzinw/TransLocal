@@ -44,6 +44,8 @@ internal sealed partial class MainForm : Form
     private readonly CheckBox _chkPlayAudio = new ToggleCheck();
     private readonly CheckBox _chkStats = new ToggleCheck();
     private readonly CheckBox _chkAutoControl = new ToggleCheck();
+    private readonly CheckBox _chkKeyLock = new ToggleCheck();
+    private readonly CheckBox _chkFollowCursor = new ToggleCheck();
     private readonly Label _padsHere = new();
     private readonly ListBox _lstPads = new();
     private readonly Button _btnPadSetup = new PillButton();
@@ -372,6 +374,9 @@ internal sealed partial class MainForm : Form
         SetupCheck(_chkAutoControl, "Começar já controlando quando o outro computador permitir (mouse, teclado e controles de jogo)");
         _chkAutoControl.CheckedChanged += (_, _) => SaveSetting(s => s.ViewerAutoControl = _chkAutoControl.Checked);
         Add(t, _chkAutoControl);
+        SetupCheck(_chkKeyLock, "Trava de atalhos: Alt+Tab e a tecla Windows vão para o outro computador (Ctrl+Alt+Shift+K)");
+        _chkKeyLock.CheckedChanged += (_, _) => SaveSetting(s => s.ViewerKeyLock = _chkKeyLock.Checked);
+        Add(t, _chkKeyLock);
         SetupStatus(_padsHere);
         Add(t, _padsHere);
         _lstPads.Height = 64;
@@ -523,6 +528,10 @@ internal sealed partial class MainForm : Form
         SetupCheck(_chkAllowControl, "Permitir que o outro computador use o mouse, o teclado e os controles de jogo dele neste computador");
         _chkAllowControl.CheckedChanged += (_, _) => SaveSetting(s => s.SenderAllowControl = _chkAllowControl.Checked);
         Add(t, _chkAllowControl);
+        SetupCheck(_chkFollowCursor, "Seguir o mouse entre monitores (telas estendidas)");
+        _chkFollowCursor.Margin = new Padding(24, 2, 0, 3);
+        _chkFollowCursor.CheckedChanged += (_, _) => SaveSetting(s => s.SendFollowCursor = _chkFollowCursor.Checked);
+        Add(t, _chkFollowCursor);
 
         SetupCheck(_chkElevated, "Controlar programas de administrador e confirmações do Windows (UAC)");
         _chkElevated.Margin = new Padding(20, 0, 0, 0);
@@ -747,6 +756,7 @@ internal sealed partial class MainForm : Form
             _chkStats.Checked = s.ShowStats;
             _chkSendAudio.Checked = s.SenderAudio;
             _chkAllowControl.Checked = s.SenderAllowControl;
+            _chkFollowCursor.Checked = s.SendFollowCursor;
             _chkElevated.Checked = s.ElevatedControl;
             _chkShareDiag.Checked = s.ShareDiagnostics;
             _chkHdmiFullscreen.Checked = s.HdmiFullscreen;
@@ -764,6 +774,7 @@ internal sealed partial class MainForm : Form
             _cmbResolution.SelectedIndex = Math.Max(0, resIdx);
             _chkLight.Checked = s.ReceiverLight;
             _chkAutoControl.Checked = s.ViewerAutoControl;
+            _chkKeyLock.Checked = s.ViewerKeyLock;
             RefreshAddresses();
         }
         finally

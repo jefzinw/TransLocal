@@ -505,10 +505,25 @@ internal sealed unsafe class GpuPresenter : IGpuFrameSink, IDisposable
         _rt!.DrawTextLayout(new Vector2(area.X, area.Y), layout, brush);
     }
 
+    // Texto das estatísticas: o layout só é refeito quando o texto ou a largura mudam (1×/s), não a cada quadro —
+    // num processador simples isso pesava a 60 q/s.
+    private IDWriteTextLayout? _statsLayout;
+    private string? _statsText;
+    private int _statsWidth;
+    private TextMetrics _statsMetrics;
+
     private void DrawStats(string s)
     {
-        using var layout = _dwrite.CreateTextLayout(s, _font!, Math.Max(100, _width - 32), 400);
-        var m = layout.Metrics;
+        if (_statsLayout is null || s != _statsText || _width != _statsWidth)
+        {
+            _statsLayout?.Dispose();
+            _statsLayout = _dwrite.CreateTextLayout(s, _font!, Math.Max(100, _width - 32), 400);
+            _statsMetrics = _statsLayout.Metrics;
+            _statsText = s;
+            _statsWidth = _width;
+        }
+        var layout = _statsLayout;
+        var m = _statsMetrics;
         float pad = _fontPx * 0.6f;
         float h = m.Height + pad, w = m.Width + pad * 2;
         float x = 8, y = _height - h - 16;
@@ -546,6 +561,7 @@ internal sealed unsafe class GpuPresenter : IGpuFrameSink, IDisposable
             _disposed = true;
             ReleaseTargets();
             _font?.Dispose();
+            _statsLayout?.Dispose();
             _nv12View?.Dispose(); _bgraView?.Dispose();
             _nv12?.Dispose(); _bgra?.Dispose(); _upload?.Dispose();
             _vp?.Dispose(); _vpEnum?.Dispose();

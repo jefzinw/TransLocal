@@ -609,6 +609,12 @@ internal sealed class TrayApp : ApplicationContext
         s.FrameReady += viewer.NotifyFrame;
         s.StatsUpdated += viewer.SetStats;
         s.CursorModeChanged += viewer.SetRemoteCursorCaptured;
+        s.CursorWarp += viewer.WarpCursor;
+        viewer.KeyLockChanged += on =>
+        {
+            Settings.ViewerKeyLock = on;
+            try { Settings.Save(); } catch (Exception ex) { Log.Warn("Falha ao salvar a trava de atalhos", ex); }
+        };
         s.Notice += text =>
         {
             viewer.ShowNotice(text);
@@ -623,6 +629,7 @@ internal sealed class TrayApp : ApplicationContext
         s.Surface.FastScaling = s.Light;
         if (s.ControlAllowed) StartGamepads(s, viewer);
         viewer.Show();
+        viewer.SetKeyLock(Settings.ViewerKeyLock);
         // Decodificação e exibição na mesma placa de vídeo: o quadro vai direto para a tela, sem passar pelo processador.
         if (s.Gpu is { } gpu && !viewer.UseGpu(gpu, sink => s.GpuSink = sink))
             Log.Info("Exibição pela placa de vídeo indisponível nesta janela; desenhando pelo processador");
@@ -744,6 +751,7 @@ internal sealed class TrayApp : ApplicationContext
         Audio = Settings.SenderAudio,
         AllowControl = Settings.SenderAllowControl,
         Resolution = Settings.SenderResolution,
+        FollowCursor = Settings.SendFollowCursor,
     };
 
     /// <summary>Passa a acompanhar uma transmissão iniciada (normal ou por acesso remoto). Thread da interface.</summary>

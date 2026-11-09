@@ -79,29 +79,67 @@ internal sealed class SurfaceView : Control
         UpdateRelativeMode();
     }
 
+    private bool _rawOn;
+
     private void UpdateRelativeMode()
     {
         if (!IsHandleCreated) return;
-        bool want = _controlEnabled && _remoteCaptured && !_forceAbsolute && ContainsFocus;
+        // Movimento bruto do mouse sempre que controlando com a janela em foco: no modo relativo (jogos) e para
+        // empurrar o cursor para além da borda da imagem (outros monitores do PC, telas estendidas).
+        bool raw = _controlEnabled && ContainsFocus;
+        if (raw != _rawOn)
+        {
+            _rawOn = raw;
+            var rid = new[]
+            {
+                new Native.RAWINPUTDEVICE
+                {
+                    usUsagePage = 0x01, // Generic Desktop
+                    usUsage = 0x02,     // Mouse
+                    dwFlags = raw ? 0u : Native.RIDEV_REMOVE,
+                    hwndTarget = raw ? Handle : IntPtr.Zero,
+                },
+            };
+            Native.RegisterRawInputDevices(rid, 1, (uint)Marshal.SizeOf<Native.RAWINPUTDEVICE>());
+        }
+        bool want = raw && _remoteCaptured && !_forceAbsolute;
         if (want == _relativeOn)
         {
             if (want) ClipToView();
             return;
         }
         _relativeOn = want;
-        var rid = new[]
-        {
-            new Native.RAWINPUTDEVICE
-            {
-                usUsagePage = 0x01, // Generic Desktop
-                usUsage = 0x02,     // Mouse
-                dwFlags = want ? 0u : Native.RIDEV_REMOVE,
-                hwndTarget = want ? Handle : IntPtr.Zero,
-            },
-        };
-        Native.RegisterRawInputDevices(rid, 1, (uint)Marshal.SizeOf<Native.RAWINPUTDEVICE>());
         if (want) ClipToView(); else Native.ClipCursorNone(IntPtr.Zero);
         RelativeModeChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Mouse empurrado para fora da imagem (o cursor local parou na borda): o cursor do outro computador segue em
+    /// frente, para o monitor vizinho — que o transmissor passa a mostrar (ele segue o cursor).
+    /// </summary>
+    private void EdgePush(int dx, int dy)
+    {
+        var d = _gpu is { Failed: false, HasImage: true } gpu ? gpu.Dest : _dest;
+        if (d.Width <= 1 || d.Height <= 1) return;
+        var p = PointToClient(Cursor.Position);
+        if (!new Rectangle(0, 0, Width, Height).Contains(p)) return;
+        int ex = 0, ey = 0;
+        if (dx < 0 && p.X <= d.Left) ex = dx; else if (dx > 0 && p.X >= d.Right - 1) ex = dx;
+        if (dy < 0 && p.Y <= d.Top) ey = dy; else if (dy > 0 && p.Y >= d.Bottom - 1) ey = dy;
+        if (ex != 0 || ey != 0) SendInput?.Invoke(InputCodec.EncodeRelativeMove(ex, ey));
+    }
+
+    /// <summary>A transmissão passou a mostrar outro monitor: põe o mouse local no ponto onde o cursor está nele.</summary>
+    public void WarpCursor(ushort nx, ushort ny)
+    {
+        if (!_controlEnabled || _relativeOn) return;
+        var d = _gpu is { Failed: false, HasImage: true } gpu ? gpu.Dest : _dest;
+        if (d.Width <= 1 || d.Height <= 1) return;
+        int x = d.X + (int)Math.Round(nx / 65535.0 * (d.Width - 1));
+        int y = d.Y + (int)Math.Round(ny / 65535.0 * (d.Height - 1));
+        _lastNx = nx;
+        _lastNy = ny;
+        Cursor.Position = PointToScreen(new Point(x, y));
     }
 
     /// <summary>Mantém o cursor local dentro da imagem enquanto o modo relativo está ativo.</summary>
@@ -125,7 +163,9 @@ internal sealed class SurfaceView : Control
         if ((flags & 0x01) != 0) return;               // MOUSE_MOVE_ABSOLUTE (tablets, área de trabalho remota)
         int dx = BitConverter.ToInt32(_rawBuffer, mouse + 12);
         int dy = BitConverter.ToInt32(_rawBuffer, mouse + 16);
-        if (dx != 0 || dy != 0) SendInput?.Invoke(InputCodec.EncodeRelativeMove(dx, dy));
+        if (dx == 0 && dy == 0) return;
+        if (_relativeOn) SendInput?.Invoke(InputCodec.EncodeRelativeMove(dx, dy));
+        else EdgePush(dx, dy);
     }
 
     protected override void OnGotFocus(EventArgs e)
@@ -338,7 +378,7 @@ internal sealed class SurfaceView : Control
         switch (m.Msg)
         {
             case Native.WM_INPUT:
-                if (_relativeOn && _controlEnabled) HandleRawInput(m.LParam);
+                if (_rawOn && _controlEnabled) HandleRawInput(m.LParam);
                 break;
             case Native.WM_KEYDOWN:
             case Native.WM_SYSKEYDOWN:
@@ -374,6 +414,27 @@ internal sealed class SurfaceView : Control
         base.WndProc(ref m);
     }
 
+    /// <summary>Ctrl+Alt+Shift+&lt;tecla&gt; já confirmado (vindo da trava de atalhos, na thread da interface).</summary>
+    public void RunShortcut(Keys key)
+    {
+        string? cmd = ShortcutCommand(key);
+        if (cmd is null) return;
+        try { BeginInvoke(() => LocalCommand?.Invoke(cmd)); } catch (InvalidOperationException) { }
+    }
+
+    private static string? ShortcutCommand(Keys key) => key switch
+    {
+        Keys.F => "fullscreen",
+        Keys.Q => "close",
+        Keys.C => "control",
+        Keys.S => "stats",
+        Keys.M => "mouse-mode",
+        Keys.A => "audio-next",
+        Keys.D => "diag",
+        Keys.K => "keylock",
+        _ => null,
+    };
+
     private bool HandleLocalShortcut(Keys key)
     {
         var mods = ModifierKeys;
@@ -381,17 +442,7 @@ internal sealed class SurfaceView : Control
         string? cmd = null;
         if (cas)
         {
-            cmd = key switch
-            {
-                Keys.F => "fullscreen",
-                Keys.Q => "close",
-                Keys.C => "control",
-                Keys.S => "stats",
-                Keys.M => "mouse-mode",
-                Keys.A => "audio-next",
-                Keys.D => "diag",
-                _ => null,
-            };
+            cmd = ShortcutCommand(key);
         }
         else if (!_controlEnabled)
         {
@@ -505,6 +556,7 @@ internal sealed class ViewerForm : Form
         _btnControl = BarButton(_controlAvailable ? "Controlar: desligado" : "Sem controle (o outro PC não permitiu)", (_, _) => ToggleControl());
         _btnControl.Enabled = _controlAvailable;
         _btnStats = BarButton("Estatísticas", (_, _) => ToggleStats());
+        if (_controlAvailable) _btnKeys = BarButton("Atalhos: neste PC", (_, _) => SetKeyLock(!(_keyLock?.Enabled ?? false), announce: true));
         _btnFull = BarButton("Tela cheia", (_, _) => ToggleFullscreen());
         var btnClose = BarButton("Fechar", (_, _) => Close());
         flow.Controls.Add(_gamepadLabel);
@@ -519,6 +571,7 @@ internal sealed class ViewerForm : Form
         _btnDiag = BarButton("Diagnóstico", (_, _) => ToggleDiag());
         _btnDiag.Visible = false;
         flow.Controls.AddRange(new Control[] { _btnControl, _btnStats, _btnDiag, _btnFull, btnClose });
+        if (_btnKeys is not null) { flow.Controls.Add(_btnKeys); flow.Controls.SetChildIndex(_btnKeys, flow.Controls.IndexOf(_btnControl) + 1); }
         _bar.Controls.Add(_barTitle);
         _bar.Controls.Add(flow);
 
@@ -630,6 +683,8 @@ internal sealed class ViewerForm : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        _keyLock?.Dispose();
+        _keyLock = null;
         _barTimer.Stop();
         _barTimer.Dispose();
         AudioOutput.Changed -= OnAudioOutputsChanged;
@@ -650,6 +705,36 @@ internal sealed class ViewerForm : Form
             case "mouse-mode": _view.ToggleForceAbsolute(); break;
             case "audio-next": if (_btnAudio is not null) NextAudioOutput(); break;
             case "diag": ToggleDiag(); break;
+            case "keylock": SetKeyLock(!(_keyLock?.Enabled ?? false), announce: true); break;
+        }
+    }
+
+    // ---------- Trava de atalhos (Alt+Tab, tecla Windows… vão para o outro computador) ----------
+
+    private KeyboardLock? _keyLock;
+    private Button? _btnKeys;
+
+    /// <summary>O usuário ligou/desligou a trava (para lembrar a escolha).</summary>
+    public event Action<bool>? KeyLockChanged;
+
+    /// <summary>Liga ou desliga a trava de atalhos (só vale com o controle ligado e esta janela em primeiro plano).</summary>
+    public void SetKeyLock(bool on, bool announce = false)
+    {
+        if (!_controlAvailable) return;
+        if (_keyLock is null && on && IsHandleCreated)
+        {
+            _keyLock = new KeyboardLock(() => Handle, () => _view.ControlEnabled, b => _view.SendInput?.Invoke(b), _view.RunShortcut);
+            if (!_keyLock.Available) { _keyLock.Dispose(); _keyLock = null; }
+        }
+        if (_keyLock is not null) _keyLock.Enabled = on;
+        bool active = _keyLock?.Enabled == true;
+        if (_btnKeys is not null) _btnKeys.Text = active ? "Atalhos: no outro PC" : "Atalhos: neste PC";
+        if (announce)
+        {
+            ShowNotice(active
+                ? "Alt+Tab, a tecla Windows e os outros atalhos vão para o outro computador. Ctrl+Alt+Shift+K devolve para este."
+                : "Atalhos do Windows (Alt+Tab, tecla Windows) voltaram para este computador.");
+            KeyLockChanged?.Invoke(active);
         }
     }
 
@@ -803,6 +888,13 @@ internal sealed class ViewerForm : Form
     }
 
     /// <summary>O outro computador avisou se um jogo prendeu o cursor (mouse relativo).</summary>
+    /// <summary>A transmissão passou a mostrar outro monitor do PC: reposiciona o mouse local.</summary>
+    public void WarpCursor(ushort nx, ushort ny)
+    {
+        if (!IsHandleCreated || IsDisposed) return;
+        try { BeginInvoke(() => _view.WarpCursor(nx, ny)); } catch (InvalidOperationException) { }
+    }
+
     public void SetRemoteCursorCaptured(bool captured)
     {
         if (!IsHandleCreated || IsDisposed) return;

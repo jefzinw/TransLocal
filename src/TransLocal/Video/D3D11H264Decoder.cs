@@ -400,7 +400,7 @@ internal sealed unsafe class D3D11H264Decoder : IDisposable
     /// Decodifica um quadro (Annex B) e o entrega à exibição. False sem imagem; <paramref name="error"/> = é preciso
     /// um quadro-chave (começou no meio, dado inválido). <see cref="Unsupported"/> preenchido = use outro decodificador.
     /// </summary>
-    public bool Decode(ReadOnlySpan<byte> annexB, int width, int height, IGpuFrameSink sink, out bool error)
+    public bool Decode(ReadOnlySpan<byte> annexB, int width, int height, IGpuFrameSink sink, out bool error, bool present = true)
     {
         error = false;
         try
@@ -451,7 +451,7 @@ internal sealed unsafe class D3D11H264Decoder : IDisposable
             bool shownAny = false;
             for (int pi = 0; pi < pictures.Count; pi++)
             {
-                if (!DecodePicture(annexB, pictures[pi], width, height, sink, pi == pictures.Count - 1, out error)) return shownAny && !error && Unsupported is null;
+                if (!DecodePicture(annexB, pictures[pi], width, height, sink, present && pi == pictures.Count - 1, out error)) return shownAny && !error && Unsupported is null;
                 shownAny = true;
             }
             return shownAny;

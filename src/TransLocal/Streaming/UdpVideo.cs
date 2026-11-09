@@ -415,6 +415,12 @@ internal sealed class UdpVideoReceiver : IDisposable
 
     public bool Receiving => Interlocked.Read(ref TotalPackets) > 0;
 
+    /// <summary>Bytes já recebidos esperando processamento (quadros acumulados no receptor).</summary>
+    public int PendingBytes
+    {
+        get { try { return _socket.Available; } catch { return 0; } }
+    }
+
     public UdpVideoReceiver(byte[] key, uint session, IPEndPoint sender)
     {
         _aes = new AesGcm(key, UdpProto.TagLen);

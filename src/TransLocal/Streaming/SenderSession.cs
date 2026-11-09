@@ -21,6 +21,9 @@ internal sealed class SenderOptions
     /// <summary>Usar vídeo H.264 quando o receptor suportar (muito menos rede e processador).</summary>
     public bool H264 { get; init; } = true;
 
+    /// <summary>Com controle: quando o cursor vai para outro monitor (telas estendidas), a transmissão passa a mostrar esse monitor.</summary>
+    public bool FollowCursor { get; init; } = true;
+
     /// <summary>"auto" (tela do receptor), "original" ou um limite como "1280x720".</summary>
     public string Resolution { get; init; } = "auto";
 }
@@ -97,6 +100,10 @@ internal sealed class SenderSession : IDisposable
     private int _lastAckedId;
     private double _lossRate;
     private long _lastForcedKey;
+
+    // Quadros "a caminho" por UDP: o suficiente para cobrir a ida e volta, sem formar fila no receptor (com 24 fixos,
+    // um notebook um pouco abaixo de 60 q/s acumulava ~400 ms de atraso).
+    private volatile int _udpWindow = 6;
     private readonly Queue<double> _lossHistory = new();
     private int _framesLostWindow, _framesRecoveredWindow;
     private volatile string _transportLabel = "TCP";
@@ -398,6 +405,10 @@ internal sealed class SenderSession : IDisposable
             long lastCursorCheck = 0;
             long lastDxgiRetry = 0;
             var screen = _screen;
+            string? monitorName = _opt.MonitorDeviceName ?? _screen.DeviceName;
+            string? cursorOther = null;
+            long cursorOtherSince = 0;
+            bool warpPending = false;
 
             while (!ct.IsCancellationRequested)
             {
@@ -405,7 +416,7 @@ internal sealed class SenderSession : IDisposable
                 if (now - lastBoundsCheck > Stopwatch.Frequency)
                 {
                     lastBoundsCheck = now;
-                    var s = Monitors.Resolve(_opt.MonitorDeviceName);
+                    var s = Monitors.Resolve(monitorName);
                     if (s.Bounds != screen.Bounds || s.DeviceName != screen.DeviceName)
                     {
                         Log.Info($"Monitor mudou: {screen.DeviceName} {screen.Bounds} -> {s.DeviceName} {s.Bounds}");
@@ -471,6 +482,19 @@ internal sealed class SenderSession : IDisposable
                     _sendSize = size;
                     needFrame = true;
                     _injector?.SetMonitor(capturer.Bounds);
+                    if (warpPending)
+                    {
+                        // Mostra ao receptor onde o cursor está no monitor novo (ele reposiciona o mouse local ali).
+                        warpPending = false;
+                        var cp = Cursor.Position;
+                        var b = capturer.Bounds;
+                        ushort wx = (ushort)Math.Clamp((cp.X - b.X) * 65535L / Math.Max(1, b.Width - 1), 0, 65535);
+                        ushort wy = (ushort)Math.Clamp((cp.Y - b.Y) * 65535L / Math.Max(1, b.Height - 1), 0, 65535);
+                        var warp = new byte[4];
+                        BinaryPrimitives.WriteUInt16LittleEndian(warp, wx);
+                        BinaryPrimitives.WriteUInt16LittleEndian(warp.AsSpan(2), wy);
+                        try { _conn.Send(MsgType.CursorWarp, warp); } catch { }
+                    }
                     ElevatedInputBridge.Current?.SetMonitor(capturer.Bounds);
                     Log.Info($"Captura {capturer.Method} de {screen.DeviceName} {capturer.Width}×{capturer.Height}" +
                              (scaler is null ? "" : $", enviada em {size.Width}×{size.Height}"));
@@ -487,6 +511,29 @@ internal sealed class SenderSession : IDisposable
                         Log.Info(captured ? "Cursor preso por um jogo: mouse relativo" : "Cursor livre: mouse absoluto");
                         _conn.Send(MsgType.CursorMode, new[] { (byte)(captured ? 1 : 0) });
                     }
+                    // Telas estendidas: o cursor foi para outro monitor (empurrado da borda pelo receptor, ou movido aqui)?
+                    // Depois de ~150 ms lá, a transmissão passa a mostrar esse monitor.
+                    if (_opt.FollowCursor && !captured && Screen.AllScreens.Length > 1)
+                    {
+                        var cp = Cursor.Position;
+                        var target = Screen.AllScreens.FirstOrDefault(sc => sc.Bounds.Contains(cp));
+                        if (target is not null && target.DeviceName != screen.DeviceName)
+                        {
+                            if (cursorOther != target.DeviceName) { cursorOther = target.DeviceName; cursorOtherSince = now; }
+                            else if (now - cursorOtherSince > Stopwatch.Frequency * 15 / 100)
+                            {
+                                Log.Info($"Cursor foi para {target.DeviceName} {target.Bounds}: transmitindo esse monitor");
+                                monitorName = target.DeviceName;
+                                screen = target;
+                                capturer?.Dispose();
+                                capturer = null;
+                                warpPending = true;
+                                cursorOther = null;
+                                continue;
+                            }
+                        }
+                        else cursorOther = null;
+                    }
                 }
 
                 bool viaUdp = _udp?.Active == true;
@@ -496,7 +543,7 @@ internal sealed class SenderSession : IDisposable
                 {
                     // Por UDP nada fica preso na fila: só segura se o receptor estiver muito atrás (~0,4 s a 60 q/s).
                     // Com 8 quadros, um atraso curto nas confirmações (Wi-Fi do notebook) congelava a imagem à toa.
-                    if (Volatile.Read(ref _frameId) - Volatile.Read(ref _lastAckedId) > 24)
+                    if (Volatile.Read(ref _frameId) - Volatile.Read(ref _lastAckedId) > _udpWindow)
                     {
                         Interlocked.Increment(ref _statBlocked);
                         Thread.Sleep(2);
@@ -779,6 +826,8 @@ internal sealed class SenderSession : IDisposable
         int blocked = Interlocked.Exchange(ref _statBlocked, 0);
         // Ritmo dos pacotes: bem acima da taxa média (o quadro sai em parte do intervalo), nunca abaixo de 30 Mbit/s.
         if (_udp is { } pace) pace.PaceBitsPerSecond = Math.Max(30_000_000, _targetBitrate * 4.0);
+        double frameMsW = 1000.0 / Math.Clamp(_limits.Fps, 1, 120);
+        _udpWindow = Math.Clamp((int)Math.Ceiling((double.IsNaN(_rttMs) ? 10 : _rttMs) / frameMsW) + 4, 4, 12);
         if (_udpWasActive && _udp is { Active: false })
         {
             // O receptor parou de se apresentar por UDP (rede mudou, firewall): volta ao TCP com quadro-chave.

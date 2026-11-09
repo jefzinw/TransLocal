@@ -64,7 +64,8 @@ internal enum MsgType : byte
     Info = 0x34,            // receptor → transmissor: texto para o registro (ex.: controles conectados)
     Notice = 0x35,          // transmissor → receptor: aviso para mostrar na tela (UTF-8)
     Diag = 0x36,            // os dois sentidos: linhas do registro do outro lado (UTF-8, separadas por \n)
-    Stats = 0x37,           // transmissor → receptor: resumo do atraso e da taxa de bits (UTF-8), uma vez por segundo
+    Stats = 0x37,
+    CursorWarp = 0x38,      // transmissor → receptor: [nx u16][ny u16] posição do cursor no monitor que passou a ser transmitido           // transmissor → receptor: resumo do atraso e da taxa de bits (UTF-8), uma vez por segundo
     Ping = 0x40,
     Pong = 0x41,
     Bye = 0x50,
